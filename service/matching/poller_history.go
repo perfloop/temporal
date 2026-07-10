@@ -7,6 +7,7 @@ import (
 	deploymentpb "go.temporal.io/api/deployment/v1"
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
 	"go.temporal.io/server/common/cache"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
@@ -56,8 +57,9 @@ func (pollers *pollerHistory) updatePollerInfo(id pollerIdentity, pollMetadata *
 	if existing := pollers.history.Get(id); existing != nil {
 		if info, ok := existing.(*pollerInfo); ok {
 			if info.ratePerSecond == ratePerSecond &&
-				info.workerVersionCapabilities == pollMetadata.workerVersionCapabilities &&
-				info.deploymentOptions == pollMetadata.deploymentOptions {
+				proto.Equal(info.workerVersionCapabilities, pollMetadata.workerVersionCapabilities) &&
+				proto.Equal(info.deploymentOptions, pollMetadata.deploymentOptions) {
+				pollers.history.Put(id, info)
 				return
 			}
 		}
