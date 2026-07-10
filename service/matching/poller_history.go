@@ -95,5 +95,3 @@ func defaultRPS(wrapper *wrapperspb.DoubleValue) float64 {
 	}
 	return defaultTaskDispatchRPS
 }
-
-//
