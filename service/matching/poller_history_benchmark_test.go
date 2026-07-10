@@ -6,9 +6,10 @@ import (
 	"time"
 )
 
+var escapeSink any
+
 func BenchmarkUpdatePollerInfo(b *testing.B) {
 	history := newPollerHistory(5 * time.Minute)
-	metadata := &pollMetadata{}
 
 	identities := make([]pollerIdentity, 100)
 	for i := range 100 {
@@ -17,6 +18,8 @@ func BenchmarkUpdatePollerInfo(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		metadata := &pollMetadata{}
+		escapeSink = metadata
 		history.updatePollerInfo(identities[i%100], metadata)
 	}
 }

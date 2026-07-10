@@ -809,6 +809,9 @@ func (pm *taskQueuePartitionManagerImpl) PollTask(
 	}
 
 	identity, hasIdentity := ctx.Value(identityKey).(string)
+	if hasIdentity && identity != "" {
+		dbq.UpdatePollerInfo(pollerIdentity(identity), pollMetadata)
+	}
 
 	// The desired global rate limit for the task queue can come from multiple sources:
 	// UpdateTaskQueueConfig API call, poller metadata, or system default.

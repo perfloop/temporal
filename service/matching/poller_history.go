@@ -15,10 +15,6 @@ const (
 
 type (
 	pollerIdentity string
-
-	pollerInfo struct {
-		*pollMetadata
-	}
 )
 
 type pollerHistory struct {
@@ -39,7 +35,7 @@ func newPollerHistory(pollerHistoryTTL time.Duration) *pollerHistory {
 }
 
 func (pollers *pollerHistory) updatePollerInfo(id pollerIdentity, pollMetadata *pollMetadata) {
-	pollers.history.Put(id, &pollerInfo{pollMetadata: pollMetadata})
+	pollers.history.Put(id, pollMetadata)
 }
 
 func (pollers *pollerHistory) removePoller(id pollerIdentity) {
@@ -53,8 +49,14 @@ func (pollers *pollerHistory) getPollerInfo(earliestAccessTime time.Time) []*tas
 	defer ite.Close()
 	for ite.HasNext() {
 		entry := ite.Next()
-		key := entry.Key().(pollerIdentity)
-		value := entry.Value().(*pollerInfo)
+		key, ok := entry.Key().(pollerIdentity)
+		if !ok {
+			continue
+		}
+		value, ok := entry.Value().(*pollMetadata)
+		if !ok {
+			continue
+		}
 		lastAccessTime := entry.CreateTime()
 		if earliestAccessTime.Before(lastAccessTime) {
 			result = append(result, &taskqueuepb.PollerInfo{
