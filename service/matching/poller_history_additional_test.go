@@ -5,6 +5,10 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	commonpb "go.temporal.io/api/common/v1"
+	deploymentpb "go.temporal.io/api/deployment/v1"
+	taskqueuepb "go.temporal.io/api/taskqueue/v1"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 func TestPollerHistoryAdditional(t *testing.T) {
@@ -82,5 +86,35 @@ func TestPollerHistoryAdditional(t *testing.T) {
 		// This simulates HasPollerAfter checking if a poller was active in last 10ms
 		pollers := history.getPollerInfo(time.Now().Add(-10 * time.Millisecond))
 		require.Len(t, pollers, 1, "Expected poller to be visible in HasPollerAfter window")
+	})
+
+	t.Run("pollMetadata fields correctly populated and returned", func(t *testing.T) {
+		t.Parallel()
+		history := newPollerHistory(5 * time.Minute)
+
+		identity := pollerIdentity("worker-full")
+		metadata := &pollMetadata{
+			taskQueueMetadata: &taskqueuepb.TaskQueueMetadata{
+				MaxTasksPerSecond: wrapperspb.Double(15.5),
+			},
+			workerVersionCapabilities: &commonpb.WorkerVersionCapabilities{
+				BuildId:       "build-123",
+				UseVersioning: true,
+			},
+			deploymentOptions: &deploymentpb.WorkerDeploymentOptions{
+				DeploymentName: "deploy-abc",
+			},
+		}
+		history.updatePollerInfo(identity, metadata)
+
+		pollers := history.getPollerInfo(time.Time{})
+		require.Len(t, pollers, 1)
+		require.Equal(t, "worker-full", pollers[0].Identity)
+		require.InDelta(t, 15.5, pollers[0].RatePerSecond, 1e-9)                    //nolint:testifylint
+		require.NotNil(t, pollers[0].WorkerVersionCapabilities)                     //nolint:staticcheck
+		require.Equal(t, "build-123", pollers[0].WorkerVersionCapabilities.BuildId) //nolint:staticcheck
+		require.True(t, pollers[0].WorkerVersionCapabilities.UseVersioning)         //nolint:staticcheck
+		require.NotNil(t, pollers[0].DeploymentOptions)
+		require.Equal(t, "deploy-abc", pollers[0].DeploymentOptions.DeploymentName)
 	})
 }
