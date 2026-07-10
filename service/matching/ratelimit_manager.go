@@ -277,7 +277,9 @@ func (r *rateLimitManager) updateSimpleRateLimitWithBurstLocked(burstDuration ti
 // UpdateTaskQueueConfig api is the single source for the per-key rate limit.
 func (r *rateLimitManager) updatePerKeySimpleRateLimitWithBurstLocked(burstDuration time.Duration) {
 	if r.fairnessKeyRateLimitDefault == nil {
-		r.clearPerKeyRateLimitsLocked()
+		if r.perKeyLimit != (simpleLimiterParams{}) {
+			r.clearPerKeyRateLimitsLocked()
+		}
 		return
 	}
 	rate := *r.fairnessKeyRateLimitDefault
