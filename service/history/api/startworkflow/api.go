@@ -77,9 +77,10 @@ type creationParams struct {
 // mutableStateInfo is a container for the relevant mutable state information to generate a start response with an eager
 // workflow task.
 type mutableStateInfo struct {
-	branchToken  []byte
-	lastEventID  int64
-	workflowTask *historyi.WorkflowTaskInfo
+	branchToken   []byte
+	lastEventID   int64
+	workflowTask  *historyi.WorkflowTaskInfo
+	historyEvents []*historypb.HistoryEvent
 }
 
 // NewStarter creates a new starter, fails if getting the active namespace fails.
@@ -515,6 +516,9 @@ func (s *Starter) resolveDuplicateWorkflowID(
 				Link:    s.generateStartedEventRefLink(newRunID),
 			}, StartNew, nil
 		}
+		if workflowLease != nil {
+			mutableStateInfo.historyEvents = extractHistoryEvents(workflowLease.GetMutableState().GetWorkflowEventsSeq())
+		}
 		events, err := s.getWorkflowHistory(ctx, mutableStateInfo)
 		if err != nil {
 			return nil, StartErr, err
@@ -625,6 +629,9 @@ func extractMutableStateInfo(mutableState historyi.MutableState) (*mutableStateI
 
 // getWorkflowHistory loads the workflow history based on given mutable state information from the DB.
 func (s *Starter) getWorkflowHistory(ctx context.Context, mutableState *mutableStateInfo) ([]*historypb.HistoryEvent, error) {
+	if len(mutableState.historyEvents) > 0 {
+		return mutableState.historyEvents, nil
+	}
 	var events []*historypb.HistoryEvent
 	// Future optimization: generate the task from mutable state to save the extra DB read.
 	// NOTE: While unlikely that there'll be more than one page, it's safer to make less assumptions.

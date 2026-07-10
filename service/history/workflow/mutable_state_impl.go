@@ -193,6 +193,7 @@ type (
 		// The flag will be unset whenever workflow task successfully completed, timedout or failed
 		// due to cause other than UnhandledCommand.
 		workflowCloseAttempted bool
+		workflowEventsSeq      []*persistence.WorkflowEvents
 		// A flag indicating if transition history feature is enabled for the current transaction.
 		// We need a consistent view of if transition history is enabled within one transaction in case
 		// dynamic configuration value changes in the middle of a transaction
@@ -2460,6 +2461,10 @@ func (ms *MutableStateImpl) GetLastFirstEventIDTxnID() (int64, int64) {
 // GetNextEventID returns next event ID
 func (ms *MutableStateImpl) GetNextEventID() int64 {
 	return ms.hBuilder.NextEventID()
+}
+
+func (ms *MutableStateImpl) GetWorkflowEventsSeq() []*persistence.WorkflowEvents {
+	return ms.workflowEventsSeq
 }
 
 // GetStartedEventIdForLastCompletedWorkflowTask returns last started workflow task event ID
@@ -7515,6 +7520,7 @@ func (ms *MutableStateImpl) CloseTransactionAsMutation(
 	if err := ms.cleanupTransaction(); err != nil {
 		return nil, nil, err
 	}
+	ms.workflowEventsSeq = result.workflowEventsSeq
 	return workflowMutation, result.workflowEventsSeq, nil
 }
 
@@ -7560,6 +7566,7 @@ func (ms *MutableStateImpl) CloseTransactionAsSnapshot(
 	if err := ms.cleanupTransaction(); err != nil {
 		return nil, nil, err
 	}
+	ms.workflowEventsSeq = result.workflowEventsSeq
 	return workflowSnapshot, result.workflowEventsSeq, nil
 }
 

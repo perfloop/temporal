@@ -182,6 +182,7 @@ type (
 		GetPendingWorkflowTask() *WorkflowTaskInfo
 		GetLastFirstEventIDTxnID() (int64, int64)
 		GetNextEventID() int64
+		GetWorkflowEventsSeq() []*persistence.WorkflowEvents
 		GetLastCompletedWorkflowTaskStartedEventId() int64
 		GetPendingActivityInfos() map[int64]*persistencespb.ActivityInfo
 		GetPendingTimerInfos() map[string]*persistencespb.TimerInfo
