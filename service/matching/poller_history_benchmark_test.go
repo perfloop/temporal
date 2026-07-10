@@ -11,7 +11,7 @@ func BenchmarkUpdatePollerInfo(b *testing.B) {
 	metadata := &pollMetadata{}
 
 	identities := make([]pollerIdentity, 100)
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		identities[i] = pollerIdentity("worker-" + strconv.Itoa(i))
 	}
 

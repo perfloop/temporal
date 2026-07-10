@@ -17,7 +17,7 @@ type (
 	pollerIdentity string
 
 	pollerInfo struct {
-		pollMetadata
+		*pollMetadata
 	}
 )
 
@@ -39,7 +39,7 @@ func newPollerHistory(pollerHistoryTTL time.Duration) *pollerHistory {
 }
 
 func (pollers *pollerHistory) updatePollerInfo(id pollerIdentity, pollMetadata *pollMetadata) {
-	pollers.history.Put(id, &pollerInfo{pollMetadata: *pollMetadata})
+	pollers.history.Put(id, &pollerInfo{pollMetadata: pollMetadata})
 }
 
 func (pollers *pollerHistory) removePoller(id pollerIdentity) {
