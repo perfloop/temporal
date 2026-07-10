@@ -7,7 +7,6 @@ import (
 	deploymentpb "go.temporal.io/api/deployment/v1"
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
 	"go.temporal.io/server/common/cache"
-	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
@@ -54,17 +53,6 @@ func (pollers *pollerHistory) updatePollerInfo(id pollerIdentity, pollMetadata *
 		ratePerSecond = defaultTaskDispatchRPS
 	}
 
-	if existing := pollers.history.Get(id); existing != nil {
-		if info, ok := existing.(*pollerInfo); ok {
-			if info.ratePerSecond == ratePerSecond &&
-				proto.Equal(info.workerVersionCapabilities, pollMetadata.workerVersionCapabilities) &&
-				proto.Equal(info.deploymentOptions, pollMetadata.deploymentOptions) {
-				pollers.history.Put(id, info)
-				return
-			}
-		}
-	}
-
 	pollers.history.Put(id, &pollerInfo{
 		ratePerSecond:             ratePerSecond,
 		workerVersionCapabilities: pollMetadata.workerVersionCapabilities,
@@ -107,3 +95,5 @@ func defaultRPS(wrapper *wrapperspb.DoubleValue) float64 {
 	}
 	return defaultTaskDispatchRPS
 }
+
+//
