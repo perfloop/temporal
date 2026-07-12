@@ -55,6 +55,35 @@ func (s *RateLimitManagerSuite) TestUpdatePerKeySimpleRateLimitLocked_WhenFairne
 	rateLimitManager.mu.Unlock()
 }
 
+func (s *RateLimitManagerSuite) TestUpdatePerKeySimpleRateLimitLocked_WhenFairnessKeyRateLimitDefaultIsNil_NeverParams() {
+	mockUserDataManager := &mockUserDataManager{}
+	config := newTaskQueueConfig(
+		tqid.UnsafeTaskQueueFamily("test-namespace", "test-task-queue").TaskQueue(enumspb.TASK_QUEUE_TYPE_ACTIVITY),
+		NewConfig(dynamicconfig.NewNoopCollection()),
+		"test-namespace",
+	)
+	rateLimitManager := newRateLimitManager(mockUserDataManager, config, enumspb.TASK_QUEUE_TYPE_ACTIVITY)
+	rateLimitManager.mu.Lock()
+	// Simulate the condition where fairnessKeyRateLimitDefault is nil
+	rateLimitManager.fairnessKeyRateLimitDefault = nil
+	// Add per-key ready entries to verify they get cleared
+	rateLimitManager.perKeyReady.Put("key1", simpleLimiter(1000))
+	// Set per-key limit to the never-params shape
+	rateLimitManager.perKeyLimit = simpleLimiterParams{
+		interval: -1,
+	}
+	// Verify initial state
+	s.Equal(1, rateLimitManager.perKeyReady.Size())
+	s.False(rateLimitManager.perKeyLimit.limited())
+	s.True(rateLimitManager.perKeyLimit.never())
+	// Update the per-key simple rate limit with fairnessKeyRateLimitDefault as nil
+	rateLimitManager.updatePerKeySimpleRateLimitWithBurstLocked(time.Second)
+	// Verify that clearPerKeyRateLimitsLocked was called because r.perKeyLimit is not empty
+	s.Equal(0, rateLimitManager.perKeyReady.Size(), "All per-key ready entries should be cleared for never-params")
+	s.Equal(simpleLimiterParams{}, rateLimitManager.perKeyLimit, "Per-key limit should be cleared")
+	rateLimitManager.mu.Unlock()
+}
+
 // Additions to rateLimitManager for use by other unit tests:
 
 func (r *rateLimitManager) UpdateSimpleRateLimitWithBurstForTesting(burstDuration time.Duration) {
