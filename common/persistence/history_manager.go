@@ -639,6 +639,10 @@ func (m *executionManagerImpl) readRawHistoryBranch(
 		}
 	}
 
+	if err := validateHistoryPagingTokenRange(token, len(branchAncestors)); err != nil {
+		return nil, nil, err
+	}
+
 	currentBranch := branchAncestors[token.CurrentRangeIndex]
 	// minNodeID remains the same, since caller can read from the middle
 	// maxNodeID need to be shortened since this branch can contain additional history nodes
@@ -661,6 +665,15 @@ func (m *executionManagerImpl) readRawHistoryBranch(
 	}
 	token.StoreToken = resp.NextPageToken
 	return resp.Nodes, token, nil
+}
+
+func validateHistoryPagingTokenRange(token *historyPagingToken, branchRangeCount int) error {
+	if token.CurrentRangeIndex < 0 ||
+		token.CurrentRangeIndex > token.FinalRangeIndex ||
+		token.FinalRangeIndex >= branchRangeCount {
+		return serviceerror.NewInvalidArgument("invalid history paging token")
+	}
+	return nil
 }
 
 func (m *executionManagerImpl) readRawHistoryBranchReverse(
@@ -696,6 +709,10 @@ func (m *executionManagerImpl) readRawHistoryBranchReverse(
 		if token.CurrentRangeIndex == notStartedIndex {
 			return nil, nil, softassert.UnexpectedDataLoss(m.logger, "branchRange is corrupted", nil)
 		}
+	}
+
+	if err := validateHistoryPagingTokenRange(token, len(branchAncestors)); err != nil {
+		return nil, nil, err
 	}
 
 	currentBranch := branchAncestors[token.CurrentRangeIndex]
