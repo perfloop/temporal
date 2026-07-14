@@ -75,30 +75,50 @@ func TestStarterGetWorkflowHistoryPropagatesNextPageToken(t *testing.T) {
 	executionManager := persistence.NewMockExecutionManager(ctrl)
 	starter := newHistoryReaderStarter(ctrl, executionManager)
 	continuationToken := []byte("next-page")
+	duplicatePageRequests := 0
+	calls := 0
 
-	gomock.InOrder(
-		executionManager.EXPECT().ReadHistoryBranch(gomock.Any(), historyReadRequest(nil)).Return(
-			&persistence.ReadHistoryBranchResponse{
-				HistoryEvents: []*historypb.HistoryEvent{{EventId: 1}},
-				NextPageToken: continuationToken,
-			},
-			nil,
-		),
-		executionManager.EXPECT().ReadHistoryBranch(gomock.Any(), historyReadRequest(continuationToken)).Return(
-			&persistence.ReadHistoryBranchResponse{
-				HistoryEvents: []*historypb.HistoryEvent{{EventId: 2}},
-			},
-			nil,
-		),
-	)
+	executionManager.EXPECT().ReadHistoryBranch(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, request *persistence.ReadHistoryBranchRequest) (*persistence.ReadHistoryBranchResponse, error) {
+			calls++
+			switch calls {
+			case 1:
+				if len(request.NextPageToken) != 0 {
+					t.Fatalf("first request token = %q, want empty", request.NextPageToken)
+				}
+				return &persistence.ReadHistoryBranchResponse{
+					HistoryEvents: []*historypb.HistoryEvent{{EventId: 1}},
+					NextPageToken: continuationToken,
+				}, nil
+			case 2:
+				if len(request.NextPageToken) == 0 {
+					duplicatePageRequests++
+					return nil, errDuplicatePageRequest
+				}
+				if !bytes.Equal(request.NextPageToken, continuationToken) {
+					t.Fatalf("second request token = %q, want %q", request.NextPageToken, continuationToken)
+				}
+				return &persistence.ReadHistoryBranchResponse{
+					HistoryEvents: []*historypb.HistoryEvent{{EventId: 2}},
+				}, nil
+			default:
+				t.Fatalf("ReadHistoryBranch calls = %d, want 2", calls)
+				return nil, nil
+			}
+		},
+	).AnyTimes()
 
 	events, err := starter.getWorkflowHistory(context.Background(), historyReaderMutableState())
+	if errors.Is(err, errDuplicatePageRequest) {
+		t.Fatalf("duplicate_page_requests/op = %d, want 0", duplicatePageRequests)
+	}
 	if err != nil {
 		t.Fatalf("getWorkflowHistory returned error: %v", err)
 	}
-	if len(events) != 2 || events[0].GetEventId() != 1 || events[1].GetEventId() != 2 {
-		t.Fatalf("getWorkflowHistory returned events: %#v", events)
+	if duplicatePageRequests != 0 || len(events) != 2 || events[0].GetEventId() != 1 || events[1].GetEventId() != 2 {
+		t.Fatalf("duplicate_page_requests/op = %d, events = %#v", duplicatePageRequests, events)
 	}
+	t.Logf("duplicate_page_requests/op=%d", duplicatePageRequests)
 }
 
 // BenchmarkStarterGetWorkflowHistoryDuplicatePageRequests measures the bounded duplicate-page reproduction only.
