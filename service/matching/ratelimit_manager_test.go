@@ -52,6 +52,7 @@ func (s *RateLimitManagerSuite) TestUpdatePerKeySimpleRateLimitLocked_WhenFairne
 	// The cache should be replaced with a new empty cache
 	s.Equal(0, rateLimitManager.perKeyReady.Size(), "All per-key ready entries should be cleared")
 	s.False(rateLimitManager.perKeyLimit.limited(), "Per-key limit should be cleared")
+	s.Equal(simpleLimiterParams{}, rateLimitManager.perKeyLimit, "Per-key limit should be reset to zero params")
 	rateLimitManager.mu.Unlock()
 }
 
