@@ -73,15 +73,18 @@ func TestStarterGetWorkflowHistorySinglePage(t *testing.T) {
 	}
 }
 
-func TestStarterGetWorkflowHistoryPropagatesNextPageToken(t *testing.T) {
-	t.Parallel()
+type duplicatePageRequestControl struct {
+	starter               *Starter
+	duplicatePageRequests int
+}
 
-	ctrl := gomock.NewController(t)
-	t.Cleanup(ctrl.Finish)
+func newDuplicatePageRequestControl(tb testing.TB) (*duplicatePageRequestControl, *gomock.Controller) {
+	tb.Helper()
+
+	ctrl := gomock.NewController(tb)
 	executionManager := persistence.NewMockExecutionManager(ctrl)
-	starter := newHistoryReaderStarter(ctrl, executionManager)
+	control := &duplicatePageRequestControl{starter: newHistoryReaderStarter(ctrl, executionManager)}
 	continuationToken := []byte("next-page")
-	duplicatePageRequests := 0
 	calls := 0
 
 	executionManager.EXPECT().ReadHistoryBranch(gomock.Any(), gomock.Any()).DoAndReturn(
@@ -90,7 +93,7 @@ func TestStarterGetWorkflowHistoryPropagatesNextPageToken(t *testing.T) {
 			switch calls {
 			case 1:
 				if len(request.NextPageToken) != 0 {
-					t.Fatalf("first request token = %q, want empty", request.NextPageToken)
+					tb.Fatalf("first request token = %q, want empty", request.NextPageToken)
 				}
 				return &persistence.ReadHistoryBranchResponse{
 					HistoryEvents: []*historypb.HistoryEvent{{EventId: 1}},
@@ -98,31 +101,42 @@ func TestStarterGetWorkflowHistoryPropagatesNextPageToken(t *testing.T) {
 				}, nil
 			case 2:
 				if len(request.NextPageToken) == 0 {
-					duplicatePageRequests++
+					control.duplicatePageRequests++
 					return nil, errDuplicatePageRequest
 				}
 				if !bytes.Equal(request.NextPageToken, continuationToken) {
-					t.Fatalf("second request token = %q, want %q", request.NextPageToken, continuationToken)
+					tb.Fatalf("second request token = %q, want %q", request.NextPageToken, continuationToken)
 				}
 				return &persistence.ReadHistoryBranchResponse{
 					HistoryEvents: []*historypb.HistoryEvent{{EventId: 2}},
 				}, nil
 			default:
-				t.Fatalf("ReadHistoryBranch calls = %d, want 2", calls)
+				tb.Fatalf("ReadHistoryBranch calls = %d, want 2", calls)
 				return nil, nil
 			}
 		},
 	).AnyTimes()
+	return control, ctrl
+}
 
-	events, err := starter.getWorkflowHistory(context.Background(), historyReaderMutableState())
+func (c *duplicatePageRequestControl) getWorkflowHistory() ([]*historypb.HistoryEvent, error) {
+	return c.starter.getWorkflowHistory(context.Background(), historyReaderMutableState())
+}
+
+func TestStarterGetWorkflowHistoryPropagatesNextPageToken(t *testing.T) {
+	t.Parallel()
+
+	control, ctrl := newDuplicatePageRequestControl(t)
+	t.Cleanup(ctrl.Finish)
+	events, err := control.getWorkflowHistory()
 	if errors.Is(err, errDuplicatePageRequest) {
-		t.Fatalf("duplicate_page_requests/op = %d, want 0", duplicatePageRequests)
+		t.Fatalf("duplicate_page_requests/op = %d, want 0", control.duplicatePageRequests)
 	}
 	if err != nil {
 		t.Fatalf("getWorkflowHistory returned error: %v", err)
 	}
-	if duplicatePageRequests != 0 || len(events) != 2 || events[0].GetEventId() != 1 || events[1].GetEventId() != 2 {
-		t.Fatalf("duplicate_page_requests/op = %d, events = %#v", duplicatePageRequests, events)
+	if control.duplicatePageRequests != 0 || len(events) != 2 || events[0].GetEventId() != 1 || events[1].GetEventId() != 2 {
+		t.Fatalf("duplicate_page_requests/op = %d, events = %#v", control.duplicatePageRequests, events)
 	}
 }
 
