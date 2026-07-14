@@ -653,22 +653,25 @@ func extractMutableStateInfo(ctx context.Context, mutableState historyi.MutableS
 // getWorkflowHistory loads the workflow history based on given mutable state information from the DB.
 func (s *Starter) getWorkflowHistory(ctx context.Context, mutableState *mutableStateInfo) ([]*historypb.HistoryEvent, error) {
 	var events []*historypb.HistoryEvent
+	var nextPageToken []byte
 	// Future optimization: generate the task from mutable state to save the extra DB read.
 	// NOTE: While unlikely that there'll be more than one page, it's safer to make less assumptions.
 	// TODO: Frontend also supports returning raw history and it's controlled by a feature flag (yycptt thinks).
 	for {
 		response, err := s.shardContext.GetExecutionManager().ReadHistoryBranch(ctx, &persistence.ReadHistoryBranchRequest{
-			ShardID:     s.shardContext.GetShardID(),
-			BranchToken: mutableState.branchToken,
-			MinEventID:  1,
-			MaxEventID:  mutableState.lastEventID,
-			PageSize:    1024,
+			ShardID:       s.shardContext.GetShardID(),
+			BranchToken:   mutableState.branchToken,
+			MinEventID:    1,
+			MaxEventID:    mutableState.lastEventID,
+			PageSize:      1024,
+			NextPageToken: nextPageToken,
 		})
 		if err != nil {
 			return nil, err
 		}
 		events = append(events, response.HistoryEvents...)
-		if len(response.NextPageToken) == 0 {
+		nextPageToken = response.NextPageToken
+		if len(nextPageToken) == 0 {
 			break
 		}
 	}
