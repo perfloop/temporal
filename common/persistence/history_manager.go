@@ -639,7 +639,7 @@ func (m *executionManagerImpl) readRawHistoryBranch(
 		}
 	}
 
-	if err := validateHistoryPagingTokenRange(token, len(branchAncestors)); err != nil {
+	if err := validateHistoryPagingTokenRange(token, len(branchAncestors), false); err != nil {
 		return nil, nil, err
 	}
 
@@ -667,10 +667,13 @@ func (m *executionManagerImpl) readRawHistoryBranch(
 	return resp.Nodes, token, nil
 }
 
-func validateHistoryPagingTokenRange(token *historyPagingToken, branchRangeCount int) error {
+func validateHistoryPagingTokenRange(token *historyPagingToken, branchRangeCount int, reverseOrder bool) error {
 	if token.CurrentRangeIndex < 0 ||
-		token.CurrentRangeIndex > token.FinalRangeIndex ||
-		token.FinalRangeIndex >= branchRangeCount {
+		token.CurrentRangeIndex >= branchRangeCount ||
+		token.FinalRangeIndex < 0 ||
+		token.FinalRangeIndex >= branchRangeCount ||
+		(!reverseOrder && token.CurrentRangeIndex > token.FinalRangeIndex) ||
+		(reverseOrder && token.CurrentRangeIndex < token.FinalRangeIndex) {
 		return serviceerror.NewInvalidArgument("invalid history paging token")
 	}
 	return nil
@@ -711,7 +714,7 @@ func (m *executionManagerImpl) readRawHistoryBranchReverse(
 		}
 	}
 
-	if err := validateHistoryPagingTokenRange(token, len(branchAncestors)); err != nil {
+	if err := validateHistoryPagingTokenRange(token, len(branchAncestors), true); err != nil {
 		return nil, nil, err
 	}
 
