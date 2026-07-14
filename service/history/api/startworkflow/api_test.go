@@ -8,16 +8,22 @@ import (
 
 	"github.com/google/uuid"
 	historypb "go.temporal.io/api/history/v1"
+	"go.temporal.io/api/workflowservice/v1"
+	"go.temporal.io/server/api/historyservice/v1"
+	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/common/config"
 	"go.temporal.io/server/common/dynamicconfig"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/metrics"
+	"go.temporal.io/server/common/namespace"
 	"go.temporal.io/server/common/persistence"
 	"go.temporal.io/server/common/persistence/serialization"
 	"go.temporal.io/server/common/persistence/sql"
 	_ "go.temporal.io/server/common/persistence/sql/sqlplugin/sqlite"
 	"go.temporal.io/server/common/resolver"
+	historyapi "go.temporal.io/server/service/history/api"
 	historyi "go.temporal.io/server/service/history/interfaces"
+	wcache "go.temporal.io/server/service/history/workflow/cache"
 	"go.uber.org/mock/gomock"
 )
 
@@ -117,6 +123,62 @@ func TestStarterGetWorkflowHistoryPropagatesNextPageToken(t *testing.T) {
 	}
 	if duplicatePageRequests != 0 || len(events) != 2 || events[0].GetEventId() != 1 || events[1].GetEventId() != 2 {
 		t.Fatalf("duplicate_page_requests/op = %d, events = %#v", duplicatePageRequests, events)
+	}
+}
+
+func TestStarterRespondToRetriedRequestReadsSecondHistoryPage(t *testing.T) {
+	t.Parallel()
+
+	starter, state, mutableState := newSQLiteHistoryReader(t)
+	state.reset()
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+	workflowCache := wcache.NewMockCache(ctrl)
+	consistencyChecker := historyapi.NewMockWorkflowConsistencyChecker(ctrl)
+	workflowContext := historyi.NewMockWorkflowContext(ctrl)
+	workflowMutableState := historyi.NewMockMutableState(ctrl)
+	namespaceEntry := namespace.NewLocalNamespaceForTest(
+		&persistencespb.NamespaceInfo{Id: "namespace-id", Name: "namespace"},
+		nil,
+		"active",
+	)
+	consistencyChecker.EXPECT().GetWorkflowCache().Return(workflowCache)
+	workflowCache.EXPECT().GetOrCreateWorkflowExecution(
+		gomock.Any(),
+		starter.shardContext,
+		namespaceEntry.ID(),
+		gomock.Any(),
+		gomock.Any(),
+	).Return(workflowContext, func(error) {}, nil)
+	workflowContext.EXPECT().LoadMutableState(gomock.Any(), starter.shardContext).Return(workflowMutableState, nil)
+	workflowMutableState.EXPECT().GetCurrentBranchToken().Return(mutableState.branchToken, nil)
+	workflowMutableState.EXPECT().GetStartedWorkflowTask().Return(&historyi.WorkflowTaskInfo{
+		ScheduledEventID: 2,
+		StartedEventID:   3,
+		Attempt:          1,
+	})
+	workflowMutableState.EXPECT().GetFirstRunID(gomock.Any()).Return("first-run", nil)
+	workflowMutableState.EXPECT().GetNextEventID().Return(int64(historyReaderEventCount + 2))
+
+	errAfterHistory := errors.New("response construction reached")
+	shardContext := starter.shardContext.(*historyi.MockShardContext)
+	shardContext.EXPECT().NewVectorClock().Return(nil, errAfterHistory)
+	starter.workflowConsistencyChecker = consistencyChecker
+	starter.namespace = namespaceEntry
+	starter.request = &historyservice.StartWorkflowExecutionRequest{
+		StartRequest: &workflowservice.StartWorkflowExecutionRequest{
+			RequestEagerExecution: true,
+			WorkflowId:            "workflow",
+		},
+	}
+
+	_, err := starter.respondToRetriedRequest(context.Background(), "run", "first-run")
+	if !errors.Is(err, errAfterHistory) {
+		t.Fatalf("respondToRetriedRequest returned error: %v", err)
+	}
+	if state.duplicatePageRequests != 0 || state.databaseReadRequests != 2 {
+		t.Fatalf("paged retry read state = %#v", state)
 	}
 }
 
