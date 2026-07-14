@@ -101,6 +101,9 @@ func TestStarterGetWorkflowHistoryPropagatesNextPageToken(t *testing.T) {
 	}
 }
 
+// BenchmarkStarterGetWorkflowHistoryDuplicatePageRequests measures the bounded duplicate-page reproduction only.
+// The unfixed path performs the duplicate store read and then receives a sentinel error, while the fixed path
+// returns the complete two-page history; it is not an end-to-end completed-workflow latency comparison.
 func BenchmarkStarterGetWorkflowHistoryDuplicatePageRequests(b *testing.B) {
 	starter, state, mutableState := newSQLiteHistoryReader(b)
 
