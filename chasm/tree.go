@@ -1692,7 +1692,8 @@ func (n *Node) AddTask(
 // CloseTransaction is used by MutableState to close the transaction and
 // track changes made in the current transaction.
 func (n *Node) CloseTransaction() (NodesMutation, error) {
-	defer n.cleanupTransaction()
+	successful := false
+	defer func() { n.cleanupTransaction(successful) }()
 
 	if err := n.executeImmediatePureTasks(); err != nil {
 		return NodesMutation{}, err
@@ -1741,6 +1742,7 @@ func (n *Node) CloseTransaction() (NodesMutation, error) {
 	maps.Copy(n.mutation.UpdatedNodes, n.systemMutation.UpdatedNodes)
 	maps.Copy(n.mutation.DeletedNodes, n.systemMutation.DeletedNodes)
 
+	successful = true
 	return n.mutation, nil
 }
 
@@ -2472,7 +2474,7 @@ func (n *Node) andAllChildren() iter.Seq2[[]string, *Node] {
 	}
 }
 
-func (n *Node) cleanupTransaction() {
+func (n *Node) cleanupTransaction(successful bool) {
 	n.mutation = NodesMutation{
 		UpdatedNodes: make(map[string]*persistencespb.ChasmNode),
 		DeletedNodes: make(map[string]struct{}),
@@ -2502,9 +2504,13 @@ func (n *Node) cleanupTransaction() {
 
 	n.needsPointerResolution = false
 
-	// Reset per-node subtreeIsDirty on all nodes in the tree.
-	for _, node := range n.andAllChildren() {
-		node.subtreeIsDirty = false
+	// A failed close can leave nodes needing serialization. Preserve their dirty
+	// index so a retry takes the serialization path instead of treating the tree
+	// as clean.
+	if successful {
+		for _, node := range n.andAllChildren() {
+			node.subtreeIsDirty = false
+		}
 	}
 }
 
