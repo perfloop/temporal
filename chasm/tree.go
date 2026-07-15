@@ -1933,6 +1933,10 @@ func (n *Node) closeTransactionForceUpdateVisibility(
 }
 
 func (n *Node) closeTransactionSerializeNodes() error {
+	if !n.subtreeIsDirty {
+		return nil
+	}
+
 	for nodePath, node := range n.andAllChildren() {
 		if node.valueState > valueStateNeedSerialize {
 			return serviceerror.NewInternalf("invalid valueState for serializing: %v", node.valueState)
