@@ -76,21 +76,11 @@ func newInstrumentedPageSizeAwareRawHistoryExecutionManager(
 }
 
 func BenchmarkReadFullPageRawEventsFilteredContinuationBoundaryMetrics(b *testing.B) {
-	nodes := rawHistoryNodes(3, 1, rawHistoryBenchmarkBlobSize)
-	nodes = append(nodes,
-		InternalHistoryNode{
-			NodeID:        3,
-			TransactionID: 0,
-			Events:        rawHistoryBlobs(1, 4, rawHistoryBenchmarkBlobSize)[0],
-		},
-		InternalHistoryNode{
-			NodeID:        3,
-			TransactionID: 0,
-			Events:        rawHistoryBlobs(1, 5, rawHistoryBenchmarkBlobSize)[0],
-		},
+	manager, branchToken, store := newInstrumentedPageSizeAwareRawHistoryExecutionManager(
+		b,
+		filteredContinuationRawHistoryNodes(),
+		3,
 	)
-	nodes = append(nodes, rawHistoryNodes(8, 4, rawHistoryBenchmarkBlobSize)...)
-	manager, branchToken, store := newInstrumentedPageSizeAwareRawHistoryExecutionManager(b, nodes, 3)
 
 	var consumed, totalCalls, totalFetchedBytes, totalReturnedBytes int
 	b.ResetTimer()

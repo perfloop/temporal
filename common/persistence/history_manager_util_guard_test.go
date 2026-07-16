@@ -117,31 +117,12 @@ func newPageSizeAwareRawHistoryExecutionManager(
 	), branchToken
 }
 
-func BenchmarkReadFullPageRawEventsTerminalBoundary(b *testing.B) {
+func BenchmarkReadFullPageRawEventsFilteredContinuationBoundary(b *testing.B) {
 	manager, branchToken := newPageSizeAwareRawHistoryExecutionManager(
 		b,
-		rawHistoryNodes(10, 1, rawHistoryBenchmarkBlobSize),
-		0,
+		filteredContinuationRawHistoryNodes(),
+		3,
 	)
-	benchmarkReadFullPageRawEventsAtExecutionManagerBoundary(b, manager, branchToken)
-}
-
-func BenchmarkReadFullPageRawEventsFilteredContinuationBoundary(b *testing.B) {
-	nodes := rawHistoryNodes(3, 1, rawHistoryBenchmarkBlobSize)
-	nodes = append(nodes,
-		InternalHistoryNode{
-			NodeID:        3,
-			TransactionID: 0,
-			Events:        rawHistoryBlobs(1, 4, rawHistoryBenchmarkBlobSize)[0],
-		},
-		InternalHistoryNode{
-			NodeID:        3,
-			TransactionID: 0,
-			Events:        rawHistoryBlobs(1, 5, rawHistoryBenchmarkBlobSize)[0],
-		},
-	)
-	nodes = append(nodes, rawHistoryNodes(8, 4, rawHistoryBenchmarkBlobSize)...)
-	manager, branchToken := newPageSizeAwareRawHistoryExecutionManager(b, nodes, 3)
 	benchmarkReadFullPageRawEventsAtExecutionManagerBoundary(b, manager, branchToken)
 }
 

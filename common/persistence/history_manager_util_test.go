@@ -8,6 +8,9 @@ import (
 
 	"github.com/stretchr/testify/require"
 	commonpb "go.temporal.io/api/common/v1"
+	"go.temporal.io/server/common/dynamicconfig"
+	"go.temporal.io/server/common/log"
+	"go.temporal.io/server/common/persistence/serialization"
 )
 
 const (
@@ -83,6 +86,85 @@ func (m *continuationRawHistoryExecutionManager) ReadRawHistoryBranch(
 	}, nil
 }
 
+type failOnNthPageSizeAwareRawHistoryStore struct {
+	*pageSizeAwareRawHistoryStore
+	calls      int
+	failOnCall int
+	err        error
+}
+
+func (s *failOnNthPageSizeAwareRawHistoryStore) ReadHistoryBranch(
+	ctx context.Context,
+	request *InternalReadHistoryBranchRequest,
+) (*InternalReadHistoryBranchResponse, error) {
+	s.calls++
+	if s.calls == s.failOnCall {
+		return nil, s.err
+	}
+	return s.pageSizeAwareRawHistoryStore.ReadHistoryBranch(ctx, request)
+}
+
+func newFailOnNthPageSizeAwareRawHistoryExecutionManager(
+	t testing.TB,
+	nodes []InternalHistoryNode,
+	firstPageSize int,
+	failOnCall int,
+	err error,
+) (ExecutionManager, []byte, *failOnNthPageSizeAwareRawHistoryStore) {
+	t.Helper()
+
+	serializer := serialization.NewSerializer()
+	historyBranchUtil := NewHistoryBranchUtil(serializer)
+	branchID := "failing-branch-id"
+	branchToken, branchErr := historyBranchUtil.NewHistoryBranch(
+		"namespace-id",
+		"workflow-id",
+		"run-id",
+		"tree-id",
+		&branchID,
+		nil,
+		0,
+		0,
+		0,
+	)
+	require.NoError(t, branchErr)
+
+	store := &failOnNthPageSizeAwareRawHistoryStore{
+		pageSizeAwareRawHistoryStore: &pageSizeAwareRawHistoryStore{
+			historyBranchUtil: historyBranchUtil,
+			nodes:             nodes,
+			firstPageSize:     firstPageSize,
+		},
+		failOnCall: failOnCall,
+		err:        err,
+	}
+	return NewExecutionManager(
+		store,
+		serializer,
+		nil,
+		log.NewNoopLogger(),
+		dynamicconfig.GetIntPropertyFn(1024*1024),
+		dynamicconfig.GetBoolPropertyFn(false),
+	), branchToken, store
+}
+
+func filteredContinuationRawHistoryNodes() []InternalHistoryNode {
+	nodes := rawHistoryNodes(3, 1, rawHistoryBenchmarkBlobSize)
+	nodes = append(nodes,
+		InternalHistoryNode{
+			NodeID:        3,
+			TransactionID: 0,
+			Events:        rawHistoryBlobs(1, 4, rawHistoryBenchmarkBlobSize)[0],
+		},
+		InternalHistoryNode{
+			NodeID:        3,
+			TransactionID: 0,
+			Events:        rawHistoryBlobs(1, 5, rawHistoryBenchmarkBlobSize)[0],
+		},
+	)
+	return append(nodes, rawHistoryNodes(8, 4, rawHistoryBenchmarkBlobSize)...)
+}
+
 func TestReadFullPageRawEventsPreservesPaginationSemantics(t *testing.T) {
 	t.Parallel()
 
@@ -117,7 +199,7 @@ func TestReadFullPageRawEventsPreservesPaginationSemantics(t *testing.T) {
 			expectedBlobs:     append(append([]*commonpb.DataBlob(nil), firstPage...), secondPage...),
 			expectedToken:     []byte("after-page"),
 			expectedTokens:    [][]byte{nil, []byte("first")},
-			expectedPageSizes: []int{10, 7},
+			expectedPageSizes: []int{10, 10},
 		},
 		{
 			name: "retains atomic batch overshoot",
@@ -134,7 +216,7 @@ func TestReadFullPageRawEventsPreservesPaginationSemantics(t *testing.T) {
 			expectedBlobs:     append(append([]*commonpb.DataBlob(nil), firstPage...), atomicPage...),
 			expectedToken:     []byte("after-atomic"),
 			expectedTokens:    [][]byte{nil, []byte("atomic")},
-			expectedPageSizes: []int{10, 7},
+			expectedPageSizes: []int{10, 10},
 		},
 		{
 			name: "continues until original target is filled",
@@ -158,7 +240,7 @@ func TestReadFullPageRawEventsPreservesPaginationSemantics(t *testing.T) {
 			),
 			expectedToken:     []byte("after-page"),
 			expectedTokens:    [][]byte{nil, []byte("first"), []byte("second")},
-			expectedPageSizes: []int{10, 7, 3},
+			expectedPageSizes: []int{10, 10, 10},
 		},
 		{
 			name: "returns terminal short page",
@@ -183,7 +265,7 @@ func TestReadFullPageRawEventsPreservesPaginationSemantics(t *testing.T) {
 				},
 			},
 			expectedTokens:    [][]byte{nil, []byte("error")},
-			expectedPageSizes: []int{10, 7},
+			expectedPageSizes: []int{10, 10},
 			expectedErr:       continuationErr,
 		},
 	}
@@ -215,6 +297,32 @@ func TestReadFullPageRawEventsPreservesPaginationSemantics(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("filtered continuation completes before third store error", func(t *testing.T) {
+		thirdReadErr := errors.New("third store read failed")
+		manager, branchToken, store := newFailOnNthPageSizeAwareRawHistoryExecutionManager(
+			t,
+			filteredContinuationRawHistoryNodes(),
+			3,
+			3,
+			thirdReadErr,
+		)
+		request := &ReadHistoryBranchRequest{
+			BranchToken: branchToken,
+			MinEventID:  1,
+			MaxEventID:  100,
+			PageSize:    rawHistoryBenchmarkPageSize,
+		}
+
+		blobs, size, nextPageToken, err := ReadFullPageRawEvents(context.Background(), manager, request)
+
+		require.NoError(t, err)
+		require.Len(t, blobs, 11)
+		require.Equal(t, 11*rawHistoryBenchmarkBlobSize, size)
+		require.Empty(t, nextPageToken)
+		require.Equal(t, 2, store.calls)
+		require.Equal(t, rawHistoryBenchmarkPageSize, request.PageSize)
+	})
 }
 
 func BenchmarkReadFullPageRawEventsContinuation(b *testing.B) {
