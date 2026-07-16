@@ -2,6 +2,7 @@ package persistence
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -19,6 +20,7 @@ var rawHistoryBenchmarkSink int
 type rawHistoryPage struct {
 	blobs         []*commonpb.DataBlob
 	nextPageToken []byte
+	err           error
 }
 
 type rawHistoryReadRequest struct {
@@ -45,6 +47,9 @@ func (m *scriptedRawHistoryExecutionManager) ReadRawHistoryBranch(
 		pageSize:      request.PageSize,
 		nextPageToken: append([]byte(nil), request.NextPageToken...),
 	})
+	if page.err != nil {
+		return nil, page.err
+	}
 	return &ReadRawHistoryBranchResponse{
 		HistoryEventBlobs: page.blobs,
 		NextPageToken:     append([]byte(nil), page.nextPageToken...),
@@ -86,13 +91,16 @@ func TestReadFullPageRawEventsPreservesPaginationSemantics(t *testing.T) {
 	middlePage := rawHistoryBlobs(4, 4, 1)
 	thirdPage := rawHistoryBlobs(3, 11, 1)
 	atomicPage := rawHistoryBlobs(8, 4, 1)
+	continuationErr := errors.New("continuation read failed")
 
 	tests := []struct {
-		name           string
-		pages          map[string]rawHistoryPage
-		expectedBlobs  []*commonpb.DataBlob
-		expectedToken  []byte
-		expectedTokens [][]byte
+		name              string
+		pages             map[string]rawHistoryPage
+		expectedBlobs     []*commonpb.DataBlob
+		expectedToken     []byte
+		expectedTokens    [][]byte
+		expectedPageSizes []int
+		expectedErr       error
 	}{
 		{
 			name: "fills page across continuation",
@@ -106,9 +114,10 @@ func TestReadFullPageRawEventsPreservesPaginationSemantics(t *testing.T) {
 					nextPageToken: []byte("after-page"),
 				},
 			},
-			expectedBlobs:  append(append([]*commonpb.DataBlob(nil), firstPage...), secondPage...),
-			expectedToken:  []byte("after-page"),
-			expectedTokens: [][]byte{nil, []byte("first")},
+			expectedBlobs:     append(append([]*commonpb.DataBlob(nil), firstPage...), secondPage...),
+			expectedToken:     []byte("after-page"),
+			expectedTokens:    [][]byte{nil, []byte("first")},
+			expectedPageSizes: []int{10, 7},
 		},
 		{
 			name: "retains atomic batch overshoot",
@@ -122,9 +131,10 @@ func TestReadFullPageRawEventsPreservesPaginationSemantics(t *testing.T) {
 					nextPageToken: []byte("after-atomic"),
 				},
 			},
-			expectedBlobs:  append(append([]*commonpb.DataBlob(nil), firstPage...), atomicPage...),
-			expectedToken:  []byte("after-atomic"),
-			expectedTokens: [][]byte{nil, []byte("atomic")},
+			expectedBlobs:     append(append([]*commonpb.DataBlob(nil), firstPage...), atomicPage...),
+			expectedToken:     []byte("after-atomic"),
+			expectedTokens:    [][]byte{nil, []byte("atomic")},
+			expectedPageSizes: []int{10, 7},
 		},
 		{
 			name: "continues until original target is filled",
@@ -146,8 +156,9 @@ func TestReadFullPageRawEventsPreservesPaginationSemantics(t *testing.T) {
 				append(append([]*commonpb.DataBlob(nil), firstPage...), middlePage...),
 				thirdPage...,
 			),
-			expectedToken:  []byte("after-page"),
-			expectedTokens: [][]byte{nil, []byte("first"), []byte("second")},
+			expectedToken:     []byte("after-page"),
+			expectedTokens:    [][]byte{nil, []byte("first"), []byte("second")},
+			expectedPageSizes: []int{10, 7, 3},
 		},
 		{
 			name: "returns terminal short page",
@@ -156,8 +167,24 @@ func TestReadFullPageRawEventsPreservesPaginationSemantics(t *testing.T) {
 					blobs: firstPage,
 				},
 			},
-			expectedBlobs:  firstPage,
-			expectedTokens: [][]byte{nil},
+			expectedBlobs:     firstPage,
+			expectedTokens:    [][]byte{nil},
+			expectedPageSizes: []int{10},
+		},
+		{
+			name: "restores page size after continuation error",
+			pages: map[string]rawHistoryPage{
+				"": {
+					blobs:         firstPage,
+					nextPageToken: []byte("error"),
+				},
+				"error": {
+					err: continuationErr,
+				},
+			},
+			expectedTokens:    [][]byte{nil, []byte("error")},
+			expectedPageSizes: []int{10, 7},
+			expectedErr:       continuationErr,
 		},
 	}
 
@@ -169,16 +196,22 @@ func TestReadFullPageRawEventsPreservesPaginationSemantics(t *testing.T) {
 			request := &ReadHistoryBranchRequest{PageSize: rawHistoryBenchmarkPageSize}
 			blobs, size, nextPageToken, err := ReadFullPageRawEvents(context.Background(), manager, request)
 
-			require.NoError(t, err)
-			require.Equal(t, tt.expectedBlobs, blobs)
-			require.Equal(t, rawHistoryBlobsSize(tt.expectedBlobs), size)
-			require.Equal(t, tt.expectedToken, nextPageToken)
+			if tt.expectedErr != nil {
+				require.ErrorIs(t, err, tt.expectedErr)
+				require.Nil(t, blobs)
+				require.Zero(t, size)
+				require.Nil(t, nextPageToken)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, tt.expectedBlobs, blobs)
+				require.Equal(t, rawHistoryBlobsSize(tt.expectedBlobs), size)
+				require.Equal(t, tt.expectedToken, nextPageToken)
+			}
 			require.Equal(t, rawHistoryBenchmarkPageSize, request.PageSize)
 			require.Len(t, manager.requests, len(tt.expectedTokens))
 			for index, expectedToken := range tt.expectedTokens {
 				require.Equal(t, expectedToken, manager.requests[index].nextPageToken)
-				require.Greater(t, manager.requests[index].pageSize, 0)
-				require.LessOrEqual(t, manager.requests[index].pageSize, rawHistoryBenchmarkPageSize)
+				require.Equal(t, tt.expectedPageSizes[index], manager.requests[index].pageSize)
 			}
 		})
 	}
