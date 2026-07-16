@@ -36,6 +36,26 @@ func TestPinnedCacheEvictsLeastRecentlyUsedUnpinnedEntry(t *testing.T) {
 	require.Equal(t, "B", cache.Get("B"))
 	require.Equal(t, "C", cache.Get("C"))
 	require.Equal(t, "D", cache.Get("D"))
+
+	cache = New(3, &Options{Pin: true})
+	for _, key := range []string{"A", "B", "C"} {
+		_, err := cache.PutIfNotExist(key, key)
+		require.NoError(t, err)
+	}
+
+	// Reacquiring A moves it to most-recently-used before its final release, so
+	// B remains the least-recently-used evictable entry.
+	cache.Release("A")
+	cache.Release("B")
+	require.Equal(t, "A", cache.Get("A"))
+	cache.Release("A")
+	_, err = cache.PutIfNotExist("D", "D")
+	require.NoError(t, err)
+
+	require.Equal(t, "A", cache.Get("A"))
+	require.Nil(t, cache.Get("B"))
+	require.Equal(t, "C", cache.Get("C"))
+	require.Equal(t, "D", cache.Get("D"))
 }
 
 func BenchmarkPinnedFullCacheInsertAt1K(b *testing.B) {
