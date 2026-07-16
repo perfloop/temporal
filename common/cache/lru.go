@@ -30,20 +30,21 @@ const emptyEntrySize = 0
 // lru is a concurrent fixed size cache that evicts elements in lru order
 type (
 	lru struct {
-		mut             sync.Mutex
-		byAccess        *list.List
-		byKey           map[any]*list.Element
-		maxSize         int
-		currSize        int
-		pinnedSize      int
-		onPut           func(val any)
-		onEvict         func(val any)
-		ttl             time.Duration
-		pin             bool
-		timeSource      clock.TimeSource
-		metricsHandler  metrics.Handler
-		backgroundEvict dynamicconfig.TypedPropertyFn[dynamicconfig.CacheBackgroundEvictSettings]
-		loops           goro.Group
+		mut                 sync.Mutex
+		byAccess            *list.List
+		byKey               map[any]*list.Element
+		maxSize             int
+		currSize            int
+		pinnedSize          int
+		evictableEntryCount int
+		onPut               func(val any)
+		onEvict             func(val any)
+		ttl                 time.Duration
+		pin                 bool
+		timeSource          clock.TimeSource
+		metricsHandler      metrics.Handler
+		backgroundEvict     dynamicconfig.TypedPropertyFn[dynamicconfig.CacheBackgroundEvictSettings]
+		loops               goro.Group
 	}
 
 	iteratorImpl struct {
@@ -57,6 +58,7 @@ type (
 		createTime time.Time
 		value      any
 		refCount   int
+		evictable  bool
 		size       int
 	}
 )
@@ -269,6 +271,8 @@ func (c *lru) Release(key any) {
 	if entry.refCount == 0 {
 		c.pinnedSize -= entry.Size()
 		metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
+		entry.evictable = true
+		c.evictableEntryCount++
 	}
 	// Entry size might have changed. Recalculate size and evict entries if necessary.
 	newEntrySize := getSize(entry.value)
@@ -346,12 +350,20 @@ func (c *lru) putInternal(key any, value any, allowUpdate bool) (any, error) {
 		c.deleteInternal(elt)
 	}
 
-	c.tryEvictUntilEnoughSpaceWithSkipEntry(newEntrySize, nil)
-
-	// check if the new entry can fit in the cache
+	// Check whether the new entry can fit in the cache before searching for an eviction candidate.
 	newCacheSize := c.calculateNewCacheSize(newEntrySize, emptyEntrySize)
 	if newCacheSize > c.maxSize {
-		return nil, ErrCacheFull
+		// A pinned cache with no evictable entries cannot make room. Avoid scanning every
+		// pinned entry before returning the same cache-full error.
+		if c.pin && c.evictableEntryCount == 0 {
+			return nil, ErrCacheFull
+		}
+
+		c.tryEvictUntilEnoughSpaceWithSkipEntry(newEntrySize, nil)
+		newCacheSize = c.calculateNewCacheSize(newEntrySize, emptyEntrySize)
+		if newCacheSize > c.maxSize {
+			return nil, ErrCacheFull
+		}
 	}
 
 	entry := &entryImpl{
@@ -379,6 +391,10 @@ func (c *lru) calculateNewCacheSize(newEntrySize int, existingEntrySize int) int
 
 func (c *lru) deleteInternal(element *list.Element) {
 	entry := c.byAccess.Remove(element).(*entryImpl)
+	if c.pin && entry.evictable {
+		c.evictableEntryCount--
+		entry.evictable = false
+	}
 	c.currSize -= entry.Size()
 	metrics.CacheUsage.With(c.metricsHandler).Record(float64(c.currSize))
 	metrics.CacheEntryAgeOnEviction.With(c.metricsHandler).Record(c.timeSource.Now().UTC().Sub(entry.createTime))
@@ -437,6 +453,10 @@ func (c *lru) updateEntryTTL(entry *entryImpl) {
 
 func (c *lru) updateEntryRefCount(entry *entryImpl) {
 	if c.pin {
+		if entry.evictable {
+			c.evictableEntryCount--
+			entry.evictable = false
+		}
 		entry.refCount++
 		if entry.refCount == 1 {
 			c.pinnedSize += entry.Size()
