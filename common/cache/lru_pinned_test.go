@@ -55,3 +55,22 @@ func TestPinnedCacheTracksEvictableEntries(t *testing.T) {
 	cache.Delete("A")
 	require.Zero(t, cache.evictableEntryCount)
 }
+
+func TestPinnedCacheReleaseUnderflowCanBecomeEvictable(t *testing.T) {
+	t.Parallel()
+
+	cache := New(1, &Options{Pin: true})
+	_, err := cache.PutIfNotExist("A", "A")
+	require.NoError(t, err)
+
+	// Release does not reject unbalanced calls. Preserve the existing behavior where
+	// a later Get can bring a negative reference count back to zero and make A evictable.
+	cache.Release("A")
+	cache.Release("A")
+	require.Equal(t, "A", cache.Get("A"))
+
+	_, err = cache.PutIfNotExist("B", "B")
+	require.NoError(t, err)
+	require.Nil(t, cache.Get("A"))
+	require.Equal(t, "B", cache.Get("B"))
+}

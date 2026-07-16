@@ -58,7 +58,7 @@ type (
 		createTime time.Time
 		value      any
 		refCount   int
-		evictable  bool
+		evictable  bool // true when refCount is zero in a pinned cache
 		size       int
 	}
 )
@@ -268,11 +268,19 @@ func (c *lru) Release(key any) {
 	}
 	entry := elt.Value.(*entryImpl)
 	entry.refCount--
-	if entry.refCount == 0 {
+	switch entry.refCount {
+	case 0:
 		c.pinnedSize -= entry.Size()
 		metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
-		entry.evictable = true
-		c.evictableEntryCount++
+		if !entry.evictable {
+			entry.evictable = true
+			c.evictableEntryCount++
+		}
+	case -1:
+		if entry.evictable {
+			entry.evictable = false
+			c.evictableEntryCount--
+		}
 	}
 	// Entry size might have changed. Recalculate size and evict entries if necessary.
 	newEntrySize := getSize(entry.value)
@@ -453,12 +461,18 @@ func (c *lru) updateEntryTTL(entry *entryImpl) {
 
 func (c *lru) updateEntryRefCount(entry *entryImpl) {
 	if c.pin {
-		if entry.evictable {
-			c.evictableEntryCount--
-			entry.evictable = false
-		}
 		entry.refCount++
-		if entry.refCount == 1 {
+		switch entry.refCount {
+		case 0:
+			if !entry.evictable {
+				entry.evictable = true
+				c.evictableEntryCount++
+			}
+		case 1:
+			if entry.evictable {
+				entry.evictable = false
+				c.evictableEntryCount--
+			}
 			c.pinnedSize += entry.Size()
 			metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
 		}
