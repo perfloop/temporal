@@ -383,8 +383,7 @@ func (c *lru) calculateNewCacheSize(newEntrySize int, existingEntrySize int) int
 }
 
 func (c *lru) deleteInternal(element *list.Element) {
-	entry := element.Value.(*entryImpl)
-	c.byAccess.Remove(element)
+	entry := c.byAccess.Remove(element).(*entryImpl)
 	c.currSize -= entry.Size()
 	metrics.CacheUsage.With(c.metricsHandler).Record(float64(c.currSize))
 	metrics.CacheEntryAgeOnEviction.With(c.metricsHandler).Record(c.timeSource.Now().UTC().Sub(entry.createTime))

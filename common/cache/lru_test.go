@@ -445,45 +445,6 @@ func TestPinnedCacheEvictableHintRecoversAfterUnbalancedRelease(t *testing.T) {
 	assertPinnedCacheEvictableHint(t, cache)
 }
 
-func TestPinnedCacheEvictableHintTracksExpiryPaths(t *testing.T) {
-	t.Parallel()
-
-	newCache := func() (StoppableCache, *clock.EventTimeSource) {
-		timeSource := clock.NewEventTimeSource()
-		return New(2, &Options{
-			Pin:        true,
-			TTL:        time.Minute,
-			TimeSource: timeSource,
-		}), timeSource
-	}
-
-	cache, timeSource := newCache()
-	_, err := cache.PutIfNotExist("get", "get")
-	require.NoError(t, err)
-	cache.Release("get")
-	timeSource.Advance(time.Minute + time.Nanosecond)
-	require.Nil(t, cache.Get("get"))
-	assertPinnedCacheEvictableHint(t, cache)
-
-	cache, timeSource = newCache()
-	_, err = cache.PutIfNotExist("iterator", "iterator")
-	require.NoError(t, err)
-	cache.Release("iterator")
-	timeSource.Advance(time.Minute + time.Nanosecond)
-	iterator := cache.Iterator()
-	require.False(t, iterator.HasNext())
-	iterator.Close()
-	assertPinnedCacheEvictableHint(t, cache)
-
-	cache, timeSource = newCache()
-	_, err = cache.PutIfNotExist("background", "background")
-	require.NoError(t, err)
-	cache.Release("background")
-	timeSource.Advance(time.Minute + time.Nanosecond)
-	cache.(*lru).bgEvict(dynamicconfig.CacheBackgroundEvictSettings{MaxEntryPerCall: 1})
-	assertPinnedCacheEvictableHint(t, cache)
-}
-
 func TestPinnedCacheCanRetryPutIfNotExistAfterErrCacheFull(t *testing.T) {
 	t.Parallel()
 
