@@ -1,7 +1,6 @@
 package cache
 
 import (
-	"container/heap"
 	"container/list"
 	"context"
 	"sync"
@@ -31,22 +30,21 @@ const emptyEntrySize = 0
 // lru is a concurrent fixed size cache that evicts elements in lru order
 type (
 	lru struct {
-		mut              sync.Mutex
-		byAccess         *list.List
-		byKey            map[any]*list.Element
-		evictableEntries entryHeap
-		accessOrder      uint64
-		maxSize          int
-		currSize         int
-		pinnedSize       int
-		onPut            func(val any)
-		onEvict          func(val any)
-		ttl              time.Duration
-		pin              bool
-		timeSource       clock.TimeSource
-		metricsHandler   metrics.Handler
-		backgroundEvict  dynamicconfig.TypedPropertyFn[dynamicconfig.CacheBackgroundEvictSettings]
-		loops            goro.Group
+		mut             sync.Mutex
+		byAccess        *list.List
+		byKey           map[any]*list.Element
+		maxSize         int
+		currSize        int
+		pinnedSize      int
+		evictableCount  int
+		onPut           func(val any)
+		onEvict         func(val any)
+		ttl             time.Duration
+		pin             bool
+		timeSource      clock.TimeSource
+		metricsHandler  metrics.Handler
+		backgroundEvict dynamicconfig.TypedPropertyFn[dynamicconfig.CacheBackgroundEvictSettings]
+		loops           goro.Group
 	}
 
 	iteratorImpl struct {
@@ -56,19 +54,12 @@ type (
 	}
 
 	entryImpl struct {
-		key            any
-		createTime     time.Time
-		value          any
-		refCount       int
-		size           int
-		accessOrder    uint64
-		evictableIndex int
+		key        any
+		createTime time.Time
+		value      any
+		refCount   int
+		size       int
 	}
-
-	// entryHeap orders unpinned entries by their last LRU access. It is used
-	// only by pinned caches, whose full-cache path otherwise has to scan pinned
-	// entries in byAccess.
-	entryHeap []*entryImpl
 )
 
 // Close closes the iterator
@@ -141,36 +132,6 @@ func (entry *entryImpl) Size() int {
 
 func (entry *entryImpl) CreateTime() time.Time {
 	return entry.createTime
-}
-
-func (h entryHeap) Len() int {
-	return len(h)
-}
-
-func (h entryHeap) Less(i, j int) bool {
-	return h[i].accessOrder < h[j].accessOrder
-}
-
-func (h entryHeap) Swap(i, j int) {
-	h[i], h[j] = h[j], h[i]
-	h[i].evictableIndex = i
-	h[j].evictableIndex = j
-}
-
-func (h *entryHeap) Push(value any) {
-	entry := value.(*entryImpl)
-	entry.evictableIndex = len(*h)
-	*h = append(*h, entry)
-}
-
-func (h *entryHeap) Pop() any {
-	entries := *h
-	last := len(entries) - 1
-	entry := entries[last]
-	entries[last] = nil
-	entry.evictableIndex = -1
-	*h = entries[:last]
-	return entry
 }
 
 // New creates a new cache with the given options
@@ -249,8 +210,7 @@ func (c *lru) Get(key any) any {
 
 	metrics.CacheEntryAgeOnGet.With(c.metricsHandler).Record(c.timeSource.Now().UTC().Sub(entry.createTime))
 
-	c.updateEntryRefCount(entry)
-	c.touchEntry(entry)
+	c.updateEntryRefCount(entry, true)
 	c.byAccess.MoveToFront(element)
 	return entry.value
 }
@@ -308,11 +268,9 @@ func (c *lru) Release(key any) {
 	entry := elt.Value.(*entryImpl)
 	entry.refCount--
 	if entry.refCount == 0 {
+		c.evictableCount++
 		c.pinnedSize -= entry.Size()
 		metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
-		c.addEvictableEntry(entry)
-	} else {
-		c.removeEvictableEntry(entry)
 	}
 	// Entry size might have changed. Recalculate size and evict entries if necessary.
 	newEntrySize := getSize(entry.value)
@@ -381,8 +339,7 @@ func (c *lru) putInternal(key any, value any, allowUpdate bool) (any, error) {
 				}
 			}
 
-			c.updateEntryRefCount(existingEntry)
-			c.touchEntry(existingEntry)
+			c.updateEntryRefCount(existingEntry, true)
 			c.byAccess.MoveToFront(elt)
 			return existingVal, nil
 		}
@@ -400,14 +357,12 @@ func (c *lru) putInternal(key any, value any, allowUpdate bool) (any, error) {
 	}
 
 	entry := &entryImpl{
-		key:            key,
-		value:          value,
-		size:           newEntrySize,
-		evictableIndex: -1,
+		key:   key,
+		value: value,
+		size:  newEntrySize,
 	}
 	c.updateEntryTTL(entry)
-	c.touchEntry(entry)
-	c.updateEntryRefCount(entry)
+	c.updateEntryRefCount(entry, false)
 	element := c.byAccess.PushFront(entry)
 	c.byKey[key] = element
 	c.currSize = newCacheSize
@@ -426,7 +381,9 @@ func (c *lru) calculateNewCacheSize(newEntrySize int, existingEntrySize int) int
 
 func (c *lru) deleteInternal(element *list.Element) {
 	entry := element.Value.(*entryImpl)
-	c.removeEvictableEntry(entry)
+	if c.pin && entry.refCount == 0 {
+		c.evictableCount--
+	}
 	c.byAccess.Remove(element)
 	c.currSize -= entry.Size()
 	metrics.CacheUsage.With(c.metricsHandler).Record(float64(c.currSize))
@@ -446,20 +403,15 @@ func (c *lru) tryEvictUntilCacheSizeUnderLimit() {
 // tryEvictUntilEnoughSpaceWithSkipEntry try to evict entries until there is enough space for the new entry without
 // evicting the existing entry. the existing entry is skipped because it is being updated.
 func (c *lru) tryEvictUntilEnoughSpaceWithSkipEntry(newEntrySize int, existingEntry *entryImpl) {
+	element := c.byAccess.Back()
 	existingEntrySize := 0
 	if existingEntry != nil {
 		existingEntrySize = existingEntry.Size()
 	}
-
-	if c.pin && existingEntry == nil {
-		for c.calculateNewCacheSize(newEntrySize, existingEntrySize) > c.maxSize && len(c.evictableEntries) > 0 {
-			entry := c.evictableEntries[0]
-			c.deleteInternal(c.byKey[entry.key])
-		}
+	if c.pin && existingEntry == nil && c.evictableCount == 0 {
 		return
 	}
 
-	element := c.byAccess.Back()
 	for c.calculateNewCacheSize(newEntrySize, existingEntrySize) > c.maxSize && element != nil {
 		entry := element.Value.(*entryImpl)
 		if existingEntry != nil && entry.key == existingEntry.key {
@@ -492,41 +444,18 @@ func (c *lru) updateEntryTTL(entry *entryImpl) {
 	}
 }
 
-func (c *lru) updateEntryRefCount(entry *entryImpl) {
+func (c *lru) updateEntryRefCount(entry *entryImpl, existing bool) {
 	if c.pin {
+		if existing && entry.refCount == 0 {
+			c.evictableCount--
+		}
 		entry.refCount++
-		switch entry.refCount {
-		case 0:
-			c.addEvictableEntry(entry)
-		case 1:
-			c.removeEvictableEntry(entry)
+		if entry.refCount == 1 {
 			c.pinnedSize += entry.Size()
 			metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
+		} else if entry.refCount == 0 {
+			c.evictableCount++
 		}
-	}
-}
-
-func (c *lru) touchEntry(entry *entryImpl) {
-	if !c.pin {
-		return
-	}
-
-	c.accessOrder++
-	entry.accessOrder = c.accessOrder
-	if entry.evictableIndex >= 0 {
-		heap.Fix(&c.evictableEntries, entry.evictableIndex)
-	}
-}
-
-func (c *lru) addEvictableEntry(entry *entryImpl) {
-	if entry.evictableIndex < 0 {
-		heap.Push(&c.evictableEntries, entry)
-	}
-}
-
-func (c *lru) removeEvictableEntry(entry *entryImpl) {
-	if entry.evictableIndex >= 0 {
-		heap.Remove(&c.evictableEntries, entry.evictableIndex)
 	}
 }
 
