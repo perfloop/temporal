@@ -420,6 +420,31 @@ func TestPinnedCacheEvictableHintTracksMutationPaths(t *testing.T) {
 	require.False(t, assertPinnedCacheEvictableHint(t, cache))
 }
 
+func TestPinnedCacheEvictableHintRecoversAfterUnbalancedRelease(t *testing.T) {
+	t.Parallel()
+
+	cache := New(1, &Options{Pin: true})
+	value, err := cache.PutIfNotExist("A", "A")
+	require.NoError(t, err)
+	require.Equal(t, "A", value)
+
+	cache.Release("A")
+	cache.Release("A")
+	value, err = cache.PutIfNotExist("B", "B")
+	require.ErrorIs(t, err, ErrCacheFull)
+	require.Nil(t, value)
+	require.False(t, assertPinnedCacheEvictableHint(t, cache))
+
+	require.Equal(t, "A", cache.Get("A"))
+	require.True(t, assertPinnedCacheEvictableHint(t, cache))
+
+	value, err = cache.PutIfNotExist("B", "B")
+	require.NoError(t, err)
+	require.Equal(t, "B", value)
+	require.Nil(t, cache.Get("A"))
+	assertPinnedCacheEvictableHint(t, cache)
+}
+
 func TestPinnedCacheEvictableHintTracksExpiryPaths(t *testing.T) {
 	t.Parallel()
 

@@ -456,6 +456,8 @@ func (c *lru) updateEntryRefCount(entry *entryImpl) {
 		if entry.refCount == 1 {
 			c.pinnedSize += entry.Size()
 			metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
+		} else if entry.refCount == 0 {
+			c.mayHaveEvictable = true
 		}
 	}
 }
