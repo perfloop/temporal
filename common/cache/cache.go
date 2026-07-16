@@ -17,7 +17,9 @@ type Cache interface {
 	// Put adds an element to the cache, returning the previous element
 	Put(key any, value any) any
 
-	// PutIfNotExist puts a value associated with a given key if it does not exist
+	// PutIfNotExist puts a value associated with a given key if it does not exist.
+	// If it returns ErrCacheFull, the cache remains usable and callers may make
+	// later PutIfNotExist calls after capacity becomes available.
 	PutIfNotExist(key any, value any) (any, error)
 
 	// Delete deletes an element in the cache

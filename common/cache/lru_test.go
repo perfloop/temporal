@@ -29,6 +29,25 @@ func (c *testEntryWithCacheSize) CacheSize() int {
 	return c.cacheSize
 }
 
+func assertPinnedCacheEvictableHint(t *testing.T, cache StoppableCache) bool {
+	t.Helper()
+
+	lru, ok := cache.(*lru)
+	require.True(t, ok)
+
+	lru.mut.Lock()
+	defer lru.mut.Unlock()
+
+	actual := 0
+	for element := lru.byAccess.Front(); element != nil; element = element.Next() {
+		if element.Value.(*entryImpl).refCount == 0 {
+			actual++
+		}
+	}
+	require.True(t, lru.mayHaveEvictable || actual == 0)
+	return lru.mayHaveEvictable
+}
+
 func TestLRU(t *testing.T) {
 	t.Parallel()
 	metricsHandler := metricstest.NewCaptureHandler()
@@ -346,6 +365,122 @@ func TestMaxSizeWithPin_LastItem(t *testing.T) {
 	assert.Nil(t, cache.Get("B"))
 	assert.Nil(t, cache.Get("C"))
 	assert.Equal(t, 0, cache.Size())
+}
+
+func TestPinnedCacheEvictableHintTracksMutationPaths(t *testing.T) {
+	t.Parallel()
+
+	cache := New(2, &Options{Pin: true})
+	for _, key := range []string{"A", "B"} {
+		_, err := cache.PutIfNotExist(key, key)
+		require.NoError(t, err)
+	}
+	require.False(t, assertPinnedCacheEvictableHint(t, cache))
+
+	cache.Release("A")
+	require.True(t, assertPinnedCacheEvictableHint(t, cache))
+
+	value, err := cache.PutIfNotExist("A", "A")
+	require.NoError(t, err)
+	require.Equal(t, "A", value)
+	require.True(t, assertPinnedCacheEvictableHint(t, cache))
+
+	cache.Release("A")
+	cache.Release("B")
+	require.True(t, assertPinnedCacheEvictableHint(t, cache))
+
+	value, err = cache.PutIfNotExist("C", "C")
+	require.NoError(t, err)
+	require.Equal(t, "C", value)
+	require.Nil(t, cache.Get("B"))
+	require.True(t, assertPinnedCacheEvictableHint(t, cache))
+
+	cache.Release("C")
+	cache.Delete("C")
+	require.True(t, assertPinnedCacheEvictableHint(t, cache))
+
+	value, err = cache.PutIfNotExist("B", "B")
+	require.NoError(t, err)
+	require.Equal(t, "B", value)
+	cache.Delete("B")
+	require.True(t, assertPinnedCacheEvictableHint(t, cache))
+
+	cache = New(2, &Options{Pin: true})
+	for _, key := range []string{"A", "B"} {
+		_, err := cache.PutIfNotExist(key, key)
+		require.NoError(t, err)
+	}
+	cache.Release("A")
+	require.Equal(t, "A", cache.Get("A"))
+	require.True(t, assertPinnedCacheEvictableHint(t, cache))
+
+	value, err = cache.PutIfNotExist("C", "C")
+	require.ErrorIs(t, err, ErrCacheFull)
+	require.Nil(t, value)
+	require.False(t, assertPinnedCacheEvictableHint(t, cache))
+}
+
+func TestPinnedCacheEvictableHintTracksExpiryPaths(t *testing.T) {
+	t.Parallel()
+
+	newCache := func() (StoppableCache, *clock.EventTimeSource) {
+		timeSource := clock.NewEventTimeSource()
+		return New(2, &Options{
+			Pin:        true,
+			TTL:        time.Minute,
+			TimeSource: timeSource,
+		}), timeSource
+	}
+
+	cache, timeSource := newCache()
+	_, err := cache.PutIfNotExist("get", "get")
+	require.NoError(t, err)
+	cache.Release("get")
+	timeSource.Advance(time.Minute + time.Nanosecond)
+	require.Nil(t, cache.Get("get"))
+	assertPinnedCacheEvictableHint(t, cache)
+
+	cache, timeSource = newCache()
+	_, err = cache.PutIfNotExist("iterator", "iterator")
+	require.NoError(t, err)
+	cache.Release("iterator")
+	timeSource.Advance(time.Minute + time.Nanosecond)
+	iterator := cache.Iterator()
+	require.False(t, iterator.HasNext())
+	iterator.Close()
+	assertPinnedCacheEvictableHint(t, cache)
+
+	cache, timeSource = newCache()
+	_, err = cache.PutIfNotExist("background", "background")
+	require.NoError(t, err)
+	cache.Release("background")
+	timeSource.Advance(time.Minute + time.Nanosecond)
+	cache.(*lru).bgEvict(dynamicconfig.CacheBackgroundEvictSettings{MaxEntryPerCall: 1})
+	assertPinnedCacheEvictableHint(t, cache)
+}
+
+func TestPinnedCacheCanRetryPutIfNotExistAfterErrCacheFull(t *testing.T) {
+	t.Parallel()
+
+	cache := New(2, &Options{Pin: true})
+	for _, key := range []string{"A", "B"} {
+		_, err := cache.PutIfNotExist(key, key)
+		require.NoError(t, err)
+	}
+
+	for _, key := range []string{"C", "D"} {
+		value, err := cache.PutIfNotExist(key, key)
+		require.ErrorIs(t, err, ErrCacheFull)
+		require.Nil(t, value)
+		assertPinnedCacheEvictableHint(t, cache)
+	}
+
+	cache.Release("A")
+	value, err := cache.PutIfNotExist("E", "E")
+	require.NoError(t, err)
+	require.Equal(t, "E", value)
+	require.Nil(t, cache.Get("A"))
+	assertPinnedCacheEvictableHint(t, cache)
 }
 
 func TestIterator(t *testing.T) {
