@@ -646,6 +646,42 @@ func TestCache_PutIfNotExistWithSameKeys_Pin(t *testing.T) {
 	assert.Equal(t, 3, cache.Size())
 }
 
+func TestCache_DeletePinnedEntryUpdatesPinnedSize(t *testing.T) {
+	t.Parallel()
+
+	cache := New(2, &Options{Pin: true})
+	_, err := cache.PutIfNotExist("a", "a")
+	require.NoError(t, err)
+	_, err = cache.PutIfNotExist("b", "b")
+	require.NoError(t, err)
+
+	cache.Delete("a")
+	_, err = cache.PutIfNotExist("c", "c")
+	require.NoError(t, err)
+	require.Equal(t, "b", cache.Get("b"))
+	require.Equal(t, "c", cache.Get("c"))
+}
+
+func TestCache_PinnedEntrySizeChangeWithMultipleReferences(t *testing.T) {
+	t.Parallel()
+
+	cache := New(10, &Options{Pin: true})
+	entry := &testEntryWithCacheSize{cacheSize: 5}
+	_, err := cache.PutIfNotExist("a", entry)
+	require.NoError(t, err)
+	require.Equal(t, entry, cache.Get("a"))
+
+	entry.cacheSize = 1
+	cache.Release("a")
+
+	_, err = cache.PutIfNotExist("b", &testEntryWithCacheSize{cacheSize: 5})
+	require.NoError(t, err)
+	cache.Release("b")
+
+	_, err = cache.PutIfNotExist("c", &testEntryWithCacheSize{cacheSize: 6})
+	require.NoError(t, err)
+}
+
 func TestCache_ItemSizeChangeBeforeRelease(t *testing.T) {
 	t.Parallel()
 

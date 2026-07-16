@@ -1,7 +1,6 @@
 package cache
 
 import (
-	"fmt"
 	"runtime"
 	"testing"
 )
@@ -9,11 +8,9 @@ import (
 const pinnedFullInsertHostLimit = 128_000
 
 func BenchmarkPinnedFullInsert(b *testing.B) {
-	for _, entries := range []int{1_000, 10_000, 100_000, pinnedFullInsertHostLimit} {
-		b.Run(fmt.Sprintf("entries_%d", entries), func(b *testing.B) {
-			benchmarkPinnedFullInsert(b, entries)
-		})
-	}
+	b.Run("entries_128000", func(b *testing.B) {
+		benchmarkPinnedFullInsert(b, pinnedFullInsertHostLimit)
+	})
 }
 
 func benchmarkPinnedFullInsert(b *testing.B, entries int) {
