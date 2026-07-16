@@ -45,6 +45,11 @@ func ReadFullPageRawEvents(
 	executionMgr ExecutionManager,
 	req *ReadHistoryBranchRequest,
 ) ([]*commonpb.DataBlob, int, []byte, error) {
+	pageSize := req.PageSize
+	defer func() {
+		req.PageSize = pageSize
+	}()
+
 	var blobs []*commonpb.DataBlob
 	size := 0
 	for {
@@ -54,10 +59,11 @@ func ReadFullPageRawEvents(
 		}
 		blobs = append(blobs, response.HistoryEventBlobs...)
 		size += response.Size
-		if len(blobs) >= req.PageSize || len(response.NextPageToken) == 0 {
+		if len(blobs) >= pageSize || len(response.NextPageToken) == 0 {
 			return blobs, size, response.NextPageToken, nil
 		}
 		req.NextPageToken = response.NextPageToken
+		req.PageSize = pageSize - len(blobs)
 	}
 }
 
