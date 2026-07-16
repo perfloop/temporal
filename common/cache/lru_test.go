@@ -646,40 +646,57 @@ func TestCache_PutIfNotExistWithSameKeys_Pin(t *testing.T) {
 	assert.Equal(t, 3, cache.Size())
 }
 
-func TestCache_DeletePinnedEntryUpdatesPinnedSize(t *testing.T) {
+func TestCache_FailedPinnedInsertEvictsReleasedEntry(t *testing.T) {
 	t.Parallel()
 
-	cache := New(2, &Options{Pin: true})
-	_, err := cache.PutIfNotExist("a", "a")
+	var evicted []any
+	cache := New(10, &Options{
+		Pin: true,
+		OnEvict: func(value any) {
+			evicted = append(evicted, value)
+		},
+	})
+	pinned := &testEntryWithCacheSize{cacheSize: 8}
+	released := &testEntryWithCacheSize{cacheSize: 2}
+	_, err := cache.PutIfNotExist("pinned", pinned)
 	require.NoError(t, err)
-	_, err = cache.PutIfNotExist("b", "b")
+	_, err = cache.PutIfNotExist("released", released)
 	require.NoError(t, err)
+	cache.Release("released")
 
-	cache.Delete("a")
-	_, err = cache.PutIfNotExist("c", "c")
-	require.NoError(t, err)
-	require.Equal(t, "b", cache.Get("b"))
-	require.Equal(t, "c", cache.Get("c"))
+	_, err = cache.PutIfNotExist("new", &testEntryWithCacheSize{cacheSize: 3})
+	require.ErrorIs(t, err, ErrCacheFull)
+	assert.Nil(t, cache.Get("released"))
+	require.Len(t, evicted, 1)
+	assert.Same(t, released, evicted[0])
 }
 
-func TestCache_PinnedEntrySizeChangeWithMultipleReferences(t *testing.T) {
+func TestCache_PinnedGrowthEvictsReleasedEntry(t *testing.T) {
 	t.Parallel()
 
-	cache := New(10, &Options{Pin: true})
-	entry := &testEntryWithCacheSize{cacheSize: 5}
-	_, err := cache.PutIfNotExist("a", entry)
+	var evicted []any
+	cache := New(10, &Options{
+		Pin: true,
+		OnEvict: func(value any) {
+			evicted = append(evicted, value)
+		},
+	})
+	pinned := &testEntryWithCacheSize{cacheSize: 8}
+	released := &testEntryWithCacheSize{cacheSize: 2}
+	_, err := cache.PutIfNotExist("pinned", pinned)
 	require.NoError(t, err)
-	require.Equal(t, entry, cache.Get("a"))
-
-	entry.cacheSize = 1
-	cache.Release("a")
-
-	_, err = cache.PutIfNotExist("b", &testEntryWithCacheSize{cacheSize: 5})
+	require.Same(t, pinned, cache.Get("pinned"))
+	_, err = cache.PutIfNotExist("released", released)
 	require.NoError(t, err)
-	cache.Release("b")
+	cache.Release("released")
 
-	_, err = cache.PutIfNotExist("c", &testEntryWithCacheSize{cacheSize: 6})
-	require.NoError(t, err)
+	pinned.cacheSize = 12
+	cache.Release("pinned")
+
+	assert.Equal(t, 12, cache.Size())
+	assert.Nil(t, cache.Get("released"))
+	require.Len(t, evicted, 1)
+	assert.Same(t, released, evicted[0])
 }
 
 func TestCache_ItemSizeChangeBeforeRelease(t *testing.T) {
