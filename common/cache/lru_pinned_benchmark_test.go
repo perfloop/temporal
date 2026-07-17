@@ -15,13 +15,7 @@ func BenchmarkPinnedFullInsert(b *testing.B) {
 }
 
 func benchmarkPinnedFullInsertParallel(b *testing.B, entries int) {
-	cache := New(entries, &Options{Pin: true})
-	for key := range entries {
-		_, err := cache.PutIfNotExist(key, key)
-		if err != nil {
-			b.Fatalf("filling pinned cache: %v", err)
-		}
-	}
+	cache := newFullPinnedCacheForBenchmark(b, entries)
 
 	var workerID atomic.Uint64
 	var unexpectedResult atomic.Bool
