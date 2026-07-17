@@ -440,6 +440,10 @@ func (d *matcherData) ReprocessTasks(pred func(*internalTask) bool) []*internalT
 // call with lock held
 // nolint:revive // will improve later
 func (d *matcherData) findMatch(allowForwarding bool) (*internalTask, *waitingPoller) {
+	if len(d.tasks.heap) == 0 {
+		return nil, nil
+	}
+
 	allPollersQueryOnly := true
 	for _, poller := range d.pollers.heap {
 		if !poller.queryOnly {
