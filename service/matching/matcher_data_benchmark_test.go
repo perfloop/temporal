@@ -34,6 +34,17 @@ func TestMatcherDataFindMatchQueryOnlyPollers(t *testing.T) {
 	if task, poller := data.findMatch(false); task != queryTask || poller == nil || !poller.queryOnly {
 		t.Fatalf("findMatch() = (%v, %v), want query task matched to a query-only poller", task, poller)
 	}
+
+	data.tasks.Remove(queryTask)
+	data.pollers.Remove(data.pollers.heap[0])
+	normalPoller := &waitingPoller{}
+	data.pollers.Add(normalPoller)
+	if got, want := data.pollers.queryOnlyCount, len(data.pollers.heap)-1; got != want {
+		t.Fatalf("queryOnlyCount = %d, want %d", got, want)
+	}
+	if task, poller := data.findMatch(false); task == nil || task.isQuery() || poller != normalPoller {
+		t.Fatalf("findMatch() = (%v, %v), want normal task matched to normal poller", task, poller)
+	}
 }
 
 // matcherDataLockHoldNanos measures the time findAndWakeMatches holds matcherData.lock.

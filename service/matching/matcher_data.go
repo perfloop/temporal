@@ -63,6 +63,8 @@ const maxTokens = 1
 
 type pollerPQ struct {
 	heap []*waitingPoller
+
+	queryOnlyCount int
 }
 
 // implements heap.Interface
@@ -104,6 +106,9 @@ func (p *pollerPQ) Push(x any) {
 	poller := x.(*waitingPoller) // nolint:revive
 	poller.matchHeapIndex = len(p.heap)
 	p.heap = append(p.heap, poller)
+	if poller.queryOnly {
+		p.queryOnlyCount++
+	}
 }
 
 // implements heap.Interface, do not call directly
@@ -112,6 +117,9 @@ func (p *pollerPQ) Pop() any {
 	poller := p.heap[last]
 	p.heap = p.heap[:last]
 	poller.matchHeapIndex = invalidHeapIndex
+	if poller.queryOnly {
+		p.queryOnlyCount--
+	}
 	return poller
 }
 
@@ -440,17 +448,7 @@ func (d *matcherData) ReprocessTasks(pred func(*internalTask) bool) []*internalT
 // call with lock held
 // nolint:revive // will improve later
 func (d *matcherData) findMatch(allowForwarding bool) (*internalTask, *waitingPoller) {
-	if len(d.tasks.heap) == 0 {
-		return nil, nil
-	}
-
-	allPollersQueryOnly := true
-	for _, poller := range d.pollers.heap {
-		if !poller.queryOnly {
-			allPollersQueryOnly = false
-			break
-		}
-	}
+	allPollersQueryOnly := d.pollers.queryOnlyCount == len(d.pollers.heap)
 
 	// TODO(pri): optimize other O(d*n) cases
 	// TODO(pri): this iterates over heap as slice, which isn't quite correct, but okay for now
