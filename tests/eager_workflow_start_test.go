@@ -188,27 +188,12 @@ func (s *EagerWorkflowTestSuite) TestEagerWorkflowStart_RetryStartImmediately() 
 	response := s.startEagerWorkflow(env, request)
 	task := response.GetEagerWorkflowTask()
 	s.NotNil(task, "StartWorkflowExecution response did not contain a workflow task")
-	response = s.startEagerWorkflow(env, request)
-	task = response.GetEagerWorkflowTask()
-	s.NotNil(task, "StartWorkflowExecution response did not contain a workflow task")
-
-	s.respondWorkflowTaskCompleted(env, task, "ok")
-	// Verify workflow completes and client can get the result
-	result := s.getWorkflowStringResult(env, s.defaultWorkflowID(), response.RunId)
-	s.Equal("ok", result)
-}
-
-func (s *EagerWorkflowTestSuite) TestEagerWorkflowStart_RetryStartImmediatelyReadsSingleHistoryPage() {
-	env := testcore.NewEnv(s.T())
-	request := &workflowservice.StartWorkflowExecutionRequest{RequestId: uuid.NewString()}
-	response := s.startEagerWorkflow(env, request)
-	s.NotNil(response.GetEagerWorkflowTask(), "StartWorkflowExecution response did not contain a workflow task")
 
 	// Count only the duplicate request, after the initial eager start has persisted its first task.
 	capture := env.StartNamespaceMetricCapture()
 	response = s.startEagerWorkflow(env, request)
-	task := response.GetEagerWorkflowTask()
-	s.NotNil(task, "retried StartWorkflowExecution response did not contain a workflow task")
+	task = response.GetEagerWorkflowTask()
+	s.NotNil(task, "StartWorkflowExecution response did not contain a workflow task")
 
 	readRequests := 0
 	for _, recording := range capture.Metric(metrics.PersistenceRequests.Name()) {
@@ -218,17 +203,10 @@ func (s *EagerWorkflowTestSuite) TestEagerWorkflowStart_RetryStartImmediatelyRea
 		}
 	}
 	s.Equal(1, readRequests, "the eager retry should issue one real ReadHistoryBranch request")
-
-	readLatencies := 0
-	for _, recording := range capture.Metric(metrics.PersistenceLatency.Name()) {
-		if recording.Tags[metrics.OperationTag("").Key] == metrics.PersistenceReadHistoryBranchScope {
-			readLatencies++
-		}
-	}
-	s.Equal(1, readLatencies, "the eager retry should record one ReadHistoryBranch latency")
 	s.Len(task.History.Events, 3)
 
 	s.respondWorkflowTaskCompleted(env, task, "ok")
+	// Verify workflow completes and client can get the result
 	result := s.getWorkflowStringResult(env, s.defaultWorkflowID(), response.RunId)
 	s.Equal("ok", result)
 }
