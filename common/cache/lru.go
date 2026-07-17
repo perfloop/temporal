@@ -58,7 +58,6 @@ type (
 		createTime time.Time
 		value      any
 		refCount   int
-		evictable  bool // true when refCount is zero in a pinned cache
 		size       int
 	}
 )
@@ -272,15 +271,9 @@ func (c *lru) Release(key any) {
 	case 0:
 		c.pinnedSize -= entry.Size()
 		metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
-		if !entry.evictable {
-			entry.evictable = true
-			c.evictableEntryCount++
-		}
+		c.evictableEntryCount++
 	case -1:
-		if entry.evictable {
-			entry.evictable = false
-			c.evictableEntryCount--
-		}
+		c.evictableEntryCount--
 	}
 	// Entry size might have changed. Recalculate size and evict entries if necessary.
 	newEntrySize := getSize(entry.value)
@@ -380,7 +373,11 @@ func (c *lru) putInternal(key any, value any, allowUpdate bool) (any, error) {
 		size:  newEntrySize,
 	}
 	c.updateEntryTTL(entry)
-	c.updateEntryRefCount(entry)
+	if c.pin {
+		entry.refCount = 1
+		c.pinnedSize += entry.Size()
+		metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
+	}
 	element := c.byAccess.PushFront(entry)
 	c.byKey[key] = element
 	c.currSize = newCacheSize
@@ -399,9 +396,8 @@ func (c *lru) calculateNewCacheSize(newEntrySize int, existingEntrySize int) int
 
 func (c *lru) deleteInternal(element *list.Element) {
 	entry := c.byAccess.Remove(element).(*entryImpl)
-	if c.pin && entry.evictable {
+	if c.pin && entry.refCount == 0 {
 		c.evictableEntryCount--
-		entry.evictable = false
 	}
 	c.currSize -= entry.Size()
 	metrics.CacheUsage.With(c.metricsHandler).Record(float64(c.currSize))
@@ -464,15 +460,9 @@ func (c *lru) updateEntryRefCount(entry *entryImpl) {
 		entry.refCount++
 		switch entry.refCount {
 		case 0:
-			if !entry.evictable {
-				entry.evictable = true
-				c.evictableEntryCount++
-			}
+			c.evictableEntryCount++
 		case 1:
-			if entry.evictable {
-				entry.evictable = false
-				c.evictableEntryCount--
-			}
+			c.evictableEntryCount--
 			c.pinnedSize += entry.Size()
 			metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
 		}

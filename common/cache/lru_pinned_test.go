@@ -52,6 +52,13 @@ func TestPinnedCacheTracksEvictableEntries(t *testing.T) {
 	cache.Release("A")
 	require.Equal(t, 1, cache.evictableEntryCount)
 
+	// An extra Release takes A below zero, where it is not evictable. A later
+	// Get restores it to zero, where the eviction predicate makes it evictable.
+	cache.Release("A")
+	require.Zero(t, cache.evictableEntryCount)
+	require.Equal(t, "A", cache.Get("A"))
+	require.Equal(t, 1, cache.evictableEntryCount)
+
 	cache.Delete("A")
 	require.Zero(t, cache.evictableEntryCount)
 }
