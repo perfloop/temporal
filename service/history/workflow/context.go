@@ -298,16 +298,18 @@ func (c *ContextImpl) GetMergedTaskCompletionPages(
 			"workflow task completion buffer lost for scheduled event %d attempt %d", schedID, attempt)
 	}
 	// Every page in 0..finalPageNumber-1 must be present. A gap means a page was
-	// lost or never sent; merging anyway would silently drop commands.
-	merged := make([]*commandpb.Command, 0, c.taskCompletionBuffer.commandCount+len(request.Commands))
+	// lost or never sent; merging anyway would silently drop commands. Validate the
+	// sequence before allocating capacity derived from buffered commands.
 	for page := range finalPageNumber {
-		cmds, ok := c.taskCompletionBuffer.pages[page]
-		if !ok {
+		if _, ok := c.taskCompletionBuffer.pages[page]; !ok {
 			metrics.WorkflowTaskCompletionBufferLost.With(c.metricsHandler).Record(1)
 			return nil, serviceerror.NewWorkflowTaskCompletionBufferLostf(
 				"workflow task completion buffer missing page %d of %d", page, finalPageNumber)
 		}
-		merged = append(merged, cmds...)
+	}
+	merged := make([]*commandpb.Command, 0, c.taskCompletionBuffer.commandCount+len(request.Commands))
+	for page := range finalPageNumber {
+		merged = append(merged, c.taskCompletionBuffer.pages[page]...)
 	}
 	// Total completion size = buffered intermediate pages plus the final page (which
 	// is never buffered, so it must be added explicitly)

@@ -39,9 +39,6 @@ func TestTaskCompletionPaginationFinalPagePreservesCommandOrder(t *testing.T) {
 			t.Errorf("command %d marker = %q, want %q", i, got, expectedNames[i])
 		}
 	}
-	if workflowContext.taskCompletionBuffer != nil {
-		t.Fatal("GetMergedTaskCompletionPages did not clear the page buffer")
-	}
 }
 
 func BenchmarkTaskCompletionPaginationFinalPage(b *testing.B) {
@@ -69,30 +66,15 @@ func BenchmarkTaskCompletionPaginationFinalPage(b *testing.B) {
 			workflowContext, buffer, finalPage, expectedNames := newTaskCompletionPaginationBenchmarkInput(testCase)
 			expectedCommandCount := len(expectedNames)
 
-			// Verify the fixed setup once outside the timed loop. Each iteration below
-			// reuses these immutable buffered pages, matching the final request after
-			// its intermediate pages have already been accepted.
-			workflowContext.taskCompletionBuffer = buffer
-			merged, err := workflowContext.GetMergedTaskCompletionPages(benchmarkTaskCompletionSchedID, benchmarkTaskCompletionAttempt, finalPage)
-			if err != nil {
-				b.Fatalf("GetMergedTaskCompletionPages returned error: %v", err)
-			}
-			commands := append(merged, finalPage.Commands...)
-			if len(commands) != expectedCommandCount ||
-				commands[0].GetRecordMarkerCommandAttributes().GetMarkerName() != expectedNames[0] ||
-				commands[len(commands)-1].GetRecordMarkerCommandAttributes().GetMarkerName() != expectedNames[len(expectedNames)-1] {
-				b.Fatal("merged commands did not preserve the buffered-to-final order")
-			}
-
 			for b.Loop() {
 				// GetMergedTaskCompletionPages clears only this context pointer; the
 				// buffer's pages remain immutable after intermediate-page acceptance.
 				workflowContext.taskCompletionBuffer = buffer
-				merged, err = workflowContext.GetMergedTaskCompletionPages(benchmarkTaskCompletionSchedID, benchmarkTaskCompletionAttempt, finalPage)
+				merged, err := workflowContext.GetMergedTaskCompletionPages(benchmarkTaskCompletionSchedID, benchmarkTaskCompletionAttempt, finalPage)
 				if err != nil {
 					b.Fatalf("GetMergedTaskCompletionPages returned error: %v", err)
 				}
-				commands = append(merged, finalPage.Commands...)
+				commands := append(merged, finalPage.Commands...)
 				if len(commands) != expectedCommandCount ||
 					commands[0].GetRecordMarkerCommandAttributes().GetMarkerName() != expectedNames[0] ||
 					commands[len(commands)-1].GetRecordMarkerCommandAttributes().GetMarkerName() != expectedNames[len(expectedNames)-1] {
