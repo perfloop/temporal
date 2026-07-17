@@ -636,6 +636,34 @@ func (s *MatcherDataSuite) TestMatchPollerImmediately() {
 	s.Equal(t2, res.task)
 }
 
+func (s *MatcherDataSuite) TestFindMatchQueryOnlyPollerCount() {
+	s.md.lock.Lock()
+	defer s.md.lock.Unlock()
+
+	normalTask := &internalTask{}
+	queryTask := newInternalQueryTask("test", &matchingservice.QueryWorkflowRequest{})
+	queryOnlyPoller := &waitingPoller{queryOnly: true}
+	s.md.tasks.Add(normalTask)
+	s.md.tasks.Add(queryTask)
+	s.md.pollers.Add(queryOnlyPoller)
+
+	foundTask, foundPoller := s.md.findMatch(true)
+	s.Same(queryTask, foundTask)
+	s.Same(queryOnlyPoller, foundPoller)
+
+	s.md.tasks.Remove(queryTask)
+	foundTask, foundPoller = s.md.findMatch(true)
+	s.Nil(foundTask)
+	s.Nil(foundPoller)
+
+	s.md.pollers.Remove(queryOnlyPoller)
+	normalPoller := &waitingPoller{}
+	s.md.pollers.Add(normalPoller)
+	foundTask, foundPoller = s.md.findMatch(true)
+	s.Same(normalTask, foundTask)
+	s.Same(normalPoller, foundPoller)
+}
+
 func (s *MatcherDataSuite) TestFindMatch() {
 	// Table-driven test for findMatch logic. Each case sets up one task and one poller
 	// and verifies whether they match.
@@ -851,7 +879,8 @@ func (s *MatcherDataSuite) TestFindMatch() {
 					MinPriority: tc.pollerMinPriority,
 				}
 			}
-			s.md.pollers.heap = []*waitingPoller{poller}
+			s.md.pollers = pollerPQ{}
+			s.md.pollers.Add(poller)
 
 			// Call findMatch
 			s.md.lock.Lock()

@@ -63,6 +63,8 @@ const maxTokens = 1
 
 type pollerPQ struct {
 	heap []*waitingPoller
+
+	queryOnlyCount int
 }
 
 // implements heap.Interface
@@ -104,6 +106,9 @@ func (p *pollerPQ) Push(x any) {
 	poller := x.(*waitingPoller) // nolint:revive
 	poller.matchHeapIndex = len(p.heap)
 	p.heap = append(p.heap, poller)
+	if poller.queryOnly {
+		p.queryOnlyCount++
+	}
 }
 
 // implements heap.Interface, do not call directly
@@ -112,6 +117,9 @@ func (p *pollerPQ) Pop() any {
 	poller := p.heap[last]
 	p.heap = p.heap[:last]
 	poller.matchHeapIndex = invalidHeapIndex
+	if poller.queryOnly {
+		p.queryOnlyCount--
+	}
 	return poller
 }
 
@@ -440,7 +448,22 @@ func (d *matcherData) ReprocessTasks(pred func(*internalTask) bool) []*internalT
 // call with lock held
 // nolint:revive // will improve later
 func (d *matcherData) findMatch(allowForwarding bool) (*internalTask, *waitingPoller) {
-	// TODO(pri): optimize so it's not O(d*n) worst case
+	// Query-only pollers cannot match normal tasks, so avoid a full cross-product scan
+	// when no query or poll-forwarder task is queued.
+	if d.pollers.queryOnlyCount == len(d.pollers.heap) {
+		hasMatchableTask := false
+		for _, task := range d.tasks.heap {
+			if task.isQuery() || task.isPollForwarder() {
+				hasMatchableTask = true
+				break
+			}
+		}
+		if !hasMatchableTask {
+			return nil, nil
+		}
+	}
+
+	// TODO(pri): optimize other O(d*n) cases
 	// TODO(pri): this iterates over heap as slice, which isn't quite correct, but okay for now
 	for _, task := range d.tasks.heap {
 		// disallow normal poll forwarding when allowForwarding is false, but allow the
