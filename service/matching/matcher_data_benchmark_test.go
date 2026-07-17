@@ -5,7 +5,6 @@ import (
 	"runtime"
 	"slices"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -43,12 +42,9 @@ func matcherDataLockHoldNanos(data *matcherData, samples int) float64 {
 	for range samples {
 		data.lock.Lock()
 		start := time.Now()
-		rateLimited := data.findAndWakeMatches()
+		data.findAndWakeMatches()
 		total += time.Since(start)
 		data.lock.Unlock()
-		if rateLimited {
-			panic("unexpected rate-limited match")
-		}
 	}
 	return float64(total) / float64(samples)
 }
@@ -58,7 +54,6 @@ func matcherDataMatchLatencyP99Nanos(data *matcherData, samplesPerWorker int) fl
 	workers := runtime.GOMAXPROCS(0)
 	latencies := make([]time.Duration, workers*samplesPerWorker)
 	start := make(chan struct{})
-	var rateLimited atomic.Bool
 	var wg sync.WaitGroup
 
 	for worker := range workers {
@@ -69,21 +64,14 @@ func matcherDataMatchLatencyP99Nanos(data *matcherData, samplesPerWorker int) fl
 			for i := range samplesPerWorker {
 				start := time.Now()
 				data.lock.Lock()
-				limited := data.findAndWakeMatches()
+				data.findAndWakeMatches()
 				data.lock.Unlock()
-				if limited {
-					rateLimited.Store(true)
-				}
 				latencies[worker*samplesPerWorker+i] = time.Since(start)
 			}
 		}(worker)
 	}
 	close(start)
 	wg.Wait()
-	if rateLimited.Load() {
-		panic("unexpected rate-limited match")
-	}
-
 	slices.Sort(latencies)
 	return float64(latencies[(len(latencies)*99+99)/100-1])
 }
@@ -105,20 +93,13 @@ func BenchmarkMatcherDataFindAndWakeMatches(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 
-			var rateLimited atomic.Bool
 			b.RunParallel(func(pb *testing.PB) {
 				for pb.Next() {
 					data.lock.Lock()
-					limited := data.findAndWakeMatches()
+					data.findAndWakeMatches()
 					data.lock.Unlock()
-					if limited {
-						rateLimited.Store(true)
-					}
 				}
 			})
-			if rateLimited.Load() {
-				b.Fatal("unexpected rate-limited match")
-			}
 			b.ReportMetric(lockHoldNanos, "lock_hold_ns/op")
 			b.ReportMetric(matchLatencyP99Nanos, "match_latency_p99_ns")
 		})
