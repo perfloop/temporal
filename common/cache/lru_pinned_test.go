@@ -7,8 +7,6 @@ import (
 )
 
 func TestPinnedCacheEvictsLeastRecentlyUsedUnpinnedEntry(t *testing.T) {
-	t.Parallel()
-
 	cache := New(3, &Options{Pin: true})
 	for _, key := range []string{"A", "B", "C"} {
 		_, err := cache.PutIfNotExist(key, key)
@@ -35,37 +33,31 @@ func TestPinnedCacheEvictsLeastRecentlyUsedUnpinnedEntry(t *testing.T) {
 	require.Equal(t, "D", cache.Get("D"))
 }
 
-func TestPinnedCacheTracksEvictableEntries(t *testing.T) {
-	t.Parallel()
+func TestPinnedCacheReleaseAndGetRestoreFullCache(t *testing.T) {
+	cache := New(2, &Options{Pin: true})
+	for _, key := range []string{"A", "B"} {
+		_, err := cache.PutIfNotExist(key, key)
+		require.NoError(t, err)
+	}
 
-	cache := New(2, &Options{Pin: true}).(*lru)
-	_, err := cache.PutIfNotExist("A", "A")
+	// Reacquiring the released entry restores a full cache with no evictable
+	// entries, so admission must still fail.
+	cache.Release("A")
+	require.Equal(t, "A", cache.Get("A"))
+	_, err := cache.PutIfNotExist("C", "C")
+	require.ErrorIs(t, err, ErrCacheFull)
+
+	// Releasing A again makes it evictable. It is now the least-recent
+	// evictable entry because B has remained pinned, so C can replace A.
+	cache.Release("A")
+	_, err = cache.PutIfNotExist("C", "C")
 	require.NoError(t, err)
-	require.Zero(t, cache.evictableEntryCount)
-
-	cache.Release("A")
-	require.Equal(t, 1, cache.evictableEntryCount)
-
-	require.Equal(t, "A", cache.Get("A"))
-	require.Zero(t, cache.evictableEntryCount)
-
-	cache.Release("A")
-	require.Equal(t, 1, cache.evictableEntryCount)
-
-	// An extra Release takes A below zero, where it is not evictable. A later
-	// Get restores it to zero, where the eviction predicate makes it evictable.
-	cache.Release("A")
-	require.Zero(t, cache.evictableEntryCount)
-	require.Equal(t, "A", cache.Get("A"))
-	require.Equal(t, 1, cache.evictableEntryCount)
-
-	cache.Delete("A")
-	require.Zero(t, cache.evictableEntryCount)
+	require.Nil(t, cache.Get("A"))
+	require.Equal(t, "B", cache.Get("B"))
+	require.Equal(t, "C", cache.Get("C"))
 }
 
 func TestPinnedCacheReleaseUnderflowCanBecomeEvictable(t *testing.T) {
-	t.Parallel()
-
 	cache := New(1, &Options{Pin: true})
 	_, err := cache.PutIfNotExist("A", "A")
 	require.NoError(t, err)

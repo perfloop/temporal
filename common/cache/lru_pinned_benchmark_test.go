@@ -15,8 +15,10 @@ func BenchmarkPinnedFullInsert(b *testing.B) {
 }
 
 func benchmarkPinnedFullInsertParallel(b *testing.B, entries int) {
-	cache := newFullPinnedCacheForBenchmark(b, entries)
+	benchmarkPinnedFullInsertWithCache(b, newFullPinnedCacheForBenchmark(b, entries), entries)
+}
 
+func benchmarkPinnedFullInsertWithCache(b *testing.B, cache Cache, entries int) {
 	var workerID atomic.Uint64
 	var unexpectedResult atomic.Bool
 
