@@ -117,6 +117,7 @@ func newTaskCompletionPaginationBenchmarkInput(testCase taskCompletionPagination
 	pages := make(map[int32][]*commandpb.Command, testCase.pageCount)
 	expectedNames := make([]string, 0, testCase.pageCount*testCase.commandsPerPage+testCase.finalCommandCount)
 	var totalSize int64
+	bufferedCommandCount := 0
 	commandNumber := 0
 	for page := range testCase.pageCount {
 		commands := make([]*commandpb.Command, testCase.commandsPerPage)
@@ -128,6 +129,8 @@ func newTaskCompletionPaginationBenchmarkInput(testCase taskCompletionPagination
 		}
 		pages[int32(page)] = commands
 		totalSize += taskCompletionPageBytes(commands)
+		// Mirror the count that AppendTaskCompletionPage maintains for a buffered page.
+		bufferedCommandCount += len(commands)
 	}
 
 	finalCommands := make([]*commandpb.Command, testCase.finalCommandCount)
@@ -139,8 +142,9 @@ func newTaskCompletionPaginationBenchmarkInput(testCase taskCompletionPagination
 	}
 
 	return &ContextImpl{metricsHandler: metrics.NoopMetricsHandler}, &TaskCompletionBuffer{
-			pages:     pages,
-			totalSize: totalSize,
+			pages:        pages,
+			totalSize:    totalSize,
+			commandCount: bufferedCommandCount,
 			identity: workflowTaskIdentity{
 				schedID: benchmarkTaskCompletionSchedID,
 				attempt: benchmarkTaskCompletionAttempt,

@@ -63,9 +63,10 @@ type (
 	// TaskCompletionBuffer holds the intermediate pages of a single in-progress
 	// pagination of RespondWorkflowTaskCompleted requests.
 	TaskCompletionBuffer struct {
-		pages     map[int32][]*commandpb.Command // page_number (0-based) -> commands
-		totalSize int64                          // cumulative buffered bytes
-		identity  workflowTaskIdentity           // the workflow task this buffer belongs to
+		pages        map[int32][]*commandpb.Command // page_number (0-based) -> commands
+		totalSize    int64                          // cumulative buffered bytes
+		commandCount int                            // cumulative buffered command count
+		identity     workflowTaskIdentity           // the workflow task this buffer belongs to
 	}
 )
 
@@ -229,6 +230,7 @@ func (c *ContextImpl) AppendTaskCompletionPage(
 
 	c.taskCompletionBuffer.pages[request.GetPageNumber()] = request.Commands
 	c.taskCompletionBuffer.totalSize += pageBytes
+	c.taskCompletionBuffer.commandCount += len(request.Commands)
 	return nil
 }
 
@@ -297,7 +299,7 @@ func (c *ContextImpl) GetMergedTaskCompletionPages(
 	}
 	// Every page in 0..finalPageNumber-1 must be present. A gap means a page was
 	// lost or never sent; merging anyway would silently drop commands.
-	merged := make([]*commandpb.Command, 0, len(c.taskCompletionBuffer.pages))
+	merged := make([]*commandpb.Command, 0, c.taskCompletionBuffer.commandCount+len(request.Commands))
 	for page := range finalPageNumber {
 		cmds, ok := c.taskCompletionBuffer.pages[page]
 		if !ok {

@@ -731,6 +731,23 @@ func (s *contextSuite) TestTaskCompletionBuffer_Idempotency() {
 	s.Equal("first", merged[0].GetRecordMarkerCommandAttributes().GetMarkerName())
 }
 
+func (s *contextSuite) TestTaskCompletionBuffer_CommandCount() {
+	const schedID = int64(13)
+	s.setTaskCompletionBufferSizeLimit(0)
+
+	page := intermediatePage(0, "first")
+	page.Commands = append(page.Commands, intermediatePage(0, "second").Commands...)
+	s.NoError(s.workflowContext.AppendTaskCompletionPage(schedID, 1, page))
+	s.Equal(2, s.workflowContext.taskCompletionBuffer.commandCount)
+
+	// A retransmission must not reserve capacity a second time.
+	s.NoError(s.workflowContext.AppendTaskCompletionPage(schedID, 1, intermediatePage(0, "duplicate")))
+	s.Equal(2, s.workflowContext.taskCompletionBuffer.commandCount)
+
+	s.NoError(s.workflowContext.AppendTaskCompletionPage(schedID, 1, intermediatePage(1, "third")))
+	s.Equal(3, s.workflowContext.taskCompletionBuffer.commandCount)
+}
+
 func (s *contextSuite) TestTaskCompletionBuffer_PageCountLimit() {
 	const schedID = int64(13)
 	s.setTaskCompletionBufferSizeLimit(0)
