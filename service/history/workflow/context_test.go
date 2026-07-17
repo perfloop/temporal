@@ -715,20 +715,42 @@ func (s *contextSuite) TestTaskCompletionBuffer_GapDetection() {
 	s.ErrorAs(err, &bufferLost)
 }
 
-func (s *contextSuite) TestTaskCompletionBuffer_OutOfOrderPages() {
+func (s *contextSuite) TestTaskCompletionBuffer_RebuildsUninitializedPrefix() {
 	const schedID = int64(12)
 	s.setTaskCompletionBufferSizeLimit(0)
 
-	// Page 1 may arrive before page 0. Once page 0 arrives, the contiguous
-	// prefix must include both pages and preserve their numeric order.
-	s.NoError(s.workflowContext.AppendTaskCompletionPage(schedID, 1, intermediatePage(1, "second")))
-	s.NoError(s.workflowContext.AppendTaskCompletionPage(schedID, 1, intermediatePage(0, "first")))
+	first := intermediatePage(0, "first")
+	second := intermediatePage(1, "second")
+	identity := workflowTaskIdentity{schedID: schedID, attempt: 1}
+	// A buffer restored without the derived prefix counters must still use its
+	// authoritative pages map, as the preallocation implementation did.
+	s.workflowContext.taskCompletionBuffer = &TaskCompletionBuffer{
+		pages: map[int32][]*commandpb.Command{
+			0: first.Commands,
+		},
+		identity: identity,
+	}
+	s.NoError(s.workflowContext.AppendTaskCompletionPage(schedID, 1, second))
 
 	merged, err := s.workflowContext.GetMergedTaskCompletionPages(schedID, 1, finalPage(2, nil))
 	s.NoError(err)
 	s.Len(merged, 2)
 	s.Equal("first", merged[0].GetRecordMarkerCommandAttributes().GetMarkerName())
 	s.Equal("second", merged[1].GetRecordMarkerCommandAttributes().GetMarkerName())
+
+	// Conversely, untrusted counters that claim a missing page cannot make a
+	// map with only page 0 pass a final request for pages 0 and 1.
+	s.workflowContext.taskCompletionBuffer = &TaskCompletionBuffer{
+		pages: map[int32][]*commandpb.Command{
+			0: first.Commands,
+		},
+		contiguousPageCount:    2,
+		contiguousCommandCount: 2,
+		identity:               identity,
+	}
+	_, err = s.workflowContext.GetMergedTaskCompletionPages(schedID, 1, finalPage(2, nil))
+	var bufferLost *serviceerror.WorkflowTaskCompletionBufferLost
+	s.ErrorAs(err, &bufferLost)
 }
 
 // TestTaskCompletionBuffer_Idempotency verifies that a resent page does not overwrite

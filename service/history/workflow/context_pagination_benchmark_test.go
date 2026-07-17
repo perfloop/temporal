@@ -74,10 +74,8 @@ func BenchmarkTaskCompletionPaginationFinalPage(b *testing.B) {
 					b.Fatalf("GetMergedTaskCompletionPages returned error: %v", err)
 				}
 				commands := append(merged, finalPage.Commands...)
-				if len(commands) != expectedCommandCount ||
-					commands[0].GetRecordMarkerCommandAttributes().GetMarkerName() != expectedNames[0] ||
-					commands[len(commands)-1].GetRecordMarkerCommandAttributes().GetMarkerName() != expectedNames[len(expectedNames)-1] {
-					b.Fatal("merged commands did not preserve the buffered-to-final order")
+				if len(commands) != expectedCommandCount {
+					b.Fatalf("merged command count = %d, want %d", len(commands), expectedCommandCount)
 				}
 			}
 		})

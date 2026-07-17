@@ -63,11 +63,12 @@ type (
 	// TaskCompletionBuffer holds the intermediate pages of a single in-progress
 	// pagination of RespondWorkflowTaskCompleted requests.
 	TaskCompletionBuffer struct {
-		pages                  map[int32][]*commandpb.Command // page_number (0-based) -> commands
-		totalSize              int64                          // cumulative buffered bytes
-		contiguousPageCount    int32                          // pages present consecutively from page 0
-		contiguousCommandCount int                            // commands in the contiguous page prefix
-		identity               workflowTaskIdentity           // the workflow task this buffer belongs to
+		pages                       map[int32][]*commandpb.Command // page_number (0-based) -> commands
+		totalSize                   int64                          // cumulative buffered bytes
+		contiguousPageCount         int32                          // pages present consecutively from page 0
+		contiguousCommandCount      int                            // commands in the contiguous page prefix
+		contiguousPrefixInitialized bool                           // counters reflect the current pages map
+		identity                    workflowTaskIdentity           // the workflow task this buffer belongs to
 	}
 )
 
@@ -155,6 +156,34 @@ func (c *ContextImpl) clearTaskCompletionBuffer() {
 	c.taskCompletionBuffer = nil
 }
 
+func newTaskCompletionBuffer(identity workflowTaskIdentity) *TaskCompletionBuffer {
+	return &TaskCompletionBuffer{
+		pages:                       make(map[int32][]*commandpb.Command),
+		contiguousPrefixInitialized: true,
+		identity:                    identity,
+	}
+}
+
+// rebuildContiguousPrefix makes pages authoritative for a buffer that was not
+// initialized through the admission path, such as a direct fixture or another construction path.
+func (b *TaskCompletionBuffer) rebuildContiguousPrefix() {
+	b.contiguousPageCount = 0
+	b.contiguousCommandCount = 0
+	b.advanceContiguousPrefix()
+	b.contiguousPrefixInitialized = true
+}
+
+func (b *TaskCompletionBuffer) advanceContiguousPrefix() {
+	for {
+		commands, ok := b.pages[b.contiguousPageCount]
+		if !ok {
+			return
+		}
+		b.contiguousCommandCount += len(commands)
+		b.contiguousPageCount++
+	}
+}
+
 // startedWorkflowTaskIdentity returns the identity of the currently started workflow
 // task. When none is started it returns the zero-value identity, which can never equal a
 // real buffer identity
@@ -209,10 +238,10 @@ func (c *ContextImpl) AppendTaskCompletionPage(
 		c.clearTaskCompletionBuffer()
 	}
 	if c.taskCompletionBuffer == nil {
-		c.taskCompletionBuffer = &TaskCompletionBuffer{
-			pages:    make(map[int32][]*commandpb.Command),
-			identity: identity,
-		}
+		c.taskCompletionBuffer = newTaskCompletionBuffer(identity)
+	}
+	if !c.taskCompletionBuffer.contiguousPrefixInitialized {
+		c.taskCompletionBuffer.rebuildContiguousPrefix()
 	}
 	// Keep existing page if it is already buffered
 	if _, ok := c.taskCompletionBuffer.pages[request.GetPageNumber()]; ok {
@@ -234,16 +263,7 @@ func (c *ContextImpl) AppendTaskCompletionPage(
 	// Fold pages into the prefix only when this page fills the lowest gap. Each
 	// accepted page is counted at most once across the buffer's lifetime.
 	if request.GetPageNumber() == c.taskCompletionBuffer.contiguousPageCount {
-		c.taskCompletionBuffer.contiguousCommandCount += len(request.Commands)
-		c.taskCompletionBuffer.contiguousPageCount++
-		for {
-			cmds, ok := c.taskCompletionBuffer.pages[c.taskCompletionBuffer.contiguousPageCount]
-			if !ok {
-				break
-			}
-			c.taskCompletionBuffer.contiguousCommandCount += len(cmds)
-			c.taskCompletionBuffer.contiguousPageCount++
-		}
+		c.taskCompletionBuffer.advanceContiguousPrefix()
 	}
 	return nil
 }
@@ -310,6 +330,9 @@ func (c *ContextImpl) GetMergedTaskCompletionPages(
 		metrics.WorkflowTaskCompletionBufferLost.With(c.metricsHandler).Record(1)
 		return nil, serviceerror.NewWorkflowTaskCompletionBufferLostf(
 			"workflow task completion buffer lost for scheduled event %d attempt %d", schedID, attempt)
+	}
+	if !c.taskCompletionBuffer.contiguousPrefixInitialized {
+		c.taskCompletionBuffer.rebuildContiguousPrefix()
 	}
 	// Every page in 0..finalPageNumber-1 must be present. A gap means a page was
 	// lost or never sent; merging anyway would silently drop commands. The buffer
