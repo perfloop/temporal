@@ -715,6 +715,22 @@ func (s *contextSuite) TestTaskCompletionBuffer_GapDetection() {
 	s.ErrorAs(err, &bufferLost)
 }
 
+func (s *contextSuite) TestTaskCompletionBuffer_OutOfOrderPages() {
+	const schedID = int64(12)
+	s.setTaskCompletionBufferSizeLimit(0)
+
+	// Page 1 may arrive before page 0. Once page 0 arrives, the contiguous
+	// prefix must include both pages and preserve their numeric order.
+	s.NoError(s.workflowContext.AppendTaskCompletionPage(schedID, 1, intermediatePage(1, "second")))
+	s.NoError(s.workflowContext.AppendTaskCompletionPage(schedID, 1, intermediatePage(0, "first")))
+
+	merged, err := s.workflowContext.GetMergedTaskCompletionPages(schedID, 1, finalPage(2, nil))
+	s.NoError(err)
+	s.Len(merged, 2)
+	s.Equal("first", merged[0].GetRecordMarkerCommandAttributes().GetMarkerName())
+	s.Equal("second", merged[1].GetRecordMarkerCommandAttributes().GetMarkerName())
+}
+
 // TestTaskCompletionBuffer_Idempotency verifies that a resent page does not overwrite
 // the first write and the merge still yields the original commands in order.
 func (s *contextSuite) TestTaskCompletionBuffer_Idempotency() {
@@ -729,23 +745,6 @@ func (s *contextSuite) TestTaskCompletionBuffer_Idempotency() {
 	s.NoError(err)
 	s.Len(merged, 1)
 	s.Equal("first", merged[0].GetRecordMarkerCommandAttributes().GetMarkerName())
-}
-
-func (s *contextSuite) TestTaskCompletionBuffer_CommandCount() {
-	const schedID = int64(13)
-	s.setTaskCompletionBufferSizeLimit(0)
-
-	page := intermediatePage(0, "first")
-	page.Commands = append(page.Commands, intermediatePage(0, "second").Commands...)
-	s.NoError(s.workflowContext.AppendTaskCompletionPage(schedID, 1, page))
-	s.Equal(2, s.workflowContext.taskCompletionBuffer.commandCount)
-
-	// A retransmission must not reserve capacity a second time.
-	s.NoError(s.workflowContext.AppendTaskCompletionPage(schedID, 1, intermediatePage(0, "duplicate")))
-	s.Equal(2, s.workflowContext.taskCompletionBuffer.commandCount)
-
-	s.NoError(s.workflowContext.AppendTaskCompletionPage(schedID, 1, intermediatePage(1, "third")))
-	s.Equal(3, s.workflowContext.taskCompletionBuffer.commandCount)
 }
 
 func (s *contextSuite) TestTaskCompletionBuffer_PageCountLimit() {

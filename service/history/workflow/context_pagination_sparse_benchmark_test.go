@@ -18,7 +18,7 @@ import (
 
 const (
 	taskCompletionSparsePageCount             = 256
-	taskCompletionOutOfRangeEmptyCommandCount = 8192
+	taskCompletionOutOfRangeEmptyCommandCount = rpc.MaxHTTPAPIRequestBytes/2 - 1024
 	taskCompletionBenchmarkBufferLimit        = 40 * 1024 * 1024
 )
 
@@ -105,8 +105,11 @@ func newTaskCompletionPaginationOutOfRangeInput(t testing.TB) (
 	workflowContext := newTaskCompletionPaginationBenchmarkContext(t)
 
 	emptyCommands := make([]*commandpb.Command, taskCompletionOutOfRangeEmptyCommandCount)
+	// The completion path does not mutate commands; repeated references retain the
+	// same zero-size protobuf entries without charging setup allocation to the run.
+	emptyCommand := &commandpb.Command{}
 	for i := range emptyCommands {
-		emptyCommands[i] = &commandpb.Command{}
+		emptyCommands[i] = emptyCommand
 	}
 	outOfRangeRequest := &workflowservice.RespondWorkflowTaskCompletedRequest{
 		IntermediatePage: true,

@@ -7,7 +7,6 @@ import (
 	commandpb "go.temporal.io/api/command/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/workflowservice/v1"
-	"go.temporal.io/server/common/metrics"
 )
 
 type taskCompletionPaginationBenchmarkCase struct {
@@ -23,7 +22,7 @@ func TestTaskCompletionPaginationFinalPagePreservesCommandOrder(t *testing.T) {
 		commandsPerPage:   2,
 		finalCommandCount: 2,
 	}
-	workflowContext, buffer, finalPage, expectedNames := newTaskCompletionPaginationBenchmarkInput(testCase)
+	workflowContext, buffer, finalPage, expectedNames := newTaskCompletionPaginationBenchmarkInput(t, testCase)
 	workflowContext.taskCompletionBuffer = buffer
 
 	merged, err := workflowContext.GetMergedTaskCompletionPages(benchmarkTaskCompletionSchedID, benchmarkTaskCompletionAttempt, finalPage)
@@ -63,7 +62,7 @@ func BenchmarkTaskCompletionPaginationFinalPage(b *testing.B) {
 		},
 	} {
 		b.Run(testCase.name, func(b *testing.B) {
-			workflowContext, buffer, finalPage, expectedNames := newTaskCompletionPaginationBenchmarkInput(testCase)
+			workflowContext, buffer, finalPage, expectedNames := newTaskCompletionPaginationBenchmarkInput(b, testCase)
 			expectedCommandCount := len(expectedNames)
 
 			for b.Loop() {
@@ -90,16 +89,15 @@ const (
 	benchmarkTaskCompletionAttempt = int32(1)
 )
 
-func newTaskCompletionPaginationBenchmarkInput(testCase taskCompletionPaginationBenchmarkCase) (
+func newTaskCompletionPaginationBenchmarkInput(t testing.TB, testCase taskCompletionPaginationBenchmarkCase) (
 	*ContextImpl,
 	*TaskCompletionBuffer,
 	*workflowservice.RespondWorkflowTaskCompletedRequest,
 	[]string,
 ) {
-	pages := make(map[int32][]*commandpb.Command, testCase.pageCount)
+	t.Helper()
+	workflowContext := newTaskCompletionPaginationBenchmarkContext(t)
 	expectedNames := make([]string, 0, testCase.pageCount*testCase.commandsPerPage+testCase.finalCommandCount)
-	var totalSize int64
-	bufferedCommandCount := 0
 	commandNumber := 0
 	for page := range testCase.pageCount {
 		commands := make([]*commandpb.Command, testCase.commandsPerPage)
@@ -109,10 +107,17 @@ func newTaskCompletionPaginationBenchmarkInput(testCase taskCompletionPagination
 			expectedNames = append(expectedNames, markerName)
 			commandNumber++
 		}
-		pages[int32(page)] = commands
-		totalSize += taskCompletionPageBytes(commands)
-		// Mirror the count that AppendTaskCompletionPage maintains for a buffered page.
-		bufferedCommandCount += len(commands)
+		if err := workflowContext.AppendTaskCompletionPage(
+			benchmarkTaskCompletionSchedID,
+			benchmarkTaskCompletionAttempt,
+			&workflowservice.RespondWorkflowTaskCompletedRequest{
+				IntermediatePage: true,
+				PageNumber:       int32(page),
+				Commands:         commands,
+			},
+		); err != nil {
+			t.Fatalf("AppendTaskCompletionPage returned error: %v", err)
+		}
 	}
 
 	finalCommands := make([]*commandpb.Command, testCase.finalCommandCount)
@@ -123,18 +128,13 @@ func newTaskCompletionPaginationBenchmarkInput(testCase taskCompletionPagination
 		commandNumber++
 	}
 
-	return &ContextImpl{metricsHandler: metrics.NoopMetricsHandler}, &TaskCompletionBuffer{
-			pages:        pages,
-			totalSize:    totalSize,
-			commandCount: bufferedCommandCount,
-			identity: workflowTaskIdentity{
-				schedID: benchmarkTaskCompletionSchedID,
-				attempt: benchmarkTaskCompletionAttempt,
-			},
-		}, &workflowservice.RespondWorkflowTaskCompletedRequest{
-			PageNumber: int32(testCase.pageCount),
-			Commands:   finalCommands,
-		}, expectedNames
+	buffer := workflowContext.taskCompletionBuffer
+	workflowContext.MutableState = nil
+	workflowContext.taskCompletionBuffer = nil
+	return workflowContext, buffer, &workflowservice.RespondWorkflowTaskCompletedRequest{
+		PageNumber: int32(testCase.pageCount),
+		Commands:   finalCommands,
+	}, expectedNames
 }
 
 func benchmarkTaskCompletionCommand(markerName string) *commandpb.Command {

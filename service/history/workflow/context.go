@@ -63,10 +63,11 @@ type (
 	// TaskCompletionBuffer holds the intermediate pages of a single in-progress
 	// pagination of RespondWorkflowTaskCompleted requests.
 	TaskCompletionBuffer struct {
-		pages        map[int32][]*commandpb.Command // page_number (0-based) -> commands
-		totalSize    int64                          // cumulative buffered bytes
-		commandCount int                            // cumulative buffered command count
-		identity     workflowTaskIdentity           // the workflow task this buffer belongs to
+		pages                  map[int32][]*commandpb.Command // page_number (0-based) -> commands
+		totalSize              int64                          // cumulative buffered bytes
+		contiguousPageCount    int32                          // pages present consecutively from page 0
+		contiguousCommandCount int                            // commands in the contiguous page prefix
+		identity               workflowTaskIdentity           // the workflow task this buffer belongs to
 	}
 )
 
@@ -230,7 +231,20 @@ func (c *ContextImpl) AppendTaskCompletionPage(
 
 	c.taskCompletionBuffer.pages[request.GetPageNumber()] = request.Commands
 	c.taskCompletionBuffer.totalSize += pageBytes
-	c.taskCompletionBuffer.commandCount += len(request.Commands)
+	// Fold pages into the prefix only when this page fills the lowest gap. Each
+	// accepted page is counted at most once across the buffer's lifetime.
+	if request.GetPageNumber() == c.taskCompletionBuffer.contiguousPageCount {
+		c.taskCompletionBuffer.contiguousCommandCount += len(request.Commands)
+		c.taskCompletionBuffer.contiguousPageCount++
+		for {
+			cmds, ok := c.taskCompletionBuffer.pages[c.taskCompletionBuffer.contiguousPageCount]
+			if !ok {
+				break
+			}
+			c.taskCompletionBuffer.contiguousCommandCount += len(cmds)
+			c.taskCompletionBuffer.contiguousPageCount++
+		}
+	}
 	return nil
 }
 
@@ -298,16 +312,25 @@ func (c *ContextImpl) GetMergedTaskCompletionPages(
 			"workflow task completion buffer lost for scheduled event %d attempt %d", schedID, attempt)
 	}
 	// Every page in 0..finalPageNumber-1 must be present. A gap means a page was
-	// lost or never sent; merging anyway would silently drop commands. Validate the
-	// sequence before allocating capacity derived from buffered commands.
-	for page := range finalPageNumber {
-		if _, ok := c.taskCompletionBuffer.pages[page]; !ok {
+	// lost or never sent; merging anyway would silently drop commands. The buffer
+	// tracks its contiguous prefix as pages are admitted, so a missing page is
+	// rejected before any count-derived allocation.
+	commandCount := c.taskCompletionBuffer.contiguousCommandCount
+	if finalPageNumber != c.taskCompletionBuffer.contiguousPageCount {
+		if finalPageNumber > c.taskCompletionBuffer.contiguousPageCount {
 			metrics.WorkflowTaskCompletionBufferLost.With(c.metricsHandler).Record(1)
 			return nil, serviceerror.NewWorkflowTaskCompletionBufferLostf(
-				"workflow task completion buffer missing page %d of %d", page, finalPageNumber)
+				"workflow task completion buffer missing page %d of %d", c.taskCompletionBuffer.contiguousPageCount, finalPageNumber)
+		}
+
+		// Preserve the existing behavior for a final page that is lower than an
+		// already buffered contiguous prefix: merge only the requested prefix.
+		commandCount = 0
+		for page := range finalPageNumber {
+			commandCount += len(c.taskCompletionBuffer.pages[page])
 		}
 	}
-	merged := make([]*commandpb.Command, 0, c.taskCompletionBuffer.commandCount+len(request.Commands))
+	merged := make([]*commandpb.Command, 0, commandCount+len(request.Commands))
 	for page := range finalPageNumber {
 		merged = append(merged, c.taskCompletionBuffer.pages[page]...)
 	}
