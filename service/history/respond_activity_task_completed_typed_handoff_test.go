@@ -44,7 +44,7 @@ func (e *activityCompletionTypedHandoffCompatibilityEngine) RespondActivityTaskC
 	return &historyservice.RespondActivityTaskCompletedResponse{}, nil
 }
 
-func TestRespondActivityTaskCompletedTypedHandoffCompatibility(t *testing.T) {
+func TestRespondActivityTaskCompletedPassesDecodedTokenToHistoryEngine(t *testing.T) {
 	request, wantToken, err := newActivityCompletionHandoffRequest(0)
 	if err != nil {
 		t.Fatal(err)
@@ -66,20 +66,6 @@ func TestRespondActivityTaskCompletedTypedHandoffCompatibility(t *testing.T) {
 	}
 	if engine.request != request {
 		t.Fatalf("engine request = %p, want %p", engine.request, request)
-	}
-
-	_, supportsTypedHandoff := any((*historyEngineImpl)(nil)).(interface {
-		RespondActivityTaskCompletedWithTaskToken(
-			context.Context,
-			*historyservice.RespondActivityTaskCompletedRequest,
-			*tokenspb.Task,
-		) (*historyservice.RespondActivityTaskCompletedResponse, error)
-	})
-	if !supportsTypedHandoff {
-		if engine.rawCalls != 1 || engine.typedCalls != 0 {
-			t.Fatalf("legacy Engine calls = raw %d, typed %d; want raw 1, typed 0", engine.rawCalls, engine.typedCalls)
-		}
-		return
 	}
 
 	if engine.rawCalls != 0 || engine.typedCalls != 1 {
@@ -122,7 +108,7 @@ func (c *activityCompletionTypedHandoffRunIDConsistencyChecker) GetCurrentWorkfl
 	return c.currentRunID, nil
 }
 
-func TestRespondActivityTaskCompletedMissingRunIDCompatibility(t *testing.T) {
+func TestRespondActivityTaskCompletedResolvesMissingRunIDThroughProductionHandoff(t *testing.T) {
 	handler, mutableState := newActivityCompletionHandoffHandler()
 	controller := handler.controller.(*activityCompletionHandoffController)
 	shardContext := controller.shardContext.(*activityCompletionHandoffShardContext)
