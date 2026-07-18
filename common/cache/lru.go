@@ -403,7 +403,7 @@ func (c *lru) tryEvictUntilCacheSizeUnderLimit() {
 // evicting the existing entry. the existing entry is skipped because it is being updated.
 func (c *lru) tryEvictUntilEnoughSpaceWithSkipEntry(newEntrySize int, existingEntry *entryImpl) {
 	// If every entry is pinned, eviction cannot make room.
-	if c.pin && c.pinnedEntries == c.byAccess.Len() {
+	if c.pinnedEntries == c.byAccess.Len() {
 		return
 	}
 
