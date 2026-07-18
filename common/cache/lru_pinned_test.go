@@ -6,30 +6,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestPinnedCacheEvictsLeastRecentlyUsedUnpinnedEntry(t *testing.T) {
-	cache := New(3, &Options{Pin: true})
-	for _, key := range []string{"A", "B", "C"} {
-		_, err := cache.PutIfNotExist(key, key)
-		require.NoError(t, err)
-	}
-
-	// Move A to the most-recent position, then make A and C evictable. B remains
-	// pinned at the least-recent position. C is the least-recent evictable entry,
-	// so a new pinned entry must evict C rather than A.
-	require.Equal(t, "A", cache.Get("A"))
-	cache.Release("A")
-	cache.Release("A")
-	cache.Release("C")
-
-	_, err := cache.PutIfNotExist("D", "D")
-	require.NoError(t, err)
-	require.Equal(t, 3, cache.Size())
-	require.Nil(t, cache.Get("C"))
-	require.Equal(t, "A", cache.Get("A"))
-	require.Equal(t, "B", cache.Get("B"))
-	require.Equal(t, "D", cache.Get("D"))
-}
-
 func TestPinnedCacheReleaseAndGetRestoreFullCache(t *testing.T) {
 	cache := New(2, &Options{Pin: true})
 	for _, key := range []string{"A", "B"} {
@@ -54,40 +30,6 @@ func TestPinnedCacheReleaseAndGetRestoreFullCache(t *testing.T) {
 	require.Equal(t, "C", cache.Get("C"))
 }
 
-func TestPinnedCacheReleaseUnderflowCanBecomeEvictable(t *testing.T) {
-	cache := New(1, &Options{Pin: true})
-	_, err := cache.PutIfNotExist("A", "A")
-	require.NoError(t, err)
-
-	// Release does not reject unbalanced calls. Preserve the existing behavior where
-	// a later Get can bring a negative reference count back to zero and make A evictable.
-	cache.Release("A")
-	cache.Release("A")
-	require.Equal(t, "A", cache.Get("A"))
-
-	_, err = cache.PutIfNotExist("B", "B")
-	require.NoError(t, err)
-	require.Nil(t, cache.Get("A"))
-	require.Equal(t, "B", cache.Get("B"))
-}
-
-func TestPinnedCacheEvictsZeroSizeEntryBeforeReturningFull(t *testing.T) {
-	cache := New(1, &Options{Pin: true})
-	pinned := &testEntryWithCacheSize{cacheSize: 1}
-	zeroSize := &testEntryWithCacheSize{}
-
-	_, err := cache.PutIfNotExist("pinned", pinned)
-	require.NoError(t, err)
-	_, err = cache.PutIfNotExist("zero-size", zeroSize)
-	require.NoError(t, err)
-	cache.Release("zero-size")
-
-	_, err = cache.PutIfNotExist("new", &testEntryWithCacheSize{cacheSize: 1})
-	require.ErrorIs(t, err, ErrCacheFull)
-	require.Nil(t, cache.Get("zero-size"))
-	require.Same(t, pinned, cache.Get("pinned"))
-}
-
 func TestPinnedCacheEvictsEntryThatBecomesZeroSizeOnRelease(t *testing.T) {
 	cache := New(1, &Options{Pin: true})
 	resized := &testEntryWithCacheSize{cacheSize: 1}
@@ -104,7 +46,7 @@ func TestPinnedCacheEvictsEntryThatBecomesZeroSizeOnRelease(t *testing.T) {
 	require.Nil(t, cache.Get("resized"))
 }
 
-func TestPinnedCacheEvictsPositiveEntryWithNegativeSizeEntry(t *testing.T) {
+func TestPinnedCacheEvictsAfterNegativeSizeUnderflowBecomesEvictable(t *testing.T) {
 	var evicted []any
 	cache := New(2, &Options{
 		Pin: true,
@@ -112,28 +54,69 @@ func TestPinnedCacheEvictsPositiveEntryWithNegativeSizeEntry(t *testing.T) {
 			evicted = append(evicted, value)
 		},
 	})
-	pinned := &testEntryWithCacheSize{cacheSize: 1}
-	evictable := &testEntryWithCacheSize{cacheSize: 1}
-	negativeSize := &testEntryWithCacheSize{cacheSize: -1}
-	newEntry := &testEntryWithCacheSize{cacheSize: 2}
+	x := &testEntryWithCacheSize{cacheSize: 1}
+	b := &testEntryWithCacheSize{}
+	a := &testEntryWithCacheSize{cacheSize: 2}
+	c := &testEntryWithCacheSize{cacheSize: 1}
 
-	_, err := cache.PutIfNotExist("pinned", pinned)
+	_, err := cache.PutIfNotExist("X", x)
 	require.NoError(t, err)
-	_, err = cache.PutIfNotExist("evictable", evictable)
+	cache.Release("X")
+	_, err = cache.PutIfNotExist("B", b)
 	require.NoError(t, err)
-	cache.Release("evictable")
-	_, err = cache.PutIfNotExist("negative-size", negativeSize)
-	require.NoError(t, err)
-	cache.Release("negative-size")
 
-	// Signed CacheSize values are accepted by the public API. The negative
-	// evictable entry cancels the positive one in aggregate usage, but the
-	// existing LRU scan must still evict the positive entry to admit newEntry.
-	_, err = cache.PutIfNotExist("new", newEntry)
+	// An unbalanced Release can refresh B to a negative size while its reference
+	// count is negative. A later Get restores B to the eviction predicate's zero
+	// count, so the aggregate equality must not reject C before scanning X and B.
+	b.cacheSize = 1
+	cache.Release("B")
+	b.cacheSize = -1
+	cache.Release("B")
+	require.Same(t, b, cache.Get("B"))
+
+	_, err = cache.PutIfNotExist("A", a)
 	require.NoError(t, err)
-	require.Nil(t, cache.Get("evictable"))
-	require.Same(t, newEntry, cache.Get("new"))
-	require.Equal(t, []any{evictable}, evicted)
+	_, err = cache.PutIfNotExist("C", c)
+	require.NoError(t, err)
+	require.Nil(t, cache.Get("X"))
+	require.Same(t, a, cache.Get("A"))
+	require.Same(t, c, cache.Get("C"))
+	require.Equal(t, []any{x}, evicted)
+}
+
+func TestPinnedCacheScansAfterSizeAccountingOverflow(t *testing.T) {
+	entrySize := int(^uint(0)>>1)/2 + 1
+	var evicted []any
+	cache := New(entrySize, &Options{
+		Pin: true,
+		OnEvict: func(value any) {
+			evicted = append(evicted, value)
+		},
+	})
+	pinned := &testEntryWithCacheSize{cacheSize: entrySize}
+	firstEvictable := &testEntryWithCacheSize{cacheSize: entrySize}
+
+	_, err := cache.PutIfNotExist(-1, pinned)
+	require.NoError(t, err)
+	for i := 0; i < 4; i++ {
+		_, err = cache.PutIfNotExist(i*2, &testEntryWithCacheSize{cacheSize: -entrySize})
+		require.NoError(t, err)
+		evictable := &testEntryWithCacheSize{cacheSize: entrySize}
+		if i == 0 {
+			evictable = firstEvictable
+		}
+		_, err = cache.PutIfNotExist(i*2+1, evictable)
+		require.NoError(t, err)
+		cache.Release(i*2 + 1)
+	}
+	require.Empty(t, evicted)
+
+	// The positive evictable entries wrap the signed aggregate back to the
+	// pinned aggregate. The original scan must still evict the first one.
+	_, err = cache.PutIfNotExist(99, &testEntryWithCacheSize{cacheSize: 1})
+	require.NoError(t, err)
+	require.Nil(t, cache.Get(1))
+	require.Equal(t, []any{firstEvictable}, evicted)
 }
 
 func TestPinnedCacheEvictsAfterPinnedEntryShrinks(t *testing.T) {

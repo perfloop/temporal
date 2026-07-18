@@ -30,21 +30,21 @@ const emptyEntrySize = 0
 // lru is a concurrent fixed size cache that evicts elements in lru order
 type (
 	lru struct {
-		mut                     sync.Mutex
-		byAccess                *list.List
-		byKey                   map[any]*list.Element
-		maxSize                 int
-		currSize                int
-		pinnedSize              int
-		hasSeenNonPositiveEntry bool
-		onPut                   func(val any)
-		onEvict                 func(val any)
-		ttl                     time.Duration
-		pin                     bool
-		timeSource              clock.TimeSource
-		metricsHandler          metrics.Handler
-		backgroundEvict         dynamicconfig.TypedPropertyFn[dynamicconfig.CacheBackgroundEvictSettings]
-		loops                   goro.Group
+		mut                      sync.Mutex
+		byAccess                 *list.List
+		byKey                    map[any]*list.Element
+		maxSize                  int
+		currSize                 int
+		pinnedSize               int
+		pinnedSizeEqualityUnsafe bool
+		onPut                    func(val any)
+		onEvict                  func(val any)
+		ttl                      time.Duration
+		pin                      bool
+		timeSource               clock.TimeSource
+		metricsHandler           metrics.Handler
+		backgroundEvict          dynamicconfig.TypedPropertyFn[dynamicconfig.CacheBackgroundEvictSettings]
+		loops                    goro.Group
 	}
 
 	iteratorImpl struct {
@@ -269,19 +269,19 @@ func (c *lru) Release(key any) {
 	entrySize := entry.Size()
 	entry.refCount--
 	if entry.refCount == 0 {
-		c.pinnedSize -= entrySize
+		c.updatePinnedSize(emptyEntrySize, entrySize)
 		metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
 	}
 	// Entry size might have changed. Recalculate size and evict entries if necessary.
 	newEntrySize := getSize(entry.value)
 	if entry.refCount > 0 && newEntrySize != entrySize {
-		c.pinnedSize += newEntrySize - entrySize
+		c.updatePinnedSize(newEntrySize, entrySize)
 		metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
 	}
-	if entry.refCount == 0 && newEntrySize <= 0 {
-		// A non-positive-size evictable entry cannot be detected from pinnedSize alone.
-		// Keep the fast rejection conservative after observing one.
-		c.hasSeenNonPositiveEntry = true
+	if newEntrySize <= 0 && entry.refCount <= 0 {
+		// A non-positive unpinned entry can be evictable now or after a later Get.
+		// Its size cannot be ruled out by the aggregate equality.
+		c.pinnedSizeEqualityUnsafe = true
 	}
 	c.currSize = c.calculateNewCacheSize(newEntrySize, entrySize)
 	entry.size = newEntrySize
@@ -360,9 +360,10 @@ func (c *lru) putInternal(key any, value any, allowUpdate bool) (any, error) {
 	// Check whether the new entry can fit in the cache before searching for an eviction candidate.
 	newCacheSize := c.calculateNewCacheSize(newEntrySize, emptyEntrySize)
 	if newCacheSize > c.maxSize {
-		// If all positive-size cache usage is pinned, no evictable entry can make room.
-		// Avoid scanning every pinned entry before returning the same cache-full error.
-		if c.pin && !c.hasSeenNonPositiveEntry && c.pinnedSize == c.currSize {
+		// Equality proves no eviction candidate only when unpinned entries have positive
+		// sizes and aggregate accounting has not overflowed. Avoid scanning every pinned
+		// entry before returning the same cache-full error in that case.
+		if c.pin && !c.pinnedSizeEqualityUnsafe && c.pinnedSize == c.currSize {
 			return nil, ErrCacheFull
 		}
 
@@ -393,13 +394,43 @@ func (c *lru) putInternal(key any, value any, allowUpdate bool) (any, error) {
 }
 
 func (c *lru) calculateNewCacheSize(newEntrySize int, existingEntrySize int) int {
-	return c.currSize - existingEntrySize + newEntrySize
+	if !c.pin {
+		return c.currSize - existingEntrySize + newEntrySize
+	}
+
+	cacheSize, subtractionOverflowed := subtractInt(c.currSize, existingEntrySize)
+	cacheSize, additionOverflowed := addInt(cacheSize, newEntrySize)
+	if subtractionOverflowed || additionOverflowed {
+		// Wrapped aggregate values cannot prove that every entry is pinned. Keep the
+		// all-pinned shortcut disabled instead of trying to recover exact accounting.
+		c.pinnedSizeEqualityUnsafe = true
+	}
+	return cacheSize
+}
+
+func (c *lru) updatePinnedSize(newEntrySize int, existingEntrySize int) {
+	pinnedSize, subtractionOverflowed := subtractInt(c.pinnedSize, existingEntrySize)
+	pinnedSize, additionOverflowed := addInt(pinnedSize, newEntrySize)
+	if subtractionOverflowed || additionOverflowed {
+		c.pinnedSizeEqualityUnsafe = true
+	}
+	c.pinnedSize = pinnedSize
+}
+
+func addInt(a int, b int) (int, bool) {
+	sum := a + b
+	return sum, (b > 0 && sum < a) || (b < 0 && sum > a)
+}
+
+func subtractInt(a int, b int) (int, bool) {
+	difference := a - b
+	return difference, (b > 0 && difference > a) || (b < 0 && difference < a)
 }
 
 func (c *lru) deleteInternal(element *list.Element) {
 	entry := c.byAccess.Remove(element).(*entryImpl)
 	if c.pin && entry.refCount > 0 {
-		c.pinnedSize -= entry.Size()
+		c.updatePinnedSize(emptyEntrySize, entry.Size())
 		metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
 	}
 	c.currSize -= entry.Size()
@@ -462,7 +493,7 @@ func (c *lru) updateEntryRefCount(entry *entryImpl) {
 	if c.pin {
 		entry.refCount++
 		if entry.refCount == 1 {
-			c.pinnedSize += entry.Size()
+			c.updatePinnedSize(entry.Size(), emptyEntrySize)
 			metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
 		}
 	}
