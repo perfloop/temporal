@@ -274,15 +274,15 @@ func (c *lru) Release(key any) {
 	}
 	// Entry size might have changed. Recalculate size and evict entries if necessary.
 	newEntrySize := getSize(entry.value)
+	if newEntrySize <= 0 && entry.refCount <= 0 {
+		// A non-positive unpinned entry can be evictable now or after a later Get.
+		// Its size cannot be ruled out by the aggregate equality.
+		c.pinnedSizeEqualityUnsafe = true
+	}
 	if newEntrySize != entrySize {
 		if entry.refCount > 0 {
 			c.pinnedSize = c.pinnedSize - entrySize + newEntrySize
 			metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
-		}
-		if newEntrySize <= 0 || entrySize <= 0 {
-			// A non-positive entry can later be evictable without aggregate
-			// equality ruling it out, so retain the original scan.
-			c.pinnedSizeEqualityUnsafe = true
 		}
 		c.updateCacheSize(newEntrySize, entrySize)
 		entry.size = newEntrySize
@@ -376,11 +376,6 @@ func (c *lru) putInternal(key any, value any, allowUpdate bool) (any, error) {
 		}
 	}
 
-	if c.pin && newEntrySize <= 0 {
-		// A non-positive entry can later be evictable without aggregate equality
-		// ruling it out, so retain the original scan.
-		c.pinnedSizeEqualityUnsafe = true
-	}
 	entry := &entryImpl{
 		key:   key,
 		value: value,
@@ -409,9 +404,9 @@ func (c *lru) calculateNewCacheSize(newEntrySize int, existingEntrySize int) int
 }
 
 func (c *lru) updateCacheSize(newEntrySize int, existingEntrySize int) {
-	cacheSize, subtractionOverflowed := subtractInt(c.currSize, existingEntrySize)
-	cacheSize, additionOverflowed := addInt(cacheSize, newEntrySize)
-	if subtractionOverflowed || additionOverflowed {
+	cacheSize := c.currSize - existingEntrySize
+	cacheSize, overflowed := addInt(cacheSize, newEntrySize)
+	if overflowed {
 		// Wrapped aggregate values cannot prove that every entry is pinned. Keep the
 		// all-pinned shortcut disabled instead of trying to recover exact accounting.
 		c.pinnedSizeEqualityUnsafe = true
@@ -422,11 +417,6 @@ func (c *lru) updateCacheSize(newEntrySize int, existingEntrySize int) {
 func addInt(a int, b int) (int, bool) {
 	sum := a + b
 	return sum, (b > 0 && sum < a) || (b < 0 && sum > a)
-}
-
-func subtractInt(a int, b int) (int, bool) {
-	difference := a - b
-	return difference, (b > 0 && difference > a) || (b < 0 && difference < a)
 }
 
 func (c *lru) deleteInternal(element *list.Element) {
