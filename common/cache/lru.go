@@ -283,7 +283,7 @@ func (c *lru) Release(key any) {
 		// Its size cannot be ruled out by the aggregate equality.
 		c.pinnedSizeEqualityUnsafe = true
 	}
-	c.currSize = c.calculateNewCacheSize(newEntrySize, entrySize)
+	c.updateCacheSize(newEntrySize, entrySize)
 	entry.size = newEntrySize
 	if c.currSize > c.maxSize {
 		c.tryEvictUntilCacheSizeUnderLimit()
@@ -383,7 +383,11 @@ func (c *lru) putInternal(key any, value any, allowUpdate bool) (any, error) {
 	c.updateEntryRefCount(entry)
 	element := c.byAccess.PushFront(entry)
 	c.byKey[key] = element
-	c.currSize = newCacheSize
+	if c.pin {
+		c.updateCacheSize(newEntrySize, emptyEntrySize)
+	} else {
+		c.currSize = newCacheSize
+	}
 	metrics.CacheUsage.With(c.metricsHandler).Record(float64(c.currSize))
 
 	if c.onPut != nil {
@@ -394,10 +398,10 @@ func (c *lru) putInternal(key any, value any, allowUpdate bool) (any, error) {
 }
 
 func (c *lru) calculateNewCacheSize(newEntrySize int, existingEntrySize int) int {
-	if !c.pin {
-		return c.currSize - existingEntrySize + newEntrySize
-	}
+	return c.currSize - existingEntrySize + newEntrySize
+}
 
+func (c *lru) updateCacheSize(newEntrySize int, existingEntrySize int) {
 	cacheSize, subtractionOverflowed := subtractInt(c.currSize, existingEntrySize)
 	cacheSize, additionOverflowed := addInt(cacheSize, newEntrySize)
 	if subtractionOverflowed || additionOverflowed {
@@ -405,7 +409,7 @@ func (c *lru) calculateNewCacheSize(newEntrySize int, existingEntrySize int) int
 		// all-pinned shortcut disabled instead of trying to recover exact accounting.
 		c.pinnedSizeEqualityUnsafe = true
 	}
-	return cacheSize
+	c.currSize = cacheSize
 }
 
 func (c *lru) updatePinnedSize(newEntrySize int, existingEntrySize int) {
@@ -433,7 +437,11 @@ func (c *lru) deleteInternal(element *list.Element) {
 		c.updatePinnedSize(emptyEntrySize, entry.Size())
 		metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
 	}
-	c.currSize -= entry.Size()
+	if c.pin {
+		c.updateCacheSize(emptyEntrySize, entry.Size())
+	} else {
+		c.currSize -= entry.Size()
+	}
 	metrics.CacheUsage.With(c.metricsHandler).Record(float64(c.currSize))
 	metrics.CacheEntryAgeOnEviction.With(c.metricsHandler).Record(c.timeSource.Now().UTC().Sub(entry.createTime))
 	delete(c.byKey, entry.key)

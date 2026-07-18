@@ -119,6 +119,89 @@ func TestPinnedCacheScansAfterSizeAccountingOverflow(t *testing.T) {
 	require.Equal(t, []any{firstEvictable}, evicted)
 }
 
+func TestPinnedCacheScansAfterCurrentSizeAdditionOverflow(t *testing.T) {
+	maxInt := int(^uint(0) >> 1)
+	maxSize := maxInt - 1
+	var evicted []any
+	cache := New(maxSize, &Options{
+		Pin: true,
+		OnEvict: func(value any) {
+			evicted = append(evicted, value)
+		},
+	})
+	pinned := &testEntryWithCacheSize{cacheSize: 2}
+	firstEvictable := &testEntryWithCacheSize{cacheSize: 1}
+	largeSize := maxSize - 1
+
+	_, err := cache.PutIfNotExist("pinned", pinned)
+	require.NoError(t, err)
+	_, err = cache.PutIfNotExist("first-evictable", firstEvictable)
+	require.NoError(t, err)
+	cache.Release("first-evictable")
+	for _, key := range []string{"large-1", "large-2"} {
+		_, err = cache.PutIfNotExist(key, &testEntryWithCacheSize{cacheSize: largeSize})
+		require.NoError(t, err)
+		cache.Release(key)
+	}
+	_, err = cache.PutIfNotExist("tail", &testEntryWithCacheSize{cacheSize: 5})
+	require.NoError(t, err)
+	cache.Release("tail")
+
+	// Adding large-1 overflows currSize while the transient pinned aggregate
+	// reaches maxInt exactly. The released positive entries then wrap currSize
+	// back to the pinned aggregate, but the first evictable entry must remain
+	// discoverable through the original scan.
+	newEntry := &testEntryWithCacheSize{cacheSize: largeSize}
+	_, err = cache.PutIfNotExist("new", newEntry)
+	require.NoError(t, err)
+	require.Nil(t, cache.Get("first-evictable"))
+	require.Same(t, newEntry, cache.Get("new"))
+	require.Equal(t, []any{firstEvictable}, evicted)
+}
+
+func TestPinnedCacheScansAfterCurrentSizeSubtractionOverflow(t *testing.T) {
+	maxInt := int(^uint(0) >> 1)
+	maxSize := maxInt - 1
+	var evicted []any
+	cache := New(maxSize, &Options{
+		Pin: true,
+		OnEvict: func(value any) {
+			evicted = append(evicted, value)
+		},
+	})
+	resizedPinned := &testEntryWithCacheSize{cacheSize: -2}
+	firstEvictable := &testEntryWithCacheSize{cacheSize: maxSize}
+
+	_, err := cache.PutIfNotExist("resized-pinned", resizedPinned)
+	require.NoError(t, err)
+	_, err = cache.PutIfNotExist("first-evictable", firstEvictable)
+	require.NoError(t, err)
+	cache.Release("first-evictable")
+	_, err = cache.PutIfNotExist("second-evictable", &testEntryWithCacheSize{cacheSize: 2})
+	require.NoError(t, err)
+	cache.Release("second-evictable")
+
+	require.Same(t, resizedPinned, cache.Get("resized-pinned"))
+	resizedPinned.cacheSize = 1
+	cache.Release("resized-pinned")
+	_, err = cache.PutIfNotExist("tail", &testEntryWithCacheSize{cacheSize: maxSize})
+	require.NoError(t, err)
+	cache.Release("tail")
+	_, err = cache.PutIfNotExist("tail-2", &testEntryWithCacheSize{cacheSize: 2})
+	require.NoError(t, err)
+	cache.Release("tail-2")
+
+	// Refreshing resized-pinned subtracts -2 from currSize and overflows before
+	// adding its new positive size. Its pinned aggregate stays in range. The
+	// later aggregate equality must still scan and evict first-evictable.
+	newEntry := &testEntryWithCacheSize{cacheSize: maxSize}
+	_, err = cache.PutIfNotExist("new", newEntry)
+	require.NoError(t, err)
+	require.Nil(t, cache.Get("first-evictable"))
+	require.Same(t, newEntry, cache.Get("new"))
+	require.Equal(t, []any{firstEvictable}, evicted)
+}
+
 func TestPinnedCacheEvictsAfterPinnedEntryShrinks(t *testing.T) {
 	cache := New(8, &Options{Pin: true})
 	resized := &testEntryWithCacheSize{cacheSize: 6}
