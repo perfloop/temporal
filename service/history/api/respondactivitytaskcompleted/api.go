@@ -26,7 +26,6 @@ func Invoke(
 	workflowConsistencyChecker api.WorkflowConsistencyChecker,
 ) (resp *historyservice.RespondActivityTaskCompletedResponse, retError error) {
 	request := req.CompleteRequest
-	var err0 error
 
 	namespaceEntry, err := api.GetActiveNamespace(shard, namespace.ID(req.GetNamespaceId()), token.WorkflowId)
 	if err != nil {
@@ -62,9 +61,9 @@ func Invoke(
 			isCompletedByID := false
 			if scheduledEventID == common.EmptyEventID { // client call CompleteActivityById, so get scheduledEventID by activityID
 				isCompletedByID = true
-				scheduledEventID, err0 = api.GetActivityScheduledEventID(token.GetActivityId(), mutableState)
-				if err0 != nil {
-					return nil, err0
+				scheduledEventID, err = api.GetActivityScheduledEventID(token.GetActivityId(), mutableState)
+				if err != nil {
+					return nil, err
 				}
 			}
 			ai, isRunning := mutableState.GetActivityInfo(scheduledEventID)
