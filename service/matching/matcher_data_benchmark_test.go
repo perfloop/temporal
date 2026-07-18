@@ -1,6 +1,7 @@
 package matching
 
 import (
+	"context"
 	"fmt"
 	"runtime"
 	"slices"
@@ -23,17 +24,33 @@ func matcherDataWithNoCompatibleQueryOnlyPollers(tasks, pollers int) *matcherDat
 }
 
 func TestMatcherDataFindMatchQueryOnlyPollers(t *testing.T) {
-	data := &matcherData{}
-	normalTask := &internalTask{}
-	queryOnlyPoller := &waitingPoller{queryOnly: true}
-	data.tasks.Add(normalTask)
-	data.pollers.Add(queryOnlyPoller)
-	data.pollers.Remove(queryOnlyPoller)
+	for _, tc := range []struct {
+		name   string
+		task   *internalTask
+		poller *waitingPoller
+	}{
+		{
+			name:   "query after normal task",
+			task:   &internalTask{query: &queryTaskInfo{}, effectivePriority: 1},
+			poller: &waitingPoller{queryOnly: true},
+		},
+		{
+			name:   "priority poll forwarder after normal task",
+			task:   newPollForwarderTask(pollForwarderPriority, priorityBacklogPollForwarder),
+			poller: &waitingPoller{queryOnly: true, forwardCtx: context.Background()},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data := &matcherData{}
+			normalTask := &internalTask{}
+			data.tasks.Add(normalTask)
+			data.tasks.Add(tc.task)
+			data.pollers.Add(tc.poller)
 
-	normalPoller := &waitingPoller{}
-	data.pollers.Add(normalPoller)
-	if task, poller := data.findMatch(false); task != normalTask || poller != normalPoller {
-		t.Fatalf("findMatch() = (%v, %v), want normal task matched to normal poller", task, poller)
+			if task, poller := data.findMatch(false); task != tc.task || poller != tc.poller {
+				t.Fatalf("findMatch() = (%v, %v), want compatible task matched to query-only poller", task, poller)
+			}
+		})
 	}
 }
 

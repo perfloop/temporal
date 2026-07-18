@@ -851,9 +851,7 @@ func (s *MatcherDataSuite) TestFindMatch() {
 					MinPriority: tc.pollerMinPriority,
 				}
 			}
-			// Construct through pollerPQ so query-only membership stays synchronized with the heap.
-			s.md.pollers = pollerPQ{}
-			s.md.pollers.Add(poller)
+			s.md.pollers.heap = []*waitingPoller{poller}
 
 			// Call findMatch
 			s.md.lock.Lock()
