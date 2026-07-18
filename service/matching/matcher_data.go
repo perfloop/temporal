@@ -448,13 +448,11 @@ func (d *matcherData) ReprocessTasks(pred func(*internalTask) bool) []*internalT
 // call with lock held
 // nolint:revive // will improve later
 func (d *matcherData) findMatch(allowForwarding bool) (*internalTask, *waitingPoller) {
-	allPollersQueryOnly := d.pollers.queryOnlyCount == len(d.pollers.heap)
-
 	// TODO(pri): optimize other O(d*n) cases
 	// TODO(pri): this iterates over heap as slice, which isn't quite correct, but okay for now
 	for _, task := range d.tasks.heap {
 		// Query-only pollers cannot match normal tasks, so skip their full cross-product scan.
-		if allPollersQueryOnly && !task.isQuery() && !task.isPollForwarder() {
+		if d.pollers.queryOnlyCount == len(d.pollers.heap) && !task.isQuery() && !task.isPollForwarder() {
 			continue
 		}
 		// disallow normal poll forwarding when allowForwarding is false, but allow the

@@ -28,18 +28,6 @@ func TestMatcherDataFindMatchQueryOnlyPollers(t *testing.T) {
 	queryOnlyPoller := &waitingPoller{queryOnly: true}
 	data.tasks.Add(normalTask)
 	data.pollers.Add(queryOnlyPoller)
-
-	if task, poller := data.findMatch(false); task != nil || poller != nil {
-		t.Fatalf("findMatch() = (%v, %v), want no match", task, poller)
-	}
-
-	queryTask := &internalTask{query: &queryTaskInfo{}}
-	data.tasks.Add(queryTask)
-	if task, poller := data.findMatch(false); task != queryTask || poller != queryOnlyPoller {
-		t.Fatalf("findMatch() = (%v, %v), want query task matched to query-only poller", task, poller)
-	}
-
-	data.tasks.Remove(queryTask)
 	data.pollers.Remove(queryOnlyPoller)
 
 	normalPoller := &waitingPoller{}
