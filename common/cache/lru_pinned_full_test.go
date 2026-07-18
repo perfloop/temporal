@@ -11,8 +11,6 @@ import (
 const pinnedFullInsertHostCacheCapacity = 128_000
 
 func TestPinnedCacheEvictsReleasedEntriesInLRUOrder(t *testing.T) {
-	t.Parallel()
-
 	cache := New(3, &Options{Pin: true})
 	for _, key := range []string{"A", "B", "C"} {
 		_, err := cache.PutIfNotExist(key, key)
@@ -36,8 +34,6 @@ func TestPinnedCacheEvictsReleasedEntriesInLRUOrder(t *testing.T) {
 }
 
 func TestPinnedCacheConcurrentFullInsert(t *testing.T) {
-	t.Parallel()
-
 	cache := New(8, &Options{Pin: true})
 	for key := range 8 {
 		_, err := cache.PutIfNotExist(key, key)

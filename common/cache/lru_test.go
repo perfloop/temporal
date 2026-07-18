@@ -253,8 +253,6 @@ func TestTTLWithPin(t *testing.T) {
 }
 
 func TestPinnedCacheEvictsReleasedEntryAfterDeletingPinnedEntry(t *testing.T) {
-	t.Parallel()
-
 	cache := New(2, &Options{Pin: true})
 	_, err := cache.PutIfNotExist("A", "A")
 	require.NoError(t, err)
