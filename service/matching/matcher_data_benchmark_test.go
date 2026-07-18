@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"go.temporal.io/server/api/matchingservice/v1"
 	"go.temporal.io/server/common/clock"
 )
 
@@ -42,8 +43,8 @@ func TestMatcherDataFindMatchQueryOnlyPollers(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			data := &matcherData{}
-			normalTask := &internalTask{}
-			data.tasks.Add(normalTask)
+			data.tasks.Add(&internalTask{})
+			data.tasks.Add(&internalTask{})
 			data.tasks.Add(tc.task)
 			data.pollers.Add(tc.poller)
 
@@ -51,6 +52,38 @@ func TestMatcherDataFindMatchQueryOnlyPollers(t *testing.T) {
 				t.Fatalf("findMatch() = (%v, %v), want compatible task matched to query-only poller", task, poller)
 			}
 		})
+	}
+
+	t.Run("normal tasks remain unmatched", func(t *testing.T) {
+		data := &matcherData{}
+		data.tasks.Add(&internalTask{})
+		data.tasks.Add(&internalTask{})
+		data.pollers.Add(&waitingPoller{queryOnly: true})
+
+		if task, poller := data.findMatch(false); task != nil || poller != nil {
+			t.Fatalf("findMatch() = (%v, %v), want no match", task, poller)
+		}
+	})
+}
+
+func TestMatcherDataFindMatchMixedPollers(t *testing.T) {
+	data := &matcherData{}
+	rejectedTask := &internalTask{effectivePriority: effectivePriorityFactor * priorityKey(2)}
+	matchedTask := &internalTask{effectivePriority: effectivePriorityFactor * priorityKey(1)}
+	queryOnlyPoller := &waitingPoller{queryOnly: true}
+	normalPoller := &waitingPoller{
+		pollMetadata: &pollMetadata{
+			conditions: &matchingservice.PollConditions{MinPriority: 1},
+		},
+	}
+	data.tasks.Add(rejectedTask)
+	data.tasks.Add(matchedTask)
+	data.pollers.Add(queryOnlyPoller)
+	data.pollers.Add(normalPoller)
+
+	task, poller := data.findMatch(false)
+	if task != matchedTask || poller != normalPoller {
+		t.Fatalf("findMatch() = (%v, %v), want later normal task matched to normal poller", task, poller)
 	}
 }
 
@@ -60,9 +93,14 @@ type matcherDataBenchmarkOperation struct {
 }
 
 func matcherDataFindAndWakeMatchesOperation(data *matcherData) matcherDataBenchmarkOperation {
+	var rateLimited bool
 	return matcherDataBenchmarkOperation{
-		run:       func() { data.findAndWakeMatches() },
-		keepAlive: func() {},
+		run: func() {
+			rateLimited = data.findAndWakeMatches() || rateLimited
+		},
+		keepAlive: func() {
+			runtime.KeepAlive(rateLimited)
+		},
 	}
 }
 
@@ -130,11 +168,13 @@ func BenchmarkMatcherDataFindAndWakeMatches(b *testing.B) {
 			b.ResetTimer()
 
 			b.RunParallel(func(pb *testing.PB) {
+				operation := newOperation()
 				for pb.Next() {
 					data.lock.Lock()
-					data.findAndWakeMatches()
+					operation.run()
 					data.lock.Unlock()
 				}
+				operation.keepAlive()
 			})
 			b.ReportMetric(lockHoldNanos, "lock_hold_ns/op")
 			b.ReportMetric(matchLatencyP99Nanos, "match_latency_p99_ns")

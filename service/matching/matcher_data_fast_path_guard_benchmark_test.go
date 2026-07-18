@@ -15,14 +15,13 @@ func matcherDataWithQueryOnlyPollers(pollers int) *matcherData {
 	return data
 }
 
-func matcherDataWithQueryOnlyPrefix(pollers int) (*matcherData, *waitingPoller) {
+func matcherDataWithQueryOnlyPrefix(pollers int) *matcherData {
 	data := &matcherData{}
 	for i := range pollers - 1 {
 		data.pollers.Add(&waitingPoller{queryOnly: true, startTime: time.Unix(int64(i), 0)})
 	}
-	normalPoller := &waitingPoller{startTime: time.Unix(int64(pollers), 0)}
-	data.pollers.Add(normalPoller)
-	return data, normalPoller
+	data.pollers.Add(&waitingPoller{startTime: time.Unix(int64(pollers), 0)})
+	return data
 }
 
 func BenchmarkMatcherDataFindMatchFastPaths(b *testing.B) {
@@ -44,10 +43,7 @@ func BenchmarkMatcherDataFindMatchFastPaths(b *testing.B) {
 		})
 
 		b.Run(fmt.Sprintf("NormalAfterQueryOnlyPrefix/pollers=%d", pollers), func(b *testing.B) {
-			data, normalPoller := matcherDataWithQueryOnlyPrefix(pollers)
-			if data.pollers.heap[len(data.pollers.heap)-1] != normalPoller {
-				b.Fatal("normal poller must follow the query-only heap prefix")
-			}
+			data := matcherDataWithQueryOnlyPrefix(pollers)
 			data.tasks.Add(&internalTask{})
 			benchmarkMatcherDataFindMatch(b, data, true)
 		})

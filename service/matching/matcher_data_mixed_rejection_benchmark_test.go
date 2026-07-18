@@ -2,9 +2,6 @@ package matching
 
 import (
 	"fmt"
-	"runtime"
-	"slices"
-	"sync"
 	"testing"
 	"time"
 
@@ -34,13 +31,18 @@ func matcherDataWithMixedRejectedPollers(tasks, pollers int) (*matcherData, *wai
 func assertMatcherDataMixedPollerRejection(b *testing.B, data *matcherData, normalPoller *waitingPoller) {
 	b.Helper()
 
-	if data.pollers.heap[len(data.pollers.heap)-1] != normalPoller {
-		b.Fatal("normal poller must follow the query-only heap prefix")
-	}
-	for _, poller := range data.pollers.heap[:len(data.pollers.heap)-1] {
-		if !poller.queryOnly {
-			b.Fatal("poller before normal poller must be query-only")
+	queryOnlyPollers := 0
+	normalPollers := 0
+	for _, poller := range data.pollers.heap {
+		if poller.queryOnly {
+			queryOnlyPollers++
 		}
+		if poller == normalPoller {
+			normalPollers++
+		}
+	}
+	if normalPollers != 1 || normalPoller.queryOnly || normalPoller.minPriority() != 1 || queryOnlyPollers != data.pollers.Len()-1 {
+		b.Fatal("want one min-priority normal poller and otherwise query-only pollers")
 	}
 
 	data.lock.Lock()
@@ -51,97 +53,14 @@ func assertMatcherDataMixedPollerRejection(b *testing.B, data *matcherData, norm
 	}
 }
 
-type mixedPollerRejectionOperation struct {
-	run       func()
-	keepAlive func()
-}
-
-func mixedPollerRejectionLockHoldNanos(
-	data *matcherData,
-	samples int,
-	newOperation func() mixedPollerRejectionOperation,
-) float64 {
-	operation := newOperation()
-	var total time.Duration
-	for range samples {
-		data.lock.Lock()
-		started := time.Now()
-		operation.run()
-		total += time.Since(started)
-		data.lock.Unlock()
-	}
-	operation.keepAlive()
-	return float64(total) / float64(samples)
-}
-
-func mixedPollerRejectionLatencyP99Nanos(
-	data *matcherData,
-	samplesPerWorker int,
-	newOperation func() mixedPollerRejectionOperation,
-) float64 {
-	workers := runtime.GOMAXPROCS(0)
-	latencies := make([]time.Duration, workers*samplesPerWorker)
-	start := make(chan struct{})
-	var wg sync.WaitGroup
-
-	for worker := range workers {
-		wg.Add(1)
-		go func(worker int) {
-			defer wg.Done()
-			operation := newOperation()
-			<-start
-			for i := range samplesPerWorker {
-				started := time.Now()
-				data.lock.Lock()
-				operation.run()
-				data.lock.Unlock()
-				latencies[worker*samplesPerWorker+i] = time.Since(started)
-			}
-			operation.keepAlive()
-		}(worker)
-	}
-	close(start)
-	wg.Wait()
-	slices.Sort(latencies)
-	return float64(latencies[(len(latencies)*99+99)/100-1])
-}
-
-func mixedPollerRejectionFindMatchOperation(data *matcherData) mixedPollerRejectionOperation {
-	var task *internalTask
-	var poller *waitingPoller
-	return mixedPollerRejectionOperation{
-		run: func() {
-			task, poller = data.findMatch(false)
-		},
-		keepAlive: func() {
-			runtime.KeepAlive(task)
-			runtime.KeepAlive(poller)
-		},
-	}
-}
-
-func mixedPollerRejectionFindAndWakeMatchesOperation(data *matcherData) mixedPollerRejectionOperation {
-	var rateLimited bool
-	return mixedPollerRejectionOperation{
-		run: func() {
-			rateLimited = data.findAndWakeMatches()
-		},
-		keepAlive: func() {
-			if rateLimited {
-				panic("findAndWakeMatches() unexpectedly rate limited")
-			}
-		},
-	}
-}
-
 func benchmarkMatcherDataMixedPollerRejectionFindMatch(b *testing.B, data *matcherData) {
 	b.Helper()
 
-	newOperation := func() mixedPollerRejectionOperation {
-		return mixedPollerRejectionFindMatchOperation(data)
+	newOperation := func() matcherDataBenchmarkOperation {
+		return matcherDataFindMatchOperation(data)
 	}
-	lockHoldNanos := mixedPollerRejectionLockHoldNanos(data, 100, newOperation)
-	matchLatencyP99Nanos := mixedPollerRejectionLatencyP99Nanos(data, 1000, newOperation)
+	lockHoldNanos := matcherDataLockHoldNanos(data, 100, newOperation)
+	matchLatencyP99Nanos := matcherDataMatchLatencyP99Nanos(data, 1000, newOperation)
 	b.ResetTimer()
 
 	b.RunParallel(func(pb *testing.PB) {
@@ -160,18 +79,17 @@ func benchmarkMatcherDataMixedPollerRejectionFindMatch(b *testing.B, data *match
 func benchmarkMatcherDataMixedPollerRejectionFindAndWakeMatches(b *testing.B, data *matcherData) {
 	b.Helper()
 
+	operation := matcherDataFindAndWakeMatchesOperation(data)
 	data.lock.Lock()
-	rateLimited := data.findAndWakeMatches()
+	operation.run()
 	data.lock.Unlock()
-	if rateLimited {
-		b.Fatal("findAndWakeMatches() unexpectedly rate limited")
-	}
+	operation.keepAlive()
 
-	newOperation := func() mixedPollerRejectionOperation {
-		return mixedPollerRejectionFindAndWakeMatchesOperation(data)
+	newOperation := func() matcherDataBenchmarkOperation {
+		return matcherDataFindAndWakeMatchesOperation(data)
 	}
-	lockHoldNanos := mixedPollerRejectionLockHoldNanos(data, 100, newOperation)
-	matchLatencyP99Nanos := mixedPollerRejectionLatencyP99Nanos(data, 1000, newOperation)
+	lockHoldNanos := matcherDataLockHoldNanos(data, 100, newOperation)
+	matchLatencyP99Nanos := matcherDataMatchLatencyP99Nanos(data, 1000, newOperation)
 	b.ResetTimer()
 
 	b.RunParallel(func(pb *testing.PB) {

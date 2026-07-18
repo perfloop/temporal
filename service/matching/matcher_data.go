@@ -440,10 +440,32 @@ func (d *matcherData) ReprocessTasks(pred func(*internalTask) bool) []*internalT
 // call with lock held
 // nolint:revive // will improve later
 func (d *matcherData) findMatch(allowForwarding bool) (*internalTask, *waitingPoller) {
-	allPollersQueryOnly := false
+	// TODO(pri): optimize so it's not O(d*n) worst case
+	// TODO(pri): this iterates over heap as slice, which isn't quite correct, but okay for now
+	const (
+		noUnmatchedNormalTask = iota
+		pollersNeedClassification
+		pollersNotAllQueryOnly
+		allPollersQueryOnly
+	)
+
+	// Defer classifying pollers until a second unmatched normal task can use it.
+	pollerState := noUnmatchedNormalTask
 	for _, task := range d.tasks.heap {
-		if allPollersQueryOnly && !task.isQuery() && !task.isPollForwarder() {
+		if pollerState == allPollersQueryOnly && !task.isQuery() && !task.isPollForwarder() {
 			continue
+		}
+		if pollerState == pollersNeedClassification && !task.isQuery() && !task.isPollForwarder() {
+			pollerState = allPollersQueryOnly
+			for _, poller := range d.pollers.heap {
+				if !poller.queryOnly {
+					pollerState = pollersNotAllQueryOnly
+					break
+				}
+			}
+			if pollerState == allPollersQueryOnly {
+				continue
+			}
 		}
 		// disallow normal poll forwarding when allowForwarding is false, but allow the
 		// "priority backlog poll forwarders".
@@ -474,14 +496,8 @@ func (d *matcherData) findMatch(allowForwarding bool) (*internalTask, *waitingPo
 
 			return task, poller
 		}
-		if !task.isQuery() && !task.isPollForwarder() {
-			allPollersQueryOnly = true
-			for _, poller := range d.pollers.heap {
-				if !poller.queryOnly {
-					allPollersQueryOnly = false
-					break
-				}
-			}
+		if pollerState == noUnmatchedNormalTask && !task.isQuery() && !task.isPollForwarder() {
+			pollerState = pollersNeedClassification
 		}
 	}
 	return nil, nil
