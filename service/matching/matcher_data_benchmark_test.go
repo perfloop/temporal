@@ -24,6 +24,7 @@ func matcherDataWithNoCompatibleQueryOnlyPollers(tasks, pollers int) *matcherDat
 
 func TestMatcherDataFindMatchQueryOnlyPollers(t *testing.T) {
 	data := matcherDataWithNoCompatibleQueryOnlyPollers(1, 2)
+	assertPollerPQQueryOnlyCount(t, &data.pollers)
 
 	if task, poller := data.findMatch(false); task != nil || poller != nil {
 		t.Fatalf("findMatch() = (%v, %v), want no match", task, poller)
@@ -37,11 +38,17 @@ func TestMatcherDataFindMatchQueryOnlyPollers(t *testing.T) {
 
 	data.tasks.Remove(queryTask)
 	data.pollers.Remove(data.pollers.heap[0])
+	assertPollerPQQueryOnlyCount(t, &data.pollers)
+
 	normalPoller := &waitingPoller{}
 	data.pollers.Add(normalPoller)
+	assertPollerPQQueryOnlyCount(t, &data.pollers)
 	if task, poller := data.findMatch(false); task == nil || task.isQuery() || poller != normalPoller {
 		t.Fatalf("findMatch() = (%v, %v), want normal task matched to normal poller", task, poller)
 	}
+
+	t.Run("counter divergence changes match decision", assertPollerPQCounterDivergenceChangesMatchDecision)
+	t.Run("counter mutation boundary", assertPollerPQMutationBoundary)
 }
 
 type matcherDataBenchmarkOperation struct {
