@@ -6,12 +6,12 @@ import (
 
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/server/api/historyservice/v1"
+	tokenspb "go.temporal.io/server/api/token/v1"
 	"go.temporal.io/server/common"
 	"go.temporal.io/server/common/definition"
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/namespace"
 	"go.temporal.io/server/common/primitives/timestamp"
-	"go.temporal.io/server/common/tasktoken"
 	"go.temporal.io/server/service/history/api"
 	"go.temporal.io/server/service/history/consts"
 	historyi "go.temporal.io/server/service/history/interfaces"
@@ -21,15 +21,12 @@ import (
 func Invoke(
 	ctx context.Context,
 	req *historyservice.RespondActivityTaskCompletedRequest,
+	token *tokenspb.Task,
 	shard historyi.ShardContext,
 	workflowConsistencyChecker api.WorkflowConsistencyChecker,
 ) (resp *historyservice.RespondActivityTaskCompletedResponse, retError error) {
-	tokenSerializer := tasktoken.NewSerializer()
 	request := req.CompleteRequest
-	token, err0 := tokenSerializer.Deserialize(request.TaskToken)
-	if err0 != nil {
-		return nil, consts.ErrDeserializingToken
-	}
+	var err0 error
 
 	namespaceEntry, err := api.GetActiveNamespace(shard, namespace.ID(req.GetNamespaceId()), token.WorkflowId)
 	if err != nil {

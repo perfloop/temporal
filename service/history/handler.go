@@ -436,7 +436,7 @@ func (h *Handler) RespondActivityTaskCompleted(ctx context.Context, request *his
 		return nil, h.convertError(err)
 	}
 
-	resp, err := engine.RespondActivityTaskCompleted(ctx, request)
+	resp, err := engine.RespondActivityTaskCompletedWithTaskToken(ctx, request, taskToken)
 	if err != nil {
 		return nil, h.convertError(err)
 	}

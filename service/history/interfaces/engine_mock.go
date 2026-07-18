@@ -19,6 +19,7 @@ import (
 	history0 "go.temporal.io/server/api/history/v1"
 	historyservice "go.temporal.io/server/api/historyservice/v1"
 	repication "go.temporal.io/server/api/replication/v1"
+	token "go.temporal.io/server/api/token/v1"
 	workflow "go.temporal.io/server/api/workflow/v1"
 	chasm "go.temporal.io/server/chasm"
 	collection "go.temporal.io/server/common/collection"
@@ -801,6 +802,21 @@ func (m *MockEngine) RespondActivityTaskCompleted(ctx context.Context, request *
 func (mr *MockEngineMockRecorder) RespondActivityTaskCompleted(ctx, request any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RespondActivityTaskCompleted", reflect.TypeOf((*MockEngine)(nil).RespondActivityTaskCompleted), ctx, request)
+}
+
+// RespondActivityTaskCompletedWithTaskToken mocks base method.
+func (m *MockEngine) RespondActivityTaskCompletedWithTaskToken(ctx context.Context, request *historyservice.RespondActivityTaskCompletedRequest, taskToken *token.Task) (*historyservice.RespondActivityTaskCompletedResponse, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "RespondActivityTaskCompletedWithTaskToken", ctx, request, taskToken)
+	ret0, _ := ret[0].(*historyservice.RespondActivityTaskCompletedResponse)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// RespondActivityTaskCompletedWithTaskToken indicates an expected call of RespondActivityTaskCompletedWithTaskToken.
+func (mr *MockEngineMockRecorder) RespondActivityTaskCompletedWithTaskToken(ctx, request, taskToken any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RespondActivityTaskCompletedWithTaskToken", reflect.TypeOf((*MockEngine)(nil).RespondActivityTaskCompletedWithTaskToken), ctx, request, taskToken)
 }
 
 // RespondActivityTaskFailed mocks base method.
