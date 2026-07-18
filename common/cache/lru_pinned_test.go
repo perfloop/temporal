@@ -136,10 +136,30 @@ func TestPinnedCacheEvictsAfterDeletingPinnedEntry(t *testing.T) {
 	require.NoError(t, err)
 	cache.Release("evictable")
 	cache.Delete("deleted")
+	require.Equal(t, 2, cache.Size())
 
 	_, err = cache.PutIfNotExist("new", &testEntryWithCacheSize{cacheSize: 3})
 	require.NoError(t, err)
 	require.Nil(t, cache.Get("evictable"))
+}
+
+func TestPinnedCacheScansAfterRefCountWrapBecomesEvictable(t *testing.T) {
+	cache := New(1, &Options{Pin: true})
+	old := &testEntryWithCacheSize{cacheSize: 1}
+	_, err := cache.PutIfNotExist("old", old)
+	require.NoError(t, err)
+
+	entry := cache.(*lru).byKey["old"].Value.(*entryImpl)
+	// A full signed ref-count wrap can leave the entry counted in pinnedSize
+	// before a later Get returns its ref count to zero.
+	entry.refCount = -1
+
+	require.Same(t, old, cache.Get("old"))
+	newEntry := &testEntryWithCacheSize{cacheSize: 1}
+	_, err = cache.PutIfNotExist("new", newEntry)
+	require.NoError(t, err)
+	require.Nil(t, cache.Get("old"))
+	require.Same(t, newEntry, cache.Get("new"))
 }
 
 func TestPinnedCacheScansAfterPinnedNegativeAggregateWrap(t *testing.T) {

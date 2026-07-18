@@ -435,11 +435,7 @@ func (c *lru) deleteInternal(element *list.Element) {
 		c.pinnedSize -= entry.Size()
 		metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
 	}
-	if c.pin {
-		c.updateCacheSize(emptyEntrySize, entry.Size())
-	} else {
-		c.currSize -= entry.Size()
-	}
+	c.currSize -= entry.Size()
 	metrics.CacheUsage.With(c.metricsHandler).Record(float64(c.currSize))
 	metrics.CacheEntryAgeOnEviction.With(c.metricsHandler).Record(c.timeSource.Now().UTC().Sub(entry.createTime))
 	delete(c.byKey, entry.key)
@@ -501,6 +497,10 @@ func (c *lru) updateEntryRefCount(entry *entryImpl) {
 		if entry.refCount == 1 {
 			c.pinnedSize += entry.Size()
 			metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
+		} else if entry.refCount == 0 {
+			// A wrapped ref count can make an entry evictable while it remains
+			// counted in pinnedSize, so preserve the original eviction scan.
+			c.pinnedSizeEqualityUnsafe = true
 		}
 	}
 }
