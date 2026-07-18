@@ -36,6 +36,7 @@ type (
 		maxSize         int
 		currSize        int
 		pinnedSize      int
+		pinnedEntries   int
 		onPut           func(val any)
 		onEvict         func(val any)
 		ttl             time.Duration
@@ -267,6 +268,7 @@ func (c *lru) Release(key any) {
 	entry := elt.Value.(*entryImpl)
 	entry.refCount--
 	if entry.refCount == 0 {
+		c.pinnedEntries--
 		c.pinnedSize -= entry.Size()
 		metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
 	}
@@ -379,6 +381,9 @@ func (c *lru) calculateNewCacheSize(newEntrySize int, existingEntrySize int) int
 
 func (c *lru) deleteInternal(element *list.Element) {
 	entry := c.byAccess.Remove(element).(*entryImpl)
+	if entry.refCount > 0 {
+		c.pinnedEntries--
+	}
 	c.currSize -= entry.Size()
 	metrics.CacheUsage.With(c.metricsHandler).Record(float64(c.currSize))
 	metrics.CacheEntryAgeOnEviction.With(c.metricsHandler).Record(c.timeSource.Now().UTC().Sub(entry.createTime))
@@ -397,6 +402,11 @@ func (c *lru) tryEvictUntilCacheSizeUnderLimit() {
 // tryEvictUntilEnoughSpaceWithSkipEntry try to evict entries until there is enough space for the new entry without
 // evicting the existing entry. the existing entry is skipped because it is being updated.
 func (c *lru) tryEvictUntilEnoughSpaceWithSkipEntry(newEntrySize int, existingEntry *entryImpl) {
+	// If every entry is pinned, eviction cannot make room.
+	if c.pin && c.pinnedEntries == c.byAccess.Len() {
+		return
+	}
+
 	element := c.byAccess.Back()
 	existingEntrySize := 0
 	if existingEntry != nil {
@@ -439,6 +449,7 @@ func (c *lru) updateEntryRefCount(entry *entryImpl) {
 	if c.pin {
 		entry.refCount++
 		if entry.refCount == 1 {
+			c.pinnedEntries++
 			c.pinnedSize += entry.Size()
 			metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
 		}

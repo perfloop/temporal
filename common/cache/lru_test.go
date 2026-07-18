@@ -252,6 +252,27 @@ func TestTTLWithPin(t *testing.T) {
 	assert.Equal(t, float64(0), snapshot[metrics.CacheUsage.Name()][3].Value)
 }
 
+func TestPinnedCacheEvictsReleasedEntryAfterDeletingPinnedEntry(t *testing.T) {
+	t.Parallel()
+
+	cache := New(2, &Options{Pin: true})
+	_, err := cache.PutIfNotExist("A", "A")
+	require.NoError(t, err)
+	_, err = cache.PutIfNotExist("B", "B")
+	require.NoError(t, err)
+
+	// Deleting A must remove it from the pinned-entry count. B is then
+	// evictable, so a size-two C can replace it.
+	cache.Delete("A")
+	cache.Release("B")
+	value := &testEntryWithCacheSize{cacheSize: 2}
+	_, err = cache.PutIfNotExist("C", value)
+	require.NoError(t, err)
+	require.Equal(t, 2, cache.Size())
+	require.Nil(t, cache.Get("B"))
+	require.Equal(t, value, cache.Get("C"))
+}
+
 func TestMaxSizeWithPin_MidItem(t *testing.T) {
 	t.Parallel()
 
