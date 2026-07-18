@@ -169,3 +169,83 @@ func TestPinnedCacheScansAfterRefCountWrapBecomesEvictable(t *testing.T) {
 	require.Same(t, newEntry, cache.Get("new"))
 	require.Equal(t, []any{old}, evicted)
 }
+
+func TestPinnedCacheScansAfterCurrentSizeSubtractionWrap(t *testing.T) {
+	maxInt := int(^uint(0) >> 1)
+	maxSize := maxInt - 1
+	cache := New(maxSize, &Options{Pin: true})
+	negative := &testEntryWithCacheSize{cacheSize: -2}
+	firstEvictable := &testEntryWithCacheSize{cacheSize: maxSize}
+	retained := &testEntryWithCacheSize{cacheSize: 2}
+
+	_, err := cache.PutIfNotExist("negative", negative)
+	require.NoError(t, err)
+	_, err = cache.PutIfNotExist("first-evictable", firstEvictable)
+	require.NoError(t, err)
+	cache.Release("first-evictable")
+	_, err = cache.PutIfNotExist("retained", retained)
+	require.NoError(t, err)
+
+	// currSize is MaxInt-1 while negative is still pinned. Refreshing it from
+	// -2 to 1 wraps the subtraction to MinInt, but the subsequent addition does
+	// not overflow. The released positive entries later total one integer word,
+	// so aggregate equality must preserve the original eviction scan.
+	require.Same(t, negative, cache.Get("negative"))
+	negative.cacheSize = 1
+	cache.Release("negative")
+	cache.Release("negative")
+	cache.Release("retained")
+	for _, entry := range []struct {
+		key   string
+		value *testEntryWithCacheSize
+	}{
+		{key: "large", value: &testEntryWithCacheSize{cacheSize: maxSize}},
+		{key: "tail", value: &testEntryWithCacheSize{cacheSize: 1}},
+	} {
+		_, err = cache.PutIfNotExist(entry.key, entry.value)
+		require.NoError(t, err)
+		cache.Release(entry.key)
+	}
+	_, err = cache.PutIfNotExist("pinned", &testEntryWithCacheSize{cacheSize: maxInt - 2})
+	require.NoError(t, err)
+
+	newEntry := &testEntryWithCacheSize{cacheSize: 2}
+	_, err = cache.PutIfNotExist("new", newEntry)
+	require.NoError(t, err)
+	require.Nil(t, cache.Get("first-evictable"))
+	require.Same(t, newEntry, cache.Get("new"))
+}
+
+func TestPinnedCacheScansAfterPinnedNegativeAggregateWrap(t *testing.T) {
+	maxInt := int(^uint(0) >> 1)
+	maxSize := maxInt - 1
+	cache := New(maxSize, &Options{Pin: true})
+	e1 := &testEntryWithCacheSize{cacheSize: maxSize}
+	newEntry := &testEntryWithCacheSize{cacheSize: 2}
+
+	// The negative pinned entries remain referenced, so they cannot be evicted.
+	// Their aggregate can nevertheless wrap independently of currSize while the
+	// released positive entries remain eligible for the original LRU scan.
+	for _, entry := range []struct {
+		key     string
+		value   *testEntryWithCacheSize
+		release bool
+	}{
+		{key: "p0", value: &testEntryWithCacheSize{cacheSize: -maxInt - 1}},
+		{key: "e1", value: e1, release: true},
+		{key: "p1", value: &testEntryWithCacheSize{cacheSize: -3}},
+		{key: "e2", value: &testEntryWithCacheSize{cacheSize: maxSize}, release: true},
+		{key: "e3", value: &testEntryWithCacheSize{cacheSize: 4}, release: true},
+	} {
+		_, err := cache.PutIfNotExist(entry.key, entry.value)
+		require.NoError(t, err)
+		if entry.release {
+			cache.Release(entry.key)
+		}
+	}
+
+	_, err := cache.PutIfNotExist("new", newEntry)
+	require.NoError(t, err)
+	require.Nil(t, cache.Get("e1"))
+	require.Same(t, newEntry, cache.Get("new"))
+}
