@@ -3,8 +3,6 @@ package matching
 import (
 	"fmt"
 	"runtime"
-	"slices"
-	"sync"
 	"testing"
 	"time"
 
@@ -33,49 +31,18 @@ func matcherDataWithQueryOnlyQueryAtEnd(tasks, pollers int, rejectQuery bool) *m
 	return data
 }
 
-func matcherDataFindMatchLockHoldNanos(data *matcherData, samples int) float64 {
-	var total time.Duration
-	for range samples {
-		data.lock.Lock()
-		start := time.Now()
-		task, poller := data.findMatch(false)
-		total += time.Since(start)
-		data.lock.Unlock()
-		runtime.KeepAlive(task)
-		runtime.KeepAlive(poller)
-	}
-	return float64(total) / float64(samples)
-}
-
-func matcherDataFindMatchLatencyP99Nanos(data *matcherData, samplesPerWorker int) float64 {
-	workers := runtime.GOMAXPROCS(0)
-	latencies := make([]time.Duration, workers*samplesPerWorker)
-	start := make(chan struct{})
-	var wg sync.WaitGroup
-
-	for worker := range workers {
-		wg.Add(1)
-		go func(worker int) {
-			defer wg.Done()
-			<-start
-			var task *internalTask
-			var poller *waitingPoller
-			for i := range samplesPerWorker {
-				started := time.Now()
-				data.lock.Lock()
-				task, poller = data.findMatch(false)
-				data.lock.Unlock()
-				latencies[worker*samplesPerWorker+i] = time.Since(started)
-			}
+func matcherDataFindMatchOperation(data *matcherData) matcherDataBenchmarkOperation {
+	var task *internalTask
+	var poller *waitingPoller
+	return matcherDataBenchmarkOperation{
+		run: func() {
+			task, poller = data.findMatch(false)
+		},
+		keepAlive: func() {
 			runtime.KeepAlive(task)
 			runtime.KeepAlive(poller)
-		}(worker)
+		},
 	}
-	close(start)
-	wg.Wait()
-
-	slices.Sort(latencies)
-	return float64(latencies[(len(latencies)*99+99)/100-1])
 }
 
 func benchmarkMatcherDataFindMatch(b *testing.B, data *matcherData, wantMatch bool) {
@@ -88,8 +55,11 @@ func benchmarkMatcherDataFindMatch(b *testing.B, data *matcherData, wantMatch bo
 		b.Fatalf("findMatch() = (%v, %v), want match=%t", task, poller, wantMatch)
 	}
 
-	lockHoldNanos := matcherDataFindMatchLockHoldNanos(data, 100)
-	matchLatencyP99Nanos := matcherDataFindMatchLatencyP99Nanos(data, 1000)
+	newOperation := func() matcherDataBenchmarkOperation {
+		return matcherDataFindMatchOperation(data)
+	}
+	lockHoldNanos := matcherDataLockHoldNanos(data, 100, newOperation)
+	matchLatencyP99Nanos := matcherDataMatchLatencyP99Nanos(data, 1000, newOperation)
 	b.ReportAllocs()
 	b.ResetTimer()
 
@@ -138,49 +108,21 @@ func matcherDataMixedPollerLifecycle(data *matcherData, task *internalTask, norm
 	return matchedTask, matchedPoller
 }
 
-func matcherDataMixedPollerLifecycleLockHoldNanos(data *matcherData, samples int) float64 {
+func matcherDataMixedPollerLifecycleOperation(data *matcherData) matcherDataBenchmarkOperation {
 	task := &internalTask{}
 	normalPoller := &waitingPoller{startTime: time.Unix(0, 0)}
 	queryOnlyPoller := &waitingPoller{queryOnly: true, startTime: time.Unix(1, 0)}
-	var total time.Duration
-	for range samples {
-		data.lock.Lock()
-		start := time.Now()
-		matcherDataMixedPollerLifecycle(data, task, normalPoller, queryOnlyPoller)
-		total += time.Since(start)
-		data.lock.Unlock()
+	var matchedTask *internalTask
+	var matchedPoller *waitingPoller
+	return matcherDataBenchmarkOperation{
+		run: func() {
+			matchedTask, matchedPoller = matcherDataMixedPollerLifecycle(data, task, normalPoller, queryOnlyPoller)
+		},
+		keepAlive: func() {
+			runtime.KeepAlive(matchedTask)
+			runtime.KeepAlive(matchedPoller)
+		},
 	}
-	return float64(total) / float64(samples)
-}
-
-func matcherDataMixedPollerLifecycleLatencyP99Nanos(data *matcherData, samplesPerWorker int) float64 {
-	workers := runtime.GOMAXPROCS(0)
-	latencies := make([]time.Duration, workers*samplesPerWorker)
-	start := make(chan struct{})
-	var wg sync.WaitGroup
-
-	for worker := range workers {
-		wg.Add(1)
-		go func(worker int) {
-			defer wg.Done()
-			task := &internalTask{}
-			normalPoller := &waitingPoller{startTime: time.Unix(0, 0)}
-			queryOnlyPoller := &waitingPoller{queryOnly: true, startTime: time.Unix(1, 0)}
-			<-start
-			for i := range samplesPerWorker {
-				started := time.Now()
-				data.lock.Lock()
-				matcherDataMixedPollerLifecycle(data, task, normalPoller, queryOnlyPoller)
-				data.lock.Unlock()
-				latencies[worker*samplesPerWorker+i] = time.Since(started)
-			}
-		}(worker)
-	}
-	close(start)
-	wg.Wait()
-
-	slices.Sort(latencies)
-	return float64(latencies[(len(latencies)*99+99)/100-1])
 }
 
 func BenchmarkMatcherDataMixedPollerLifecycle(b *testing.B) {
@@ -197,8 +139,11 @@ func BenchmarkMatcherDataMixedPollerLifecycle(b *testing.B) {
 		b.Fatal("normal poller should match the normal task")
 	}
 
-	lockHoldNanos := matcherDataMixedPollerLifecycleLockHoldNanos(data, 100)
-	matchLatencyP99Nanos := matcherDataMixedPollerLifecycleLatencyP99Nanos(data, 1000)
+	newOperation := func() matcherDataBenchmarkOperation {
+		return matcherDataMixedPollerLifecycleOperation(data)
+	}
+	lockHoldNanos := matcherDataLockHoldNanos(data, 100, newOperation)
+	matchLatencyP99Nanos := matcherDataMatchLatencyP99Nanos(data, 1000, newOperation)
 	b.ReportAllocs()
 	b.ResetTimer()
 

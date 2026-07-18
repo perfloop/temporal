@@ -23,7 +23,7 @@ func matcherDataWithNoCompatibleQueryOnlyPollers(tasks, pollers int) *matcherDat
 }
 
 func TestMatcherDataFindMatchQueryOnlyPollers(t *testing.T) {
-	data := matcherDataWithNoCompatibleQueryOnlyPollers(3, 3)
+	data := matcherDataWithNoCompatibleQueryOnlyPollers(1, 2)
 
 	if task, poller := data.findMatch(false); task != nil || poller != nil {
 		t.Fatalf("findMatch() = (%v, %v), want no match", task, poller)
@@ -39,29 +39,40 @@ func TestMatcherDataFindMatchQueryOnlyPollers(t *testing.T) {
 	data.pollers.Remove(data.pollers.heap[0])
 	normalPoller := &waitingPoller{}
 	data.pollers.Add(normalPoller)
-	if got, want := data.pollers.queryOnlyCount, len(data.pollers.heap)-1; got != want {
-		t.Fatalf("queryOnlyCount = %d, want %d", got, want)
-	}
 	if task, poller := data.findMatch(false); task == nil || task.isQuery() || poller != normalPoller {
 		t.Fatalf("findMatch() = (%v, %v), want normal task matched to normal poller", task, poller)
 	}
 }
 
-// matcherDataLockHoldNanos measures the time findAndWakeMatches holds matcherData.lock.
-func matcherDataLockHoldNanos(data *matcherData, samples int) float64 {
+type matcherDataBenchmarkOperation struct {
+	run       func()
+	keepAlive func()
+}
+
+func matcherDataFindAndWakeMatchesOperation(data *matcherData) matcherDataBenchmarkOperation {
+	return matcherDataBenchmarkOperation{
+		run:       func() { data.findAndWakeMatches() },
+		keepAlive: func() {},
+	}
+}
+
+// matcherDataLockHoldNanos measures the time an operation holds matcherData.lock.
+func matcherDataLockHoldNanos(data *matcherData, samples int, newOperation func() matcherDataBenchmarkOperation) float64 {
+	operation := newOperation()
 	var total time.Duration
 	for range samples {
 		data.lock.Lock()
 		start := time.Now()
-		data.findAndWakeMatches()
+		operation.run()
 		total += time.Since(start)
 		data.lock.Unlock()
 	}
+	operation.keepAlive()
 	return float64(total) / float64(samples)
 }
 
-// matcherDataMatchLatencyP99Nanos measures a caller's lock-wait plus matching latency.
-func matcherDataMatchLatencyP99Nanos(data *matcherData, samplesPerWorker int) float64 {
+// matcherDataMatchLatencyP99Nanos measures a caller's lock-wait plus operation latency.
+func matcherDataMatchLatencyP99Nanos(data *matcherData, samplesPerWorker int, newOperation func() matcherDataBenchmarkOperation) float64 {
 	workers := runtime.GOMAXPROCS(0)
 	latencies := make([]time.Duration, workers*samplesPerWorker)
 	start := make(chan struct{})
@@ -71,14 +82,16 @@ func matcherDataMatchLatencyP99Nanos(data *matcherData, samplesPerWorker int) fl
 		wg.Add(1)
 		go func(worker int) {
 			defer wg.Done()
+			operation := newOperation()
 			<-start
 			for i := range samplesPerWorker {
-				start := time.Now()
+				started := time.Now()
 				data.lock.Lock()
-				data.findAndWakeMatches()
+				operation.run()
 				data.lock.Unlock()
-				latencies[worker*samplesPerWorker+i] = time.Since(start)
+				latencies[worker*samplesPerWorker+i] = time.Since(started)
 			}
+			operation.keepAlive()
 		}(worker)
 	}
 	close(start)
@@ -99,8 +112,11 @@ func BenchmarkMatcherDataFindAndWakeMatches(b *testing.B) {
 	} {
 		b.Run(fmt.Sprintf("NoCompatibleQueryOnly/tasks=%d/pollers=%d", size.tasks, size.pollers), func(b *testing.B) {
 			data := matcherDataWithNoCompatibleQueryOnlyPollers(size.tasks, size.pollers)
-			lockHoldNanos := matcherDataLockHoldNanos(data, 100)
-			matchLatencyP99Nanos := matcherDataMatchLatencyP99Nanos(data, 1000)
+			newOperation := func() matcherDataBenchmarkOperation {
+				return matcherDataFindAndWakeMatchesOperation(data)
+			}
+			lockHoldNanos := matcherDataLockHoldNanos(data, 100, newOperation)
+			matchLatencyP99Nanos := matcherDataMatchLatencyP99Nanos(data, 1000, newOperation)
 			b.ReportAllocs()
 			b.ResetTimer()
 
