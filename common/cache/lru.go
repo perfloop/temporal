@@ -271,16 +271,19 @@ func (c *lru) Release(key any) {
 	if entry.refCount == 0 {
 		c.pinnedSize -= entrySize
 		metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
+		if entrySize <= 0 {
+			// An evictable non-positive entry makes the original scan observable.
+			c.pinnedSizeEqualityUnsafe = true
+		}
 	}
 	// Entry size might have changed. Recalculate size and evict entries if necessary.
 	newEntrySize := getSize(entry.value)
-	if newEntrySize <= 0 && (entry.refCount <= 0 || newEntrySize < 0) {
-		// A negative pinned entry can make pinnedSize wrap independently of currSize.
-		// A non-positive unpinned entry can be evictable now or after a later Get.
-		// Either case prevents aggregate equality from proving every entry is pinned.
-		c.pinnedSizeEqualityUnsafe = true
-	}
 	if newEntrySize != entrySize {
+		if newEntrySize < 0 || (newEntrySize == 0 && entry.refCount <= 0) {
+			// A negative pinned entry can wrap its aggregate independently. A
+			// non-positive evictable entry makes the original scan observable.
+			c.pinnedSizeEqualityUnsafe = true
+		}
 		if entry.refCount > 0 {
 			c.pinnedSize = c.pinnedSize - entrySize + newEntrySize
 			metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
@@ -411,9 +414,9 @@ func (c *lru) calculateNewCacheSize(newEntrySize int, existingEntrySize int) int
 }
 
 func (c *lru) updateCacheSize(newEntrySize int, existingEntrySize int) {
-	cacheSize, subtractionOverflowed := subtractInt(c.currSize, existingEntrySize)
+	cacheSize := c.currSize - existingEntrySize
 	cacheSize, additionOverflowed := addInt(cacheSize, newEntrySize)
-	if subtractionOverflowed || additionOverflowed {
+	if additionOverflowed {
 		// Wrapped aggregate values cannot prove that every entry is pinned. Keep the
 		// all-pinned shortcut disabled instead of trying to recover exact accounting.
 		c.pinnedSizeEqualityUnsafe = true
@@ -424,11 +427,6 @@ func (c *lru) updateCacheSize(newEntrySize int, existingEntrySize int) {
 func addInt(a int, b int) (int, bool) {
 	sum := a + b
 	return sum, (b > 0 && sum < a) || (b < 0 && sum > a)
-}
-
-func subtractInt(a int, b int) (int, bool) {
-	difference := a - b
-	return difference, (b > 0 && difference > a) || (b < 0 && difference < a)
 }
 
 func (c *lru) deleteInternal(element *list.Element) {
@@ -500,16 +498,9 @@ func (c *lru) updateEntryTTL(entry *entryImpl) {
 func (c *lru) updateEntryRefCount(entry *entryImpl) {
 	if c.pin {
 		entry.refCount++
-		if entry.refCount <= 1 {
-			if entry.refCount == 1 {
-				c.pinnedSize += entry.Size()
-				metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
-			} else {
-				// A wrapped or unbalanced count can reach zero without removing this
-				// entry from pinnedSize. Preserve the original eviction scan instead
-				// of treating aggregate equality as proof that every entry is pinned.
-				c.pinnedSizeEqualityUnsafe = true
-			}
+		if entry.refCount == 1 {
+			c.pinnedSize += entry.Size()
+			metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
 		}
 	}
 }
