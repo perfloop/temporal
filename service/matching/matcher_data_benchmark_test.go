@@ -127,7 +127,6 @@ func BenchmarkMatcherDataFindAndWakeMatches(b *testing.B) {
 			}
 			lockHoldNanos := matcherDataLockHoldNanos(data, 100, newOperation)
 			matchLatencyP99Nanos := matcherDataMatchLatencyP99Nanos(data, 1000, newOperation)
-			b.ReportAllocs()
 			b.ResetTimer()
 
 			b.RunParallel(func(pb *testing.PB) {
