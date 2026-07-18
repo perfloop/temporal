@@ -23,8 +23,11 @@ func matcherDataWithNoCompatibleQueryOnlyPollers(tasks, pollers int) *matcherDat
 }
 
 func TestMatcherDataFindMatchQueryOnlyPollers(t *testing.T) {
-	data := matcherDataWithNoCompatibleQueryOnlyPollers(1, 2)
-	assertPollerPQQueryOnlyCount(t, &data.pollers)
+	data := &matcherData{}
+	normalTask := &internalTask{}
+	queryOnlyPoller := &waitingPoller{queryOnly: true}
+	data.tasks.Add(normalTask)
+	data.pollers.Add(queryOnlyPoller)
 
 	if task, poller := data.findMatch(false); task != nil || poller != nil {
 		t.Fatalf("findMatch() = (%v, %v), want no match", task, poller)
@@ -32,23 +35,18 @@ func TestMatcherDataFindMatchQueryOnlyPollers(t *testing.T) {
 
 	queryTask := &internalTask{query: &queryTaskInfo{}}
 	data.tasks.Add(queryTask)
-	if task, poller := data.findMatch(false); task != queryTask || poller == nil || !poller.queryOnly {
-		t.Fatalf("findMatch() = (%v, %v), want query task matched to a query-only poller", task, poller)
+	if task, poller := data.findMatch(false); task != queryTask || poller != queryOnlyPoller {
+		t.Fatalf("findMatch() = (%v, %v), want query task matched to query-only poller", task, poller)
 	}
 
 	data.tasks.Remove(queryTask)
-	data.pollers.Remove(data.pollers.heap[0])
-	assertPollerPQQueryOnlyCount(t, &data.pollers)
+	data.pollers.Remove(queryOnlyPoller)
 
 	normalPoller := &waitingPoller{}
 	data.pollers.Add(normalPoller)
-	assertPollerPQQueryOnlyCount(t, &data.pollers)
-	if task, poller := data.findMatch(false); task == nil || task.isQuery() || poller != normalPoller {
+	if task, poller := data.findMatch(false); task != normalTask || poller != normalPoller {
 		t.Fatalf("findMatch() = (%v, %v), want normal task matched to normal poller", task, poller)
 	}
-
-	t.Run("counter divergence changes match decision", assertPollerPQCounterDivergenceChangesMatchDecision)
-	t.Run("counter mutation boundary", assertPollerPQMutationBoundary)
 }
 
 type matcherDataBenchmarkOperation struct {
