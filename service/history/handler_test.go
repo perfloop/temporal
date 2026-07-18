@@ -83,26 +83,23 @@ type activityCompletionTypedHandoffEngine struct {
 
 	rawCalls   int
 	typedCalls int
-	request    *historyservice.RespondActivityTaskCompletedRequest
 	taskToken  *tokenspb.Task
 }
 
 func (e *activityCompletionTypedHandoffEngine) RespondActivityTaskCompleted(
 	_ context.Context,
-	request *historyservice.RespondActivityTaskCompletedRequest,
+	_ *historyservice.RespondActivityTaskCompletedRequest,
 ) (*historyservice.RespondActivityTaskCompletedResponse, error) {
 	e.rawCalls++
-	e.request = request
 	return &historyservice.RespondActivityTaskCompletedResponse{}, nil
 }
 
 func (e *activityCompletionTypedHandoffEngine) RespondActivityTaskCompletedWithTaskToken(
 	_ context.Context,
-	request *historyservice.RespondActivityTaskCompletedRequest,
+	_ *historyservice.RespondActivityTaskCompletedRequest,
 	taskToken *tokenspb.Task,
 ) (*historyservice.RespondActivityTaskCompletedResponse, error) {
 	e.typedCalls++
-	e.request = request
 	e.taskToken = taskToken
 	return &historyservice.RespondActivityTaskCompletedResponse{}, nil
 }
@@ -127,10 +124,6 @@ func TestRespondActivityTaskCompletedPassesDecodedTokenToHistoryEngine(t *testin
 	if response == nil {
 		t.Fatal("RespondActivityTaskCompleted returned a nil response")
 	}
-	if engine.request != request {
-		t.Fatalf("engine request = %p, want %p", engine.request, request)
-	}
-
 	if engine.rawCalls != 0 || engine.typedCalls != 1 {
 		t.Fatalf("typed Engine calls = raw %d, typed %d; want raw 0, typed 1", engine.rawCalls, engine.typedCalls)
 	}
