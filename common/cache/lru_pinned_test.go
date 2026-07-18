@@ -234,3 +234,33 @@ func TestPinnedCacheEvictsAfterDeletingPinnedEntry(t *testing.T) {
 	require.NoError(t, err)
 	require.Nil(t, cache.Get("evictable"))
 }
+
+func TestPinnedCacheScansAfterRefCountWrapBecomesEvictable(t *testing.T) {
+	var evicted []any
+	cache := New(1, &Options{
+		Pin: true,
+		OnEvict: func(value any) {
+			evicted = append(evicted, value)
+		},
+	})
+	old := &testEntryWithCacheSize{cacheSize: 1}
+	_, err := cache.PutIfNotExist("old", old)
+	require.NoError(t, err)
+
+	lru := cache.(*lru)
+	entry := lru.byKey["old"].Value.(*entryImpl)
+	// Reaching this state through Get calls would require a full signed-int
+	// ref-count wrap. Set the reachable post-wrap boundary directly: old remains
+	// counted in pinnedSize, but the next Get makes it evictable at refCount zero.
+	entry.refCount = -1
+	require.Equal(t, 1, lru.currSize)
+	require.Equal(t, 1, lru.pinnedSize)
+
+	require.Same(t, old, cache.Get("old"))
+	newEntry := &testEntryWithCacheSize{cacheSize: 1}
+	_, err = cache.PutIfNotExist("new", newEntry)
+	require.NoError(t, err)
+	require.Nil(t, cache.Get("old"))
+	require.Same(t, newEntry, cache.Get("new"))
+	require.Equal(t, []any{old}, evicted)
+}

@@ -268,9 +268,16 @@ func (c *lru) Release(key any) {
 	entry := elt.Value.(*entryImpl)
 	entrySize := entry.Size()
 	entry.refCount--
-	if entry.refCount == 0 {
-		c.updatePinnedSize(emptyEntrySize, entrySize)
-		metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
+	if entry.refCount <= 0 {
+		if entry.refCount == 0 {
+			c.updatePinnedSize(emptyEntrySize, entrySize)
+			metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
+		} else {
+			// A negative count can be reached by an unbalanced Release or signed
+			// overflow. Aggregate equality can no longer prove that an entry will
+			// not later become evictable at refCount zero.
+			c.pinnedSizeEqualityUnsafe = true
+		}
 	}
 	// Entry size might have changed. Recalculate size and evict entries if necessary.
 	newEntrySize := getSize(entry.value)
@@ -283,8 +290,10 @@ func (c *lru) Release(key any) {
 		// Its size cannot be ruled out by the aggregate equality.
 		c.pinnedSizeEqualityUnsafe = true
 	}
-	c.updateCacheSize(newEntrySize, entrySize)
-	entry.size = newEntrySize
+	if newEntrySize != entrySize {
+		c.updateCacheSize(newEntrySize, entrySize)
+		entry.size = newEntrySize
+	}
 	if c.currSize > c.maxSize {
 		c.tryEvictUntilCacheSizeUnderLimit()
 	}
@@ -500,9 +509,16 @@ func (c *lru) updateEntryTTL(entry *entryImpl) {
 func (c *lru) updateEntryRefCount(entry *entryImpl) {
 	if c.pin {
 		entry.refCount++
-		if entry.refCount == 1 {
-			c.updatePinnedSize(entry.Size(), emptyEntrySize)
-			metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
+		if entry.refCount <= 1 {
+			if entry.refCount == 1 {
+				c.updatePinnedSize(entry.Size(), emptyEntrySize)
+				metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
+			} else {
+				// A wrapped or unbalanced count can reach zero without removing this
+				// entry from pinnedSize. Preserve the original eviction scan instead
+				// of treating aggregate equality as proof that every entry is pinned.
+				c.pinnedSizeEqualityUnsafe = true
+			}
 		}
 	}
 }
