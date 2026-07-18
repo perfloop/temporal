@@ -261,11 +261,15 @@ func TestPinnedCacheEvictsReleasedEntryAfterDeletingPinnedEntry(t *testing.T) {
 	_, err = cache.PutIfNotExist("B", "B")
 	require.NoError(t, err)
 
-	// Deleting A must remove it from the pinned-entry count. B is then
-	// evictable, so a size-two C can replace it.
+	// Deleting A must remove it from the pinned-entry count. B remains pinned,
+	// so a size-two C cannot fit until B is released.
 	cache.Delete("A")
-	cache.Release("B")
 	value := &testEntryWithCacheSize{cacheSize: 2}
+	_, err = cache.PutIfNotExist("C", value)
+	require.Equal(t, ErrCacheFull, err)
+
+	// Once B is released it is evictable, so C can replace it.
+	cache.Release("B")
 	_, err = cache.PutIfNotExist("C", value)
 	require.NoError(t, err)
 	require.Equal(t, 2, cache.Size())
