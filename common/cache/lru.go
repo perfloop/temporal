@@ -268,16 +268,9 @@ func (c *lru) Release(key any) {
 	entry := elt.Value.(*entryImpl)
 	entrySize := entry.Size()
 	entry.refCount--
-	if entry.refCount <= 0 {
-		if entry.refCount == 0 {
-			c.updatePinnedSize(emptyEntrySize, entrySize)
-			metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
-		} else {
-			// A negative count can be reached by an unbalanced Release or signed
-			// overflow. Aggregate equality can no longer prove that an entry will
-			// not later become evictable at refCount zero.
-			c.pinnedSizeEqualityUnsafe = true
-		}
+	if entry.refCount == 0 {
+		c.updatePinnedSize(emptyEntrySize, entrySize)
+		metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
 	}
 	// Entry size might have changed. Recalculate size and evict entries if necessary.
 	newEntrySize := getSize(entry.value)
