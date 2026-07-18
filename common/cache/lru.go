@@ -36,7 +36,7 @@ type (
 		maxSize                 int
 		currSize                int
 		pinnedSize              int
-		mayContainZeroSizeEntry bool
+		hasSeenNonPositiveEntry bool
 		onPut                   func(val any)
 		onEvict                 func(val any)
 		ttl                     time.Duration
@@ -278,10 +278,10 @@ func (c *lru) Release(key any) {
 		c.pinnedSize += newEntrySize - entrySize
 		metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
 	}
-	if newEntrySize == 0 {
-		// A zero-size evictable entry cannot be detected from pinnedSize alone.
+	if newEntrySize <= 0 {
+		// A non-positive-size evictable entry cannot be detected from pinnedSize alone.
 		// Keep the fast rejection conservative after observing one.
-		c.mayContainZeroSizeEntry = true
+		c.hasSeenNonPositiveEntry = true
 	}
 	c.currSize = c.calculateNewCacheSize(newEntrySize, entrySize)
 	entry.size = newEntrySize
@@ -362,7 +362,7 @@ func (c *lru) putInternal(key any, value any, allowUpdate bool) (any, error) {
 	if newCacheSize > c.maxSize {
 		// If all positive-size cache usage is pinned, no evictable entry can make room.
 		// Avoid scanning every pinned entry before returning the same cache-full error.
-		if c.pin && !c.mayContainZeroSizeEntry && c.pinnedSize == c.currSize {
+		if c.pin && !c.hasSeenNonPositiveEntry && c.pinnedSize == c.currSize {
 			return nil, ErrCacheFull
 		}
 
@@ -379,13 +379,9 @@ func (c *lru) putInternal(key any, value any, allowUpdate bool) (any, error) {
 		size:  newEntrySize,
 	}
 	c.updateEntryTTL(entry)
-	if c.pin {
-		entry.refCount = 1
-		c.pinnedSize += entry.Size()
-		metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
-		if newEntrySize == 0 {
-			c.mayContainZeroSizeEntry = true
-		}
+	c.updateEntryRefCount(entry)
+	if c.pin && newEntrySize <= 0 {
+		c.hasSeenNonPositiveEntry = true
 	}
 	element := c.byAccess.PushFront(entry)
 	c.byKey[key] = element

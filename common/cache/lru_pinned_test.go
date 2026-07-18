@@ -104,6 +104,38 @@ func TestPinnedCacheEvictsEntryThatBecomesZeroSizeOnRelease(t *testing.T) {
 	require.Nil(t, cache.Get("resized"))
 }
 
+func TestPinnedCacheEvictsPositiveEntryWithNegativeSizeEntry(t *testing.T) {
+	var evicted []any
+	cache := New(2, &Options{
+		Pin: true,
+		OnEvict: func(value any) {
+			evicted = append(evicted, value)
+		},
+	})
+	pinned := &testEntryWithCacheSize{cacheSize: 1}
+	evictable := &testEntryWithCacheSize{cacheSize: 1}
+	negativeSize := &testEntryWithCacheSize{cacheSize: -1}
+	newEntry := &testEntryWithCacheSize{cacheSize: 2}
+
+	_, err := cache.PutIfNotExist("pinned", pinned)
+	require.NoError(t, err)
+	_, err = cache.PutIfNotExist("evictable", evictable)
+	require.NoError(t, err)
+	cache.Release("evictable")
+	_, err = cache.PutIfNotExist("negative-size", negativeSize)
+	require.NoError(t, err)
+	cache.Release("negative-size")
+
+	// Signed CacheSize values are accepted by the public API. The negative
+	// evictable entry cancels the positive one in aggregate usage, but the
+	// existing LRU scan must still evict the positive entry to admit newEntry.
+	_, err = cache.PutIfNotExist("new", newEntry)
+	require.NoError(t, err)
+	require.Nil(t, cache.Get("evictable"))
+	require.Same(t, newEntry, cache.Get("new"))
+	require.Equal(t, []any{evictable}, evicted)
+}
+
 func TestPinnedCacheEvictsAfterPinnedEntryShrinks(t *testing.T) {
 	cache := New(8, &Options{Pin: true})
 	resized := &testEntryWithCacheSize{cacheSize: 6}
