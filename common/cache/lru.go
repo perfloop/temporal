@@ -278,7 +278,7 @@ func (c *lru) Release(key any) {
 		c.pinnedSize += newEntrySize - entrySize
 		metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
 	}
-	if newEntrySize <= 0 {
+	if entry.refCount == 0 && newEntrySize <= 0 {
 		// A non-positive-size evictable entry cannot be detected from pinnedSize alone.
 		// Keep the fast rejection conservative after observing one.
 		c.hasSeenNonPositiveEntry = true
@@ -380,9 +380,6 @@ func (c *lru) putInternal(key any, value any, allowUpdate bool) (any, error) {
 	}
 	c.updateEntryTTL(entry)
 	c.updateEntryRefCount(entry)
-	if c.pin && newEntrySize <= 0 {
-		c.hasSeenNonPositiveEntry = true
-	}
 	element := c.byAccess.PushFront(entry)
 	c.byKey[key] = element
 	c.currSize = newCacheSize
