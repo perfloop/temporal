@@ -70,3 +70,69 @@ func TestPinnedCacheReleaseUnderflowCanBecomeEvictable(t *testing.T) {
 	require.Nil(t, cache.Get("A"))
 	require.Equal(t, "B", cache.Get("B"))
 }
+
+func TestPinnedCacheEvictsZeroSizeEntryBeforeReturningFull(t *testing.T) {
+	cache := New(1, &Options{Pin: true})
+	pinned := &testEntryWithCacheSize{cacheSize: 1}
+	zeroSize := &testEntryWithCacheSize{}
+
+	_, err := cache.PutIfNotExist("pinned", pinned)
+	require.NoError(t, err)
+	_, err = cache.PutIfNotExist("zero-size", zeroSize)
+	require.NoError(t, err)
+	cache.Release("zero-size")
+
+	_, err = cache.PutIfNotExist("new", &testEntryWithCacheSize{cacheSize: 1})
+	require.ErrorIs(t, err, ErrCacheFull)
+	require.Nil(t, cache.Get("zero-size"))
+	require.Same(t, pinned, cache.Get("pinned"))
+}
+
+func TestPinnedCacheEvictsEntryThatBecomesZeroSizeOnRelease(t *testing.T) {
+	cache := New(1, &Options{Pin: true})
+	resized := &testEntryWithCacheSize{cacheSize: 1}
+
+	_, err := cache.PutIfNotExist("resized", resized)
+	require.NoError(t, err)
+	resized.cacheSize = 0
+	cache.Release("resized")
+
+	_, err = cache.PutIfNotExist("pinned", &testEntryWithCacheSize{cacheSize: 1})
+	require.NoError(t, err)
+	_, err = cache.PutIfNotExist("new", &testEntryWithCacheSize{cacheSize: 1})
+	require.ErrorIs(t, err, ErrCacheFull)
+	require.Nil(t, cache.Get("resized"))
+}
+
+func TestPinnedCacheEvictsAfterPinnedEntryShrinks(t *testing.T) {
+	cache := New(8, &Options{Pin: true})
+	resized := &testEntryWithCacheSize{cacheSize: 6}
+
+	_, err := cache.PutIfNotExist("resized", resized)
+	require.NoError(t, err)
+	_, err = cache.PutIfNotExist("evictable", &testEntryWithCacheSize{cacheSize: 2})
+	require.NoError(t, err)
+	cache.Release("evictable")
+	require.Same(t, resized, cache.Get("resized"))
+
+	resized.cacheSize = 4
+	cache.Release("resized")
+	_, err = cache.PutIfNotExist("new", &testEntryWithCacheSize{cacheSize: 3})
+	require.NoError(t, err)
+	require.Nil(t, cache.Get("evictable"))
+}
+
+func TestPinnedCacheEvictsAfterDeletingPinnedEntry(t *testing.T) {
+	cache := New(4, &Options{Pin: true})
+
+	_, err := cache.PutIfNotExist("deleted", &testEntryWithCacheSize{cacheSize: 2})
+	require.NoError(t, err)
+	_, err = cache.PutIfNotExist("evictable", &testEntryWithCacheSize{cacheSize: 2})
+	require.NoError(t, err)
+	cache.Release("evictable")
+	cache.Delete("deleted")
+
+	_, err = cache.PutIfNotExist("new", &testEntryWithCacheSize{cacheSize: 3})
+	require.NoError(t, err)
+	require.Nil(t, cache.Get("evictable"))
+}

@@ -30,21 +30,21 @@ const emptyEntrySize = 0
 // lru is a concurrent fixed size cache that evicts elements in lru order
 type (
 	lru struct {
-		mut                 sync.Mutex
-		byAccess            *list.List
-		byKey               map[any]*list.Element
-		maxSize             int
-		currSize            int
-		pinnedSize          int
-		evictableEntryCount int
-		onPut               func(val any)
-		onEvict             func(val any)
-		ttl                 time.Duration
-		pin                 bool
-		timeSource          clock.TimeSource
-		metricsHandler      metrics.Handler
-		backgroundEvict     dynamicconfig.TypedPropertyFn[dynamicconfig.CacheBackgroundEvictSettings]
-		loops               goro.Group
+		mut                     sync.Mutex
+		byAccess                *list.List
+		byKey                   map[any]*list.Element
+		maxSize                 int
+		currSize                int
+		pinnedSize              int
+		mayContainZeroSizeEntry bool
+		onPut                   func(val any)
+		onEvict                 func(val any)
+		ttl                     time.Duration
+		pin                     bool
+		timeSource              clock.TimeSource
+		metricsHandler          metrics.Handler
+		backgroundEvict         dynamicconfig.TypedPropertyFn[dynamicconfig.CacheBackgroundEvictSettings]
+		loops                   goro.Group
 	}
 
 	iteratorImpl struct {
@@ -266,18 +266,24 @@ func (c *lru) Release(key any) {
 		return
 	}
 	entry := elt.Value.(*entryImpl)
+	entrySize := entry.Size()
 	entry.refCount--
-	switch entry.refCount {
-	case 0:
-		c.pinnedSize -= entry.Size()
+	if entry.refCount == 0 {
+		c.pinnedSize -= entrySize
 		metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
-		c.evictableEntryCount++
-	case -1:
-		c.evictableEntryCount--
 	}
 	// Entry size might have changed. Recalculate size and evict entries if necessary.
 	newEntrySize := getSize(entry.value)
-	c.currSize = c.calculateNewCacheSize(newEntrySize, entry.Size())
+	if entry.refCount > 0 && newEntrySize != entrySize {
+		c.pinnedSize += newEntrySize - entrySize
+		metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
+	}
+	if newEntrySize == 0 {
+		// A zero-size evictable entry cannot be detected from pinnedSize alone.
+		// Keep the fast rejection conservative after observing one.
+		c.mayContainZeroSizeEntry = true
+	}
+	c.currSize = c.calculateNewCacheSize(newEntrySize, entrySize)
 	entry.size = newEntrySize
 	if c.currSize > c.maxSize {
 		c.tryEvictUntilCacheSizeUnderLimit()
@@ -354,9 +360,9 @@ func (c *lru) putInternal(key any, value any, allowUpdate bool) (any, error) {
 	// Check whether the new entry can fit in the cache before searching for an eviction candidate.
 	newCacheSize := c.calculateNewCacheSize(newEntrySize, emptyEntrySize)
 	if newCacheSize > c.maxSize {
-		// A pinned cache with no evictable entries cannot make room. Avoid scanning every
-		// pinned entry before returning the same cache-full error.
-		if c.pin && c.evictableEntryCount == 0 {
+		// If all positive-size cache usage is pinned, no evictable entry can make room.
+		// Avoid scanning every pinned entry before returning the same cache-full error.
+		if c.pin && !c.mayContainZeroSizeEntry && c.pinnedSize == c.currSize {
 			return nil, ErrCacheFull
 		}
 
@@ -377,6 +383,9 @@ func (c *lru) putInternal(key any, value any, allowUpdate bool) (any, error) {
 		entry.refCount = 1
 		c.pinnedSize += entry.Size()
 		metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
+		if newEntrySize == 0 {
+			c.mayContainZeroSizeEntry = true
+		}
 	}
 	element := c.byAccess.PushFront(entry)
 	c.byKey[key] = element
@@ -396,8 +405,9 @@ func (c *lru) calculateNewCacheSize(newEntrySize int, existingEntrySize int) int
 
 func (c *lru) deleteInternal(element *list.Element) {
 	entry := c.byAccess.Remove(element).(*entryImpl)
-	if c.pin && entry.refCount == 0 {
-		c.evictableEntryCount--
+	if c.pin && entry.refCount > 0 {
+		c.pinnedSize -= entry.Size()
+		metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
 	}
 	c.currSize -= entry.Size()
 	metrics.CacheUsage.With(c.metricsHandler).Record(float64(c.currSize))
@@ -458,11 +468,7 @@ func (c *lru) updateEntryTTL(entry *entryImpl) {
 func (c *lru) updateEntryRefCount(entry *entryImpl) {
 	if c.pin {
 		entry.refCount++
-		switch entry.refCount {
-		case 0:
-			c.evictableEntryCount++
-		case 1:
-			c.evictableEntryCount--
+		if entry.refCount == 1 {
 			c.pinnedSize += entry.Size()
 			metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
 		}
