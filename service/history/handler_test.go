@@ -81,17 +81,8 @@ func TestDescribeHistoryHost(t *testing.T) {
 type activityCompletionTypedHandoffEngine struct {
 	historyi.Engine
 
-	rawCalls   int
 	typedCalls int
 	taskToken  *tokenspb.Task
-}
-
-func (e *activityCompletionTypedHandoffEngine) RespondActivityTaskCompleted(
-	_ context.Context,
-	_ *historyservice.RespondActivityTaskCompletedRequest,
-) (*historyservice.RespondActivityTaskCompletedResponse, error) {
-	e.rawCalls++
-	return &historyservice.RespondActivityTaskCompletedResponse{}, nil
 }
 
 func (e *activityCompletionTypedHandoffEngine) RespondActivityTaskCompletedWithTaskToken(
@@ -117,15 +108,11 @@ func TestRespondActivityTaskCompletedPassesDecodedTokenToHistoryEngine(t *testin
 		},
 	}
 
-	response, err := handler.RespondActivityTaskCompleted(context.Background(), request)
-	if err != nil {
+	if _, err := handler.RespondActivityTaskCompleted(context.Background(), request); err != nil {
 		t.Fatal(err)
 	}
-	if response == nil {
-		t.Fatal("RespondActivityTaskCompleted returned a nil response")
-	}
-	if engine.rawCalls != 0 || engine.typedCalls != 1 {
-		t.Fatalf("typed Engine calls = raw %d, typed %d; want raw 0, typed 1", engine.rawCalls, engine.typedCalls)
+	if engine.typedCalls != 1 {
+		t.Fatalf("typed Engine calls = %d, want 1", engine.typedCalls)
 	}
 	if engine.taskToken == wantToken {
 		t.Fatal("engine received the token instance used to create the serialized request, not the handler-decoded token")
@@ -139,7 +126,6 @@ type activityCompletionTypedHandoffRunIDConsistencyChecker struct {
 	api.WorkflowConsistencyChecker
 
 	workflowLease       api.WorkflowLease
-	currentRunID        string
 	currentRunIDCalls   int
 	workflowKeyForLease definition.WorkflowKey
 }
@@ -161,7 +147,7 @@ func (c *activityCompletionTypedHandoffRunIDConsistencyChecker) GetCurrentWorkfl
 	locks.Priority,
 ) (string, error) {
 	c.currentRunIDCalls++
-	return c.currentRunID, nil
+	return tests.RunID, nil
 }
 
 func TestRespondActivityTaskCompletedResolvesMissingRunIDThroughProductionHandoff(t *testing.T) {
@@ -175,7 +161,6 @@ func TestRespondActivityTaskCompletedResolvesMissingRunIDThroughProductionHandof
 			func(error) {},
 			mutableState,
 		),
-		currentRunID: tests.RunID,
 	}
 	historyEngine.workflowConsistencyChecker = workflowConsistencyChecker
 
@@ -189,12 +174,8 @@ func TestRespondActivityTaskCompletedResolvesMissingRunIDThroughProductionHandof
 		t.Fatal(err)
 	}
 
-	response, err := handler.RespondActivityTaskCompleted(context.Background(), request)
-	if err != nil {
+	if _, err := handler.RespondActivityTaskCompleted(context.Background(), request); err != nil {
 		t.Fatal(err)
-	}
-	if response == nil {
-		t.Fatal("RespondActivityTaskCompleted returned a nil response")
 	}
 	if workflowConsistencyChecker.currentRunIDCalls != 1 {
 		t.Fatalf("GetCurrentWorkflowRunID calls = %d, want 1", workflowConsistencyChecker.currentRunIDCalls)
