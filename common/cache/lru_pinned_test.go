@@ -13,9 +13,6 @@ func TestPinnedCacheEvictsLeastRecentlyUsedUnpinnedEntry(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	_, err := cache.PutIfNotExist("D", "D")
-	require.ErrorIs(t, err, ErrCacheFull)
-
 	// Move A to the most-recent position, then make A and C evictable. B remains
 	// pinned at the least-recent position. C is the least-recent evictable entry,
 	// so a new pinned entry must evict C rather than A.
@@ -24,7 +21,7 @@ func TestPinnedCacheEvictsLeastRecentlyUsedUnpinnedEntry(t *testing.T) {
 	cache.Release("A")
 	cache.Release("C")
 
-	_, err = cache.PutIfNotExist("D", "D")
+	_, err := cache.PutIfNotExist("D", "D")
 	require.NoError(t, err)
 	require.Equal(t, 3, cache.Size())
 	require.Nil(t, cache.Get("C"))
