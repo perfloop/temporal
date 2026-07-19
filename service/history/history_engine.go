@@ -12,6 +12,7 @@ import (
 	"go.temporal.io/server/api/historyservice/v1"
 	"go.temporal.io/server/api/matchingservice/v1"
 	replicationspb "go.temporal.io/server/api/replication/v1"
+	tokenspb "go.temporal.io/server/api/token/v1"
 	workflowspb "go.temporal.io/server/api/workflow/v1"
 	"go.temporal.io/server/chasm"
 	chasmworkflow "go.temporal.io/server/chasm/lib/workflow"
@@ -607,7 +608,20 @@ func (e *historyEngineImpl) RespondActivityTaskCompleted(
 	ctx context.Context,
 	req *historyservice.RespondActivityTaskCompletedRequest,
 ) (*historyservice.RespondActivityTaskCompletedResponse, error) {
-	return respondactivitytaskcompleted.Invoke(ctx, req, e.shardContext, e.workflowConsistencyChecker)
+	taskToken, err := e.tokenSerializer.Deserialize(req.CompleteRequest.TaskToken)
+	if err != nil {
+		return nil, consts.ErrDeserializingToken
+	}
+	return e.RespondActivityTaskCompletedWithTaskToken(ctx, req, taskToken)
+}
+
+// RespondActivityTaskCompletedWithTaskToken completes an activity task with a caller-decoded token.
+func (e *historyEngineImpl) RespondActivityTaskCompletedWithTaskToken(
+	ctx context.Context,
+	req *historyservice.RespondActivityTaskCompletedRequest,
+	taskToken *tokenspb.Task,
+) (*historyservice.RespondActivityTaskCompletedResponse, error) {
+	return respondactivitytaskcompleted.Invoke(ctx, req, taskToken, e.shardContext, e.workflowConsistencyChecker)
 }
 
 // RespondActivityTaskFailed completes an activity task failure.
