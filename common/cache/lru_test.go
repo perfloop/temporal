@@ -24,6 +24,11 @@ type (
 	testEntryWithCacheSize struct {
 		cacheSize int
 	}
+	pinnedCacheModelEntry struct {
+		value    *testEntryWithCacheSize
+		refCount int
+		size     int
+	}
 )
 
 func (c *testEntryWithCacheSize) CacheSize() int {
@@ -647,45 +652,102 @@ func TestCache_PutIfNotExistWithSameKeys_Pin(t *testing.T) {
 	assert.Equal(t, 3, cache.Size())
 }
 
-func TestCache_PinnedEntryCountMatchesRefCounts(t *testing.T) {
+func TestCache_DeletePinnedEntryKeepsEvictableEntry(t *testing.T) {
 	t.Parallel()
 
+	cache := New(2, &Options{Pin: true})
+	_, err := cache.PutIfNotExist("pinned", "pinned")
+	require.NoError(t, err)
+	_, err = cache.PutIfNotExist("evictable", "evictable")
+	require.NoError(t, err)
+
+	cache.Release("evictable")
+	cache.Delete("pinned")
+
+	value, err := cache.PutIfNotExist("replacement", "replacement")
+	require.NoError(t, err)
+	require.Equal(t, "replacement", value)
+
+	value, err = cache.PutIfNotExist("new", "new")
+	require.NoError(t, err)
+	assert.Equal(t, "new", value)
+	assert.Nil(t, cache.Get("evictable"))
+	assert.Equal(t, 2, cache.Size())
+}
+
+func TestCache_PinnedEntryCountMatchesPublicModel(t *testing.T) {
+	t.Parallel()
+
+	// The model tracks refs and sizes independently through the public cache API.
+	// Every valid pin, release, delete, and size-update transition is followed by
+	// an admission decision that must match the model after zero-ref eviction.
 	err := quick.Check(func(randomOperations []uint8) bool {
-		cache := New(4, &Options{Pin: true}).(*lru)
+		const cacheSize = 4
+		cache := New(cacheSize, &Options{Pin: true})
+		model := make(map[int]pinnedCacheModelEntry)
 		operations := append([]uint8{
 			0, 1, 2, 3, // Fill the cache with pinned entries.
 			16, // Release key 0 so a new key can evict it.
 			4,
-			17, // Release key 1 so a new key can evict it.
-			5,
-			10, 18, 18, // Get and fully release key 2.
-			10, 98, // Re-pin key 2, resize it, and release it.
-			27, // Delete pinned key 3.
+			9, 17, 17, // Re-pin and fully release key 1.
+			26,   // Delete pinned key 2.
+			5, 6, // Refill, then require the surviving zero-ref entry to be evicted.
+			99, // Resize and release pinned key 3.
 		}, randomOperations...)
 
 		for _, operation := range operations {
 			key := int(operation & 0x07)
 			switch (operation >> 3) & 0x07 {
 			case 0:
-				_, err := cache.PutIfNotExist(key, &testEntryWithCacheSize{cacheSize: 1})
-				if err != nil && err != ErrCacheFull {
-					return false
+				value := &testEntryWithCacheSize{cacheSize: 1 + int(operation>>6)}
+				if existing, ok := model[key]; ok {
+					actual, err := cache.PutIfNotExist(key, value)
+					if err != nil || actual != existing.value {
+						return false
+					}
+					existing.refCount++
+					model[key] = existing
+				} else {
+					actual, err := cache.PutIfNotExist(key, value)
+					if pinnedCacheModelPinnedSize(model)+value.cacheSize <= cacheSize {
+						if err != nil || actual != value {
+							return false
+						}
+						model[key] = pinnedCacheModelEntry{value: value, refCount: 1, size: value.cacheSize}
+					} else if err != ErrCacheFull || actual != nil {
+						return false
+					}
 				}
 			case 1:
-				cache.Get(key)
+				if existing, ok := model[key]; ok {
+					if cache.Get(key) != existing.value {
+						return false
+					}
+					existing.refCount++
+					model[key] = existing
+				} else if cache.Get(key) != nil {
+					return false
+				}
 			case 2:
-				if cacheEntryRefCount(cache, key) > 0 {
+				if existing, ok := model[key]; ok && existing.refCount > 0 {
 					cache.Release(key)
+					existing.refCount--
+					model[key] = existing
 				}
 			case 3:
 				cache.Delete(key)
+				delete(model, key)
 			case 4:
-				if setPinnedEntrySize(cache, key, 1+int(operation>>6)) {
+				if existing, ok := model[key]; ok && existing.refCount == 1 {
+					existing.size = 1 + int(operation>>6)
+					existing.value.cacheSize = existing.size
 					cache.Release(key)
+					existing.refCount = 0
+					model[key] = existing
 				}
 			}
 
-			if !pinnedEntryCountMatchesRefCounts(cache) {
+			if !pinnedCacheMatchesPublicModel(cache, model) {
 				return false
 			}
 		}
@@ -694,44 +756,55 @@ func TestCache_PinnedEntryCountMatchesRefCounts(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func cacheEntryRefCount(cache *lru, key int) int {
-	cache.mut.Lock()
-	defer cache.mut.Unlock()
-
-	element := cache.byKey[key]
-	if element == nil {
-		return 0
+func pinnedCacheMatchesPublicModel(cache Cache, model map[int]pinnedCacheModelEntry) bool {
+	actual := make(map[int]*testEntryWithCacheSize, len(model))
+	iterator := cache.Iterator()
+	for iterator.HasNext() {
+		entry := iterator.Next()
+		key, ok := entry.Key().(int)
+		if !ok {
+			iterator.Close()
+			return false
+		}
+		value, ok := entry.Value().(*testEntryWithCacheSize)
+		if !ok || actual[key] != nil {
+			iterator.Close()
+			return false
+		}
+		actual[key] = value
 	}
-	return element.Value.(*entryImpl).refCount
+	iterator.Close()
+
+	for key, expected := range model {
+		actualValue, ok := actual[key]
+		if !ok {
+			delete(model, key)
+			continue
+		}
+		if actualValue != expected.value {
+			return false
+		}
+		delete(actual, key)
+	}
+	return len(actual) == 0 && cache.Size() == pinnedCacheModelSize(model)
 }
 
-func setPinnedEntrySize(cache *lru, key int, size int) bool {
-	cache.mut.Lock()
-	defer cache.mut.Unlock()
-
-	element := cache.byKey[key]
-	if element == nil {
-		return false
-	}
-	entry := element.Value.(*entryImpl)
-	if entry.refCount <= 0 {
-		return false
-	}
-	entry.value.(*testEntryWithCacheSize).cacheSize = size
-	return true
-}
-
-func pinnedEntryCountMatchesRefCounts(cache *lru) bool {
-	cache.mut.Lock()
-	defer cache.mut.Unlock()
-
-	pinnedEntryCount := 0
-	for element := cache.byAccess.Front(); element != nil; element = element.Next() {
-		if element.Value.(*entryImpl).refCount > 0 {
-			pinnedEntryCount++
+func pinnedCacheModelPinnedSize(model map[int]pinnedCacheModelEntry) int {
+	pinnedSize := 0
+	for _, entry := range model {
+		if entry.refCount > 0 {
+			pinnedSize += entry.size
 		}
 	}
-	return cache.pinnedEntryCount == pinnedEntryCount
+	return pinnedSize
+}
+
+func pinnedCacheModelSize(model map[int]pinnedCacheModelEntry) int {
+	totalSize := 0
+	for _, entry := range model {
+		totalSize += entry.size
+	}
+	return totalSize
 }
 
 func TestCache_ItemSizeChangeBeforeRelease(t *testing.T) {
