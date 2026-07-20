@@ -30,20 +30,21 @@ const emptyEntrySize = 0
 // lru is a concurrent fixed size cache that evicts elements in lru order
 type (
 	lru struct {
-		mut             sync.Mutex
-		byAccess        *list.List
-		byKey           map[any]*list.Element
-		maxSize         int
-		currSize        int
-		pinnedSize      int
-		onPut           func(val any)
-		onEvict         func(val any)
-		ttl             time.Duration
-		pin             bool
-		timeSource      clock.TimeSource
-		metricsHandler  metrics.Handler
-		backgroundEvict dynamicconfig.TypedPropertyFn[dynamicconfig.CacheBackgroundEvictSettings]
-		loops           goro.Group
+		mut              sync.Mutex
+		byAccess         *list.List
+		byKey            map[any]*list.Element
+		maxSize          int
+		currSize         int
+		pinnedSize       int
+		pinnedEntryCount int
+		onPut            func(val any)
+		onEvict          func(val any)
+		ttl              time.Duration
+		pin              bool
+		timeSource       clock.TimeSource
+		metricsHandler   metrics.Handler
+		backgroundEvict  dynamicconfig.TypedPropertyFn[dynamicconfig.CacheBackgroundEvictSettings]
+		loops            goro.Group
 	}
 
 	iteratorImpl struct {
@@ -267,6 +268,7 @@ func (c *lru) Release(key any) {
 	entry := elt.Value.(*entryImpl)
 	entry.refCount--
 	if entry.refCount == 0 {
+		c.pinnedEntryCount--
 		c.pinnedSize -= entry.Size()
 		metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
 	}
@@ -346,6 +348,12 @@ func (c *lru) putInternal(key any, value any, allowUpdate bool) (any, error) {
 		c.deleteInternal(elt)
 	}
 
+	if c.pin && c.pinnedEntryCount == c.byAccess.Len() &&
+		c.calculateNewCacheSize(newEntrySize, emptyEntrySize) > c.maxSize {
+		// All entries are pinned, so eviction cannot free space for the new entry.
+		return nil, ErrCacheFull
+	}
+
 	c.tryEvictUntilEnoughSpaceWithSkipEntry(newEntrySize, nil)
 
 	// check if the new entry can fit in the cache
@@ -379,6 +387,9 @@ func (c *lru) calculateNewCacheSize(newEntrySize int, existingEntrySize int) int
 
 func (c *lru) deleteInternal(element *list.Element) {
 	entry := c.byAccess.Remove(element).(*entryImpl)
+	if entry.refCount > 0 {
+		c.pinnedEntryCount--
+	}
 	c.currSize -= entry.Size()
 	metrics.CacheUsage.With(c.metricsHandler).Record(float64(c.currSize))
 	metrics.CacheEntryAgeOnEviction.With(c.metricsHandler).Record(c.timeSource.Now().UTC().Sub(entry.createTime))
@@ -439,6 +450,7 @@ func (c *lru) updateEntryRefCount(entry *entryImpl) {
 	if c.pin {
 		entry.refCount++
 		if entry.refCount == 1 {
+			c.pinnedEntryCount++
 			c.pinnedSize += entry.Size()
 			metrics.CachePinnedUsage.With(c.metricsHandler).Record(float64(c.pinnedSize))
 		}

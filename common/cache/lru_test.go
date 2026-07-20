@@ -4,6 +4,7 @@ import (
 	"math/rand"
 	"sync"
 	"testing"
+	"testing/quick"
 	"time"
 
 	"github.com/google/uuid"
@@ -644,6 +645,93 @@ func TestCache_PutIfNotExistWithSameKeys_Pin(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, &testEntryWithCacheSize{3}, val)
 	assert.Equal(t, 3, cache.Size())
+}
+
+func TestCache_PinnedEntryCountMatchesRefCounts(t *testing.T) {
+	t.Parallel()
+
+	err := quick.Check(func(randomOperations []uint8) bool {
+		cache := New(4, &Options{Pin: true}).(*lru)
+		operations := append([]uint8{
+			0, 1, 2, 3, // Fill the cache with pinned entries.
+			16, // Release key 0 so a new key can evict it.
+			4,
+			17, // Release key 1 so a new key can evict it.
+			5,
+			10, 18, 18, // Get and fully release key 2.
+			10, 98, // Re-pin key 2, resize it, and release it.
+			27, // Delete pinned key 3.
+		}, randomOperations...)
+
+		for _, operation := range operations {
+			key := int(operation & 0x07)
+			switch (operation >> 3) & 0x07 {
+			case 0:
+				_, err := cache.PutIfNotExist(key, &testEntryWithCacheSize{cacheSize: 1})
+				if err != nil && err != ErrCacheFull {
+					return false
+				}
+			case 1:
+				cache.Get(key)
+			case 2:
+				if cacheEntryRefCount(cache, key) > 0 {
+					cache.Release(key)
+				}
+			case 3:
+				cache.Delete(key)
+			case 4:
+				if setPinnedEntrySize(cache, key, 1+int(operation>>6)) {
+					cache.Release(key)
+				}
+			}
+
+			if !pinnedEntryCountMatchesRefCounts(cache) {
+				return false
+			}
+		}
+		return true
+	}, &quick.Config{MaxCount: 100, Rand: rand.New(rand.NewSource(0))})
+	require.NoError(t, err)
+}
+
+func cacheEntryRefCount(cache *lru, key int) int {
+	cache.mut.Lock()
+	defer cache.mut.Unlock()
+
+	element := cache.byKey[key]
+	if element == nil {
+		return 0
+	}
+	return element.Value.(*entryImpl).refCount
+}
+
+func setPinnedEntrySize(cache *lru, key int, size int) bool {
+	cache.mut.Lock()
+	defer cache.mut.Unlock()
+
+	element := cache.byKey[key]
+	if element == nil {
+		return false
+	}
+	entry := element.Value.(*entryImpl)
+	if entry.refCount <= 0 {
+		return false
+	}
+	entry.value.(*testEntryWithCacheSize).cacheSize = size
+	return true
+}
+
+func pinnedEntryCountMatchesRefCounts(cache *lru) bool {
+	cache.mut.Lock()
+	defer cache.mut.Unlock()
+
+	pinnedEntryCount := 0
+	for element := cache.byAccess.Front(); element != nil; element = element.Next() {
+		if element.Value.(*entryImpl).refCount > 0 {
+			pinnedEntryCount++
+		}
+	}
+	return cache.pinnedEntryCount == pinnedEntryCount
 }
 
 func TestCache_ItemSizeChangeBeforeRelease(t *testing.T) {
