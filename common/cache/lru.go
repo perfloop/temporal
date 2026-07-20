@@ -348,7 +348,7 @@ func (c *lru) putInternal(key any, value any, allowUpdate bool) (any, error) {
 		c.deleteInternal(elt)
 	}
 
-	if c.pinnedEntryCount == c.byAccess.Len() &&
+	if c.pin && c.pinnedEntryCount == c.byAccess.Len() &&
 		c.calculateNewCacheSize(newEntrySize, emptyEntrySize) > c.maxSize {
 		// All entries are pinned, so eviction cannot free space for the new entry.
 		return nil, ErrCacheFull
@@ -387,7 +387,7 @@ func (c *lru) calculateNewCacheSize(newEntrySize int, existingEntrySize int) int
 
 func (c *lru) deleteInternal(element *list.Element) {
 	entry := c.byAccess.Remove(element).(*entryImpl)
-	if entry.refCount > 0 {
+	if c.pin && entry.refCount > 0 {
 		c.pinnedEntryCount--
 	}
 	c.currSize -= entry.Size()

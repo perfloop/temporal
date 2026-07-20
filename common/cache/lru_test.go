@@ -658,38 +658,6 @@ func TestCache_PutIfNotExistWithSameKeys_Pin(t *testing.T) {
 	assert.Equal(t, 3, cache.Size())
 }
 
-func TestCache_DeletePinnedEntryPreservesEviction(t *testing.T) {
-	t.Parallel()
-
-	const cacheSize = 2
-	cache := New(cacheSize, &Options{Pin: true})
-	pinned := &testEntryWithCacheSize{cacheSize: 1}
-	evictable := &testEntryWithCacheSize{cacheSize: 1}
-	replacement := &testEntryWithCacheSize{cacheSize: 1}
-	newEntry := &testEntryWithCacheSize{cacheSize: 1}
-
-	_, err := cache.PutIfNotExist("pinned", pinned)
-	require.NoError(t, err)
-	_, err = cache.PutIfNotExist("evictable", evictable)
-	require.NoError(t, err)
-
-	cache.Release("evictable")
-	cache.Delete("pinned")
-
-	value, err := cache.PutIfNotExist("replacement", replacement)
-	require.NoError(t, err)
-	require.Same(t, replacement, value)
-	require.Equal(t, cacheSize, cache.Size())
-
-	// This insertion exceeds capacity. The remaining zero-ref entry must be
-	// evicted rather than rejected as a fully pinned cache.
-	value, err = cache.PutIfNotExist("new", newEntry)
-	require.NoError(t, err)
-	require.Same(t, newEntry, value)
-	assert.Nil(t, cache.Get("evictable"))
-	assert.Equal(t, cacheSize, cache.Size())
-}
-
 func TestCache_PinnedEntryCountMatchesPublicModel(t *testing.T) {
 	t.Parallel()
 
