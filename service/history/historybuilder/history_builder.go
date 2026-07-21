@@ -79,6 +79,7 @@ func New(
 
 			dbBufferBatch:          dbBufferBatch,
 			dbClearBuffer:          false,
+			bufferedEventSize:      bufferedEventsSize(dbBufferBatch),
 			memEventsBatches:       nil,
 			memLatestBatch:         nil,
 			memBufferBatch:         nil,

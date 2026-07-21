@@ -2399,11 +2399,19 @@ func (s *historyBuilderSuite) TestBufferSize_Memory() {
 func (s *historyBuilderSuite) TestBufferSize_DB() {
 	s.Assert().Zero(s.historyBuilder.NumBufferedEvents())
 	s.Assert().Zero(s.historyBuilder.SizeInBytesOfBufferedEvents())
-	s.historyBuilder.dbBufferBatch = []*historypb.HistoryEvent{{
-		EventType: enumspb.EVENT_TYPE_TIMER_FIRED,
-		EventId:   common.BufferedEventID,
-		TaskId:    common.EmptyEventTaskID,
-	}}
+	s.historyBuilder = New(
+		s.mockTimeSource,
+		s.taskIDGenerator,
+		s.version,
+		s.nextEventID,
+		[]*historypb.HistoryEvent{{
+			EventType: enumspb.EVENT_TYPE_TIMER_FIRED,
+			EventId:   common.BufferedEventID,
+			TaskId:    common.EmptyEventTaskID,
+		}},
+		metrics.NoopMetricsHandler,
+		tests.NewDynamicConfig().MaximumEventBatchSizeInBytes,
+	)
 	s.Assert().Equal(1, s.historyBuilder.NumBufferedEvents())
 	// the size of the proto  is non-deterministic, so just assert that it's non-zero, and it isn't really high
 	s.Assert().Greater(s.historyBuilder.SizeInBytesOfBufferedEvents(), 0)
