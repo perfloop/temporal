@@ -687,9 +687,20 @@ func TestCache_FullPinnedCacheEvictsReleasedZeroSizeEntry(t *testing.T) {
 	cache.Release("released-zero-size")
 	assert.Equal(t, 1, cache.Size())
 
-	// The released zero-size entry remains evictable even though the pinned
-	// entry occupies the cache's full capacity. It must be removed before the
-	// new entry is rejected for lack of evictable capacity.
+	// The size aggregates are both one here, but the resident set still has a
+	// released zero-size entry. It remains evictable even though removing it
+	// cannot free capacity. An early ErrCacheFull based only on those sizes
+	// would incorrectly retain it.
+	it := cache.Iterator()
+	var keys []any
+	for it.HasNext() {
+		keys = append(keys, it.Next().Key())
+	}
+	it.Close()
+	assert.ElementsMatch(t, []any{"pinned", "released-zero-size"}, keys)
+
+	// The released zero-size entry must be removed before the new entry is
+	// rejected for lack of evictable capacity.
 	value, err := cache.PutIfNotExist("new", &testEntryWithCacheSize{cacheSize: 1})
 	require.ErrorIs(t, err, ErrCacheFull)
 	assert.Nil(t, value)
