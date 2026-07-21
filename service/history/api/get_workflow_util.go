@@ -33,89 +33,27 @@ func GetOrPollWorkflowMutableState(
 	eventNotifier events.Notifier,
 ) (*historyservice.GetMutableStateResponse, error) {
 
-	logger := shardContext.GetLogger()
-	namespaceID := namespace.ID(request.GetNamespaceId())
-	err := ValidateNamespaceUUID(namespaceID)
-	if err != nil {
-		return nil, err
-	}
-
-	if len(request.Execution.RunId) == 0 {
-		request.Execution.RunId, err = workflowConsistencyChecker.GetCurrentWorkflowRunID(
-			ctx,
-			request.NamespaceId,
-			request.Execution.WorkflowId,
-			locks.PriorityHigh,
-		)
-		if err != nil {
-			return nil, err
-		}
-	}
-	workflowKey := definition.NewWorkflowKey(
-		request.NamespaceId,
-		request.Execution.WorkflowId,
-		request.Execution.RunId,
-	)
-	response, err := GetMutableStateWithConsistencyCheck(
+	response, workflowLease, err := GetWorkflowMutableStateWithLease(
 		ctx,
 		shardContext,
-		workflowKey,
-		request.VersionHistoryItem.GetVersion(),
-		request.VersionHistoryItem.GetEventId(),
-		request.VersionedTransition,
+		request,
 		workflowConsistencyChecker,
 	)
 	if err != nil {
 		return nil, err
 	}
+	workflowLease.GetReleaseFn()(nil)
+
+	logger := shardContext.GetLogger()
+	namespaceID := namespace.ID(request.GetNamespaceId())
+	workflowKey := definition.NewWorkflowKey(
+		request.NamespaceId,
+		request.Execution.WorkflowId,
+		request.Execution.RunId,
+	)
 	currentVersionHistory, err := versionhistory.GetCurrentVersionHistory(response.GetVersionHistories())
 	if err != nil {
 		return nil, err
-	}
-	if request.GetVersionHistoryItem() == nil {
-		lastVersionHistoryItem, err := versionhistory.GetLastVersionHistoryItem(currentVersionHistory)
-		if err != nil {
-			return nil, err
-		}
-		request.VersionHistoryItem = lastVersionHistoryItem
-	}
-
-	transitionHistory := response.GetTransitionHistory()
-	currentVersionedTransition := transitionhistory.LastVersionedTransition(transitionHistory)
-	if len(transitionHistory) != 0 && request.VersionedTransition != nil {
-		if transitionhistory.StalenessCheck(transitionHistory, request.VersionedTransition) != nil {
-			logger.Warn(fmt.Sprintf("Request versioned transition and transition history don't match. Request: %v, current: %v",
-				request.VersionedTransition,
-				currentVersionedTransition),
-				tag.WorkflowNamespaceID(workflowKey.GetNamespaceID()),
-				tag.WorkflowID(workflowKey.GetWorkflowID()),
-				tag.WorkflowRunID(workflowKey.GetRunID()))
-			return nil, serviceerrors.NewCurrentBranchChanged(response.CurrentBranchToken,
-				request.CurrentBranchToken,
-				currentVersionedTransition,
-				request.VersionedTransition)
-		}
-	}
-
-	// Use the latest event id + event version as the branch identifier. This pair is unique across clusters.
-	// We return the full version histories. Callers need to fetch the last version history item from current branch
-	// and use the last version history item in following calls.
-	if !versionhistory.ContainsVersionHistoryItem(currentVersionHistory, request.VersionHistoryItem) {
-		logItem, err := versionhistory.GetLastVersionHistoryItem(currentVersionHistory)
-		if err != nil {
-			return nil, err
-		}
-		logger.Warn("Request history branch and current history branch don't match",
-			tag.Value(logItem),
-			tag.TokenLastEventVersion(request.VersionHistoryItem.GetVersion()),
-			tag.TokenLastEventID(request.VersionHistoryItem.GetEventId()),
-			tag.WorkflowNamespaceID(workflowKey.GetNamespaceID()),
-			tag.WorkflowID(workflowKey.GetWorkflowID()),
-			tag.WorkflowRunID(workflowKey.GetRunID()))
-		return nil, serviceerrors.NewCurrentBranchChanged(response.CurrentBranchToken,
-			request.CurrentBranchToken,
-			currentVersionedTransition,
-			request.VersionedTransition)
 	}
 
 	// expectedNextEventID is 0 when caller want to get the current next event ID without blocking.
@@ -263,6 +201,111 @@ func GetOrPollWorkflowMutableState(
 	return response, nil
 }
 
+// GetWorkflowMutableStateWithLease validates a mutable-state read and returns its workflow lease to the caller.
+// The caller must release the lease after consuming fields that are not immutable snapshots.
+func GetWorkflowMutableStateWithLease(
+	ctx context.Context,
+	shardContext historyi.ShardContext,
+	request *historyservice.GetMutableStateRequest,
+	workflowConsistencyChecker WorkflowConsistencyChecker,
+) (_ *historyservice.GetMutableStateResponse, _ WorkflowLease, retError error) {
+	logger := shardContext.GetLogger()
+	namespaceID := namespace.ID(request.GetNamespaceId())
+	if err := ValidateNamespaceUUID(namespaceID); err != nil {
+		return nil, nil, err
+	}
+
+	if len(request.Execution.RunId) == 0 {
+		var err error
+		request.Execution.RunId, err = workflowConsistencyChecker.GetCurrentWorkflowRunID(
+			ctx,
+			request.NamespaceId,
+			request.Execution.WorkflowId,
+			locks.PriorityHigh,
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	workflowKey := definition.NewWorkflowKey(
+		request.NamespaceId,
+		request.Execution.WorkflowId,
+		request.Execution.RunId,
+	)
+	response, workflowLease, err := getMutableStateWithConsistencyCheckAndLease(
+		ctx,
+		shardContext,
+		workflowKey,
+		request.VersionHistoryItem.GetVersion(),
+		request.VersionHistoryItem.GetEventId(),
+		request.VersionedTransition,
+		workflowConsistencyChecker,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() {
+		if retError != nil {
+			workflowLease.GetReleaseFn()(retError)
+		}
+	}()
+
+	currentVersionHistory, err := versionhistory.GetCurrentVersionHistory(response.GetVersionHistories())
+	if err != nil {
+		return nil, nil, err
+	}
+	if request.GetVersionHistoryItem() == nil {
+		lastVersionHistoryItem, err := versionhistory.GetLastVersionHistoryItem(currentVersionHistory)
+		if err != nil {
+			return nil, nil, err
+		}
+		request.VersionHistoryItem = lastVersionHistoryItem
+	}
+
+	transitionHistory := response.GetTransitionHistory()
+	currentVersionedTransition := transitionhistory.LastVersionedTransition(transitionHistory)
+	if len(transitionHistory) != 0 && request.VersionedTransition != nil &&
+		transitionhistory.StalenessCheck(transitionHistory, request.VersionedTransition) != nil {
+		logger.Warn(fmt.Sprintf("Request versioned transition and transition history don't match. Request: %v, current: %v",
+			request.VersionedTransition,
+			currentVersionedTransition),
+			tag.WorkflowNamespaceID(workflowKey.GetNamespaceID()),
+			tag.WorkflowID(workflowKey.GetWorkflowID()),
+			tag.WorkflowRunID(workflowKey.GetRunID()))
+		return nil, nil, serviceerrors.NewCurrentBranchChanged(
+			response.CurrentBranchToken,
+			request.CurrentBranchToken,
+			currentVersionedTransition,
+			request.VersionedTransition,
+		)
+	}
+
+	// Use the latest event id + event version as the branch identifier. This pair is unique across clusters.
+	// We return the full version histories. Callers need to fetch the last version history item from the current branch
+	// and use the last version history item in following calls.
+	if !versionhistory.ContainsVersionHistoryItem(currentVersionHistory, request.VersionHistoryItem) {
+		logItem, err := versionhistory.GetLastVersionHistoryItem(currentVersionHistory)
+		if err != nil {
+			return nil, nil, err
+		}
+		logger.Warn("Request history branch and current history branch don't match",
+			tag.Value(logItem),
+			tag.TokenLastEventVersion(request.VersionHistoryItem.GetVersion()),
+			tag.TokenLastEventID(request.VersionHistoryItem.GetEventId()),
+			tag.WorkflowNamespaceID(workflowKey.GetNamespaceID()),
+			tag.WorkflowID(workflowKey.GetWorkflowID()),
+			tag.WorkflowRunID(workflowKey.GetRunID()))
+		return nil, nil, serviceerrors.NewCurrentBranchChanged(
+			response.CurrentBranchToken,
+			request.CurrentBranchToken,
+			currentVersionedTransition,
+			request.VersionedTransition,
+		)
+	}
+
+	return response, workflowLease, nil
+}
+
 func GetMutableState(
 	ctx context.Context,
 	shardContext historyi.ShardContext,
@@ -303,9 +346,35 @@ func GetMutableStateWithConsistencyCheck(
 	versionedTransition *persistencespb.VersionedTransition,
 	workflowConsistencyChecker WorkflowConsistencyChecker,
 ) (_ *historyservice.GetMutableStateResponse, retError error) {
+	response, workflowLease, err := getMutableStateWithConsistencyCheckAndLease(
+		ctx,
+		shardContext,
+		workflowKey,
+		currentVersion,
+		currentEventID,
+		versionedTransition,
+		workflowConsistencyChecker,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { workflowLease.GetReleaseFn()(retError) }()
+	return response, nil
+}
 
+// getMutableStateWithConsistencyCheckAndLease returns a mutable-state response while retaining the workflow lease.
+// The caller must release the lease after it is done consuming response fields that are not immutable snapshots.
+func getMutableStateWithConsistencyCheckAndLease(
+	ctx context.Context,
+	shardContext historyi.ShardContext,
+	workflowKey definition.WorkflowKey,
+	currentVersion int64,
+	currentEventID int64,
+	versionedTransition *persistencespb.VersionedTransition,
+	workflowConsistencyChecker WorkflowConsistencyChecker,
+) (_ *historyservice.GetMutableStateResponse, _ WorkflowLease, retError error) {
 	if len(workflowKey.RunID) == 0 {
-		return nil, serviceerror.NewInternalf(
+		return nil, nil, serviceerror.NewInternalf(
 			"getMutableState encountered empty run ID: %v", workflowKey,
 		)
 	}
@@ -337,15 +406,23 @@ func GetMutableStateWithConsistencyCheck(
 		locks.PriorityHigh,
 	)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	defer func() { workflowLease.GetReleaseFn()(retError) }()
+	defer func() {
+		if retError != nil {
+			workflowLease.GetReleaseFn()(retError)
+		}
+	}()
 
 	mutableState, err := workflowLease.GetContext().LoadMutableState(ctx, shardContext)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return MutableStateToGetResponse(mutableState)
+	response, err := MutableStateToGetResponse(mutableState)
+	if err != nil {
+		return nil, nil, err
+	}
+	return response, workflowLease, nil
 }
 
 func MutableStateToGetResponse(

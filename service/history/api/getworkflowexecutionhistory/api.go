@@ -30,9 +30,9 @@ import (
 )
 
 // appendTransientTasks queries mutable state for transient/speculative events and appends them to the response.
-// It prefers a no-gap terminal-page freshness snapshot when available, including a known-empty snapshot,
-// before falling back to cached tasks or another mutable-state query. Validation of event IDs is handled
-// by ValidateTransientWorkflowTaskEvents.
+// It prefers a no-gap terminal-page freshness snapshot while Invoke retains its workflow lease, including a
+// known-empty snapshot, before falling back to cached tasks or another mutable-state query. Validation of event IDs
+// is handled by ValidateTransientWorkflowTaskEvents.
 func appendTransientTasks(
 	ctx context.Context,
 	shardContext historyi.ShardContext,
@@ -46,7 +46,7 @@ func appendTransientTasks(
 	historyBlob *[]*commonpb.DataBlob,
 	cachedTransientTasks *historyspb.TransientWorkflowTaskInfo,
 	freshTransientTasks *historyspb.TransientWorkflowTaskInfo,
-	hasFreshTerminalTransientTasks bool,
+	hasLockedTerminalTransientTasks bool,
 	nextEventID int64,
 ) {
 	if !shardContext.GetConfig().SendTransientOrSpeculativeWorkflowTaskEvents(namespaceName) {
@@ -60,8 +60,9 @@ func appendTransientTasks(
 
 	var transientWorkflowTask *historyspb.TransientWorkflowTaskInfo
 
-	// A no-gap terminal-page freshness query is authoritative, including when it found no transient tasks.
-	if hasFreshTerminalTransientTasks {
+	// A no-gap terminal-page snapshot is authoritative while Invoke still holds its workflow lease, including when it
+	// found no transient tasks.
+	if hasLockedTerminalTransientTasks {
 		cachedTransientTasks = freshTransientTasks
 	}
 
@@ -73,8 +74,8 @@ func appendTransientTasks(
 		}
 	}
 
-	// A known terminal snapshot is sufficient even when it was empty or its suffix was invalid.
-	if transientWorkflowTask == nil && hasFreshTerminalTransientTasks {
+	// A locked terminal snapshot is sufficient even when it was empty or its suffix was invalid.
+	if transientWorkflowTask == nil && hasLockedTerminalTransientTasks {
 		return
 	}
 
@@ -153,6 +154,7 @@ func Invoke(
 		currentBranchToken []byte,
 		versionHistoryItem *historyspb.VersionHistoryItem,
 		versionedTransition *persistencespb.VersionedTransition,
+		retainLease bool,
 	) (
 		[]byte, // current branch token (to use to retrieve history events)
 		string, // workflow run ID
@@ -162,59 +164,75 @@ func Invoke(
 		*historyspb.VersionHistoryItem, // version history item for the current branch
 		*persistencespb.VersionedTransition, // last versioned transition
 		*historyspb.TransientWorkflowTaskInfo, // transient workflow task info
+		api.WorkflowLease, // retained only for the terminal no-gap snapshot
 		error, // error if any
 	) {
-		response, err := api.GetOrPollWorkflowMutableState(
-			ctx,
-			shardContext,
-			&historyservice.GetMutableStateRequest{
+		getMutableState := func(
+			currentBranchToken []byte,
+			versionHistoryItem *historyspb.VersionHistoryItem,
+			versionedTransition *persistencespb.VersionedTransition,
+		) (*historyservice.GetMutableStateResponse, api.WorkflowLease, error) {
+			mutableStateRequest := &historyservice.GetMutableStateRequest{
 				NamespaceId:         namespaceUUID.String(),
 				Execution:           execution,
 				ExpectedNextEventId: expectedNextEventID,
 				CurrentBranchToken:  currentBranchToken,
 				VersionHistoryItem:  versionHistoryItem,
 				VersionedTransition: versionedTransition,
-			},
-			workflowConsistencyChecker,
-			eventNotifier,
-		)
+			}
+			if retainLease {
+				return api.GetWorkflowMutableStateWithLease(
+					ctx,
+					shardContext,
+					mutableStateRequest,
+					workflowConsistencyChecker,
+				)
+			}
+			response, err := api.GetOrPollWorkflowMutableState(
+				ctx,
+				shardContext,
+				mutableStateRequest,
+				workflowConsistencyChecker,
+				eventNotifier,
+			)
+			return response, nil, err
+		}
 
+		response, workflowLease, err := getMutableState(currentBranchToken, versionHistoryItem, versionedTransition)
 		var branchErr *serviceerrors.CurrentBranchChanged
 		if errors.As(err, &branchErr) && isCloseEventOnly {
+			if workflowLease != nil {
+				workflowLease.GetReleaseFn()(err)
+				workflowLease = nil
+			}
 			shardContext.GetLogger().Info("Got CurrentBranchChanged, retry with empty branch token",
 				tag.WorkflowNamespaceID(namespaceUUID.String()),
 				tag.WorkflowID(execution.GetWorkflowId()),
 				tag.WorkflowRunID(execution.GetRunId()),
 				tag.Error(err),
 			)
-			// if we are only querying for close event, and encounter CurrentBranchChanged error, then we retry with empty branch token to get the close event
-			response, err = api.GetOrPollWorkflowMutableState(
-				ctx,
-				shardContext,
-				&historyservice.GetMutableStateRequest{
-					NamespaceId:         namespaceUUID.String(),
-					Execution:           execution,
-					ExpectedNextEventId: expectedNextEventID,
-					CurrentBranchToken:  nil,
-					VersionHistoryItem:  nil,
-					VersionedTransition: nil,
-				},
-				workflowConsistencyChecker,
-				eventNotifier,
-			)
+			// If we are only querying for a close event and encounter CurrentBranchChanged, retry with an empty branch
+			// token to get the close event.
+			response, workflowLease, err = getMutableState(nil, nil, nil)
 		}
 		if err != nil {
-			return nil, "", 0, 0, false, nil, nil, nil, err
+			return nil, "", 0, 0, false, nil, nil, nil, nil, err
 		}
 
 		isWorkflowRunning := response.GetWorkflowStatus() == enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING
 		currentVersionHistory, err := versionhistory.GetCurrentVersionHistory(response.GetVersionHistories())
 		if err != nil {
-			return nil, "", 0, 0, false, nil, nil, nil, err
+			if workflowLease != nil {
+				workflowLease.GetReleaseFn()(err)
+			}
+			return nil, "", 0, 0, false, nil, nil, nil, nil, err
 		}
 		lastVersionHistoryItem, err := versionhistory.GetLastVersionHistoryItem(currentVersionHistory)
 		if err != nil {
-			return nil, "", 0, 0, false, nil, nil, nil, err
+			if workflowLease != nil {
+				workflowLease.GetReleaseFn()(err)
+			}
+			return nil, "", 0, 0, false, nil, nil, nil, nil, err
 		}
 
 		lastVersionedTransition := transitionhistory.LastVersionedTransition(response.GetTransitionHistory())
@@ -226,6 +244,7 @@ func Invoke(
 			lastVersionHistoryItem,
 			lastVersionedTransition,
 			response.GetTransientOrSpeculativeTasks(),
+			workflowLease,
 			nil
 	}
 
@@ -260,8 +279,8 @@ func Invoke(
 			if !isCloseEventOnly {
 				queryNextEventID = continuationToken.GetNextEventId()
 			}
-			continuationToken.BranchToken, _, lastFirstEventID, nextEventID, isWorkflowRunning, continuationToken.VersionHistoryItem, continuationToken.VersionedTransition, cachedTransientTasks, err =
-				queryMutableState(namespaceID, execution, queryNextEventID, continuationToken.BranchToken, continuationToken.VersionHistoryItem, continuationToken.VersionedTransition)
+			continuationToken.BranchToken, _, lastFirstEventID, nextEventID, isWorkflowRunning, continuationToken.VersionHistoryItem, continuationToken.VersionedTransition, cachedTransientTasks, _, err =
+				queryMutableState(namespaceID, execution, queryNextEventID, continuationToken.BranchToken, continuationToken.VersionHistoryItem, continuationToken.VersionedTransition, false)
 			if err != nil {
 				return nil, err
 			}
@@ -274,8 +293,8 @@ func Invoke(
 		if !isCloseEventOnly {
 			queryNextEventID = common.FirstEventID
 		}
-		continuationToken.BranchToken, runID, lastFirstEventID, nextEventID, isWorkflowRunning, continuationToken.VersionHistoryItem, continuationToken.VersionedTransition, cachedTransientTasks, err =
-			queryMutableState(namespaceID, execution, queryNextEventID, nil, nil, nil)
+		continuationToken.BranchToken, runID, lastFirstEventID, nextEventID, isWorkflowRunning, continuationToken.VersionHistoryItem, continuationToken.VersionedTransition, cachedTransientTasks, _, err =
+			queryMutableState(namespaceID, execution, queryNextEventID, nil, nil, nil, false)
 		if err != nil {
 			return nil, err
 		}
@@ -459,15 +478,26 @@ func Invoke(
 				// those events are committed to DB with IDs < continuationToken.NextEventId but were excluded
 				// because the DB fetch was capped at the original boundary. Fetch the gap now, then update
 				// the nextEventID boundary so appendTransientTasks validates against the correct ID.
-				_, _, _, freshNextEventID, freshIsRunning, freshVersionHistoryItem, freshVersionedTransition, freshTransientTasks, freshErr :=
+				_, _, _, freshNextEventID, freshIsRunning, freshVersionHistoryItem, freshVersionedTransition, freshTransientTasks, freshWorkflowLease, freshErr :=
 					queryMutableState(namespaceID, execution, common.EmptyEventID,
-						continuationToken.BranchToken, continuationToken.VersionHistoryItem, continuationToken.VersionedTransition)
+						continuationToken.BranchToken, continuationToken.VersionHistoryItem, continuationToken.VersionedTransition, true)
 				if freshErr != nil {
 					return nil, freshErr
 				}
-				// A gap read can race with later workflow updates, so only use the terminal snapshot directly
-				// when no persisted gap must be fetched before it is appended.
-				hasFreshTerminalTransientTasks := freshIsRunning && freshNextEventID <= continuationToken.NextEventId
+				defer func() {
+					if freshWorkflowLease != nil {
+						freshWorkflowLease.GetReleaseFn()(retError)
+					}
+				}()
+
+				// A gap read can race with later workflow updates, so only use the terminal snapshot directly when no
+				// persisted gap must be fetched before it is appended. Keep its lease through appendTransientTasks so
+				// the response is built from one immutable workflow snapshot.
+				hasLockedTerminalTransientTasks := freshWorkflowLease != nil && freshIsRunning && freshNextEventID <= continuationToken.NextEventId
+				if !hasLockedTerminalTransientTasks && freshWorkflowLease != nil {
+					freshWorkflowLease.GetReleaseFn()(nil)
+					freshWorkflowLease = nil
+				}
 				if freshNextEventID > continuationToken.NextEventId {
 					// Events were committed to DB during pagination — fetch the gap.
 					if freshErr = fetchGapEvents(continuationToken.NextEventId, freshNextEventID, continuationToken.BranchToken); freshErr != nil {
@@ -495,9 +525,13 @@ func Invoke(
 					&historyBlob,
 					cachedTransientTasks,
 					freshTransientTasks,
-					hasFreshTerminalTransientTasks,
+					hasLockedTerminalTransientTasks,
 					continuationToken.NextEventId,
 				)
+				if freshWorkflowLease != nil {
+					freshWorkflowLease.GetReleaseFn()(nil)
+					freshWorkflowLease = nil
+				}
 			}
 
 			// here, for long pull on history events, we need to intercept the paging token from cassandra
