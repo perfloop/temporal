@@ -387,7 +387,7 @@ func (c *lru) calculateNewCacheSize(newEntrySize int, existingEntrySize int) int
 
 func (c *lru) deleteInternal(element *list.Element) {
 	entry := c.byAccess.Remove(element).(*entryImpl)
-	if c.pin && entry.refCount > 0 {
+	if entry.refCount > 0 {
 		c.pinnedEntryCount--
 	}
 	c.currSize -= entry.Size()
