@@ -150,10 +150,10 @@ func (b *EventStore) NumBufferedEvents() int {
 func (b *EventStore) SizeInBytesOfBufferedEvents() int {
 	size := 0
 	for _, ev := range b.dbBufferBatch {
-		size += proto.Size(ev)
+		size += bufferedEventProtoSize(ev)
 	}
 	for _, ev := range b.memBufferBatch {
-		size += proto.Size(ev)
+		size += bufferedEventProtoSize(ev)
 	}
 	return size
 }
