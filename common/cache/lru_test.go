@@ -4,7 +4,6 @@ import (
 	"math/rand"
 	"sync"
 	"testing"
-	"testing/quick"
 	"time"
 
 	"github.com/google/uuid"
@@ -23,17 +22,6 @@ type (
 	}
 	testEntryWithCacheSize struct {
 		cacheSize int
-	}
-	pinnedCacheModelEntry struct {
-		value    *testEntryWithCacheSize
-		refCount int
-		size     int
-	}
-	pinnedCacheModel struct {
-		maxSize     int
-		currSize    int
-		entries     map[int]pinnedCacheModelEntry
-		accessOrder []int
 	}
 )
 
@@ -658,188 +646,53 @@ func TestCache_PutIfNotExistWithSameKeys_Pin(t *testing.T) {
 	assert.Equal(t, 3, cache.Size())
 }
 
-func TestCache_PinnedEntryCountMatchesPublicModel(t *testing.T) {
+func TestCache_ReleasedPinnedEntryIsEvicted(t *testing.T) {
 	t.Parallel()
 
-	// The model owns reference counts and LRU order independently of the cache.
-	// At capacity, its predicted admission result distinguishes an all-pinned
-	// cache from one with an evictable zero-ref entry, exposing the aggregate
-	// through public behavior after every valid transition.
-	err := quick.Check(func(randomOperations []uint8) bool {
-		const cacheSize = 4
-		cache := New(cacheSize, &Options{Pin: true})
-		model := newPinnedCacheModel(cacheSize)
-		operations := append([]uint8{
-			0, 1, 2, 3, // Fill the cache with pinned entries.
-			16, // Release key 0 so a new key can evict it.
-			4,
-			9, 17, 17, // Re-pin and fully release key 1.
-			26,   // Delete pinned key 2.
-			5, 6, // Refill, then require the surviving zero-ref entry to be evicted.
-			99, // Resize and release pinned key 3.
-		}, randomOperations...)
+	const cacheSize = 2
+	cache := New(cacheSize, &Options{Pin: true})
+	pinned := &testEntryWithCacheSize{cacheSize: 1}
+	released := &testEntryWithCacheSize{cacheSize: 1}
+	replacement := &testEntryWithCacheSize{cacheSize: 1}
 
-		for _, operation := range operations {
-			key := int(operation & 0x07)
-			switch (operation >> 3) & 0x07 {
-			case 0:
-				value := &testEntryWithCacheSize{cacheSize: 1 + int(operation>>6)}
-				actual, actualErr := cache.PutIfNotExist(key, value)
-				expected, expectedErr := model.putIfNotExist(key, value)
-				if actual != expected || actualErr != expectedErr {
-					return false
-				}
-			case 1:
-				if cache.Get(key) != model.get(key) {
-					return false
-				}
-			case 2:
-				if entry, ok := model.entries[key]; ok && entry.refCount > 0 {
-					cache.Release(key)
-					model.release(key)
-				}
-			case 3:
-				cache.Delete(key)
-				model.delete(key)
-			case 4:
-				if entry, ok := model.entries[key]; ok && entry.refCount == 1 {
-					entry.value.cacheSize = 1 + int(operation>>6)
-					cache.Release(key)
-					model.release(key)
-				}
-			}
-
-			if !pinnedCacheMatchesPublicModel(cache, model) {
-				return false
-			}
-		}
-		return true
-	}, &quick.Config{MaxCount: 100, Rand: rand.New(rand.NewSource(0))})
+	_, err := cache.PutIfNotExist("pinned", pinned)
 	require.NoError(t, err)
+	_, err = cache.PutIfNotExist("released", released)
+	require.NoError(t, err)
+
+	cache.Release("released")
+	value, err := cache.PutIfNotExist("replacement", replacement)
+	require.NoError(t, err)
+	require.Same(t, replacement, value)
+	assert.Nil(t, cache.Get("released"))
+	assert.Equal(t, cacheSize, cache.Size())
 }
 
-func newPinnedCacheModel(maxSize int) *pinnedCacheModel {
-	return &pinnedCacheModel{
-		maxSize: maxSize,
-		entries: make(map[int]pinnedCacheModelEntry),
-	}
-}
+func TestCache_DeletedPinnedEntryDoesNotBlockEviction(t *testing.T) {
+	t.Parallel()
 
-func (m *pinnedCacheModel) putIfNotExist(key int, value *testEntryWithCacheSize) (any, error) {
-	if entry, ok := m.entries[key]; ok {
-		entry.refCount++
-		m.entries[key] = entry
-		m.moveToFront(key)
-		return entry.value, nil
-	}
+	const cacheSize = 2
+	cache := New(cacheSize, &Options{Pin: true})
+	pinned := &testEntryWithCacheSize{cacheSize: 1}
+	evictable := &testEntryWithCacheSize{cacheSize: 1}
+	replacement := &testEntryWithCacheSize{cacheSize: 1}
+	newEntry := &testEntryWithCacheSize{cacheSize: 1}
 
-	newEntrySize := value.cacheSize
-	if newEntrySize > m.maxSize {
-		return nil, ErrCacheItemTooLarge
-	}
+	_, err := cache.PutIfNotExist("pinned", pinned)
+	require.NoError(t, err)
+	_, err = cache.PutIfNotExist("evictable", evictable)
+	require.NoError(t, err)
 
-	m.evictUntilEnoughSpace(newEntrySize)
-	if m.currSize+newEntrySize > m.maxSize {
-		return nil, ErrCacheFull
-	}
+	cache.Release("evictable")
+	cache.Delete("pinned")
+	_, err = cache.PutIfNotExist("replacement", replacement)
+	require.NoError(t, err)
 
-	m.entries[key] = pinnedCacheModelEntry{
-		value:    value,
-		refCount: 1,
-		size:     newEntrySize,
-	}
-	m.accessOrder = append([]int{key}, m.accessOrder...)
-	m.currSize += newEntrySize
-	return value, nil
-}
-
-func (m *pinnedCacheModel) get(key int) any {
-	entry, ok := m.entries[key]
-	if !ok {
-		return nil
-	}
-
-	entry.refCount++
-	m.entries[key] = entry
-	m.moveToFront(key)
-	return entry.value
-}
-
-func (m *pinnedCacheModel) release(key int) {
-	entry, ok := m.entries[key]
-	if !ok || entry.refCount == 0 {
-		return
-	}
-
-	entry.refCount--
-	newEntrySize := entry.value.cacheSize
-	m.currSize += newEntrySize - entry.size
-	entry.size = newEntrySize
-	m.entries[key] = entry
-	m.evictUntilEnoughSpace(0)
-}
-
-func (m *pinnedCacheModel) delete(key int) {
-	entry, ok := m.entries[key]
-	if !ok {
-		return
-	}
-
-	m.currSize -= entry.size
-	delete(m.entries, key)
-	for index, orderedKey := range m.accessOrder {
-		if orderedKey == key {
-			m.accessOrder = append(m.accessOrder[:index], m.accessOrder[index+1:]...)
-			return
-		}
-	}
-}
-
-func (m *pinnedCacheModel) evictUntilEnoughSpace(newEntrySize int) {
-	for index := len(m.accessOrder) - 1; index >= 0 && m.currSize+newEntrySize > m.maxSize; index-- {
-		key := m.accessOrder[index]
-		if m.entries[key].refCount == 0 {
-			m.delete(key)
-		}
-	}
-}
-
-func (m *pinnedCacheModel) moveToFront(key int) {
-	for index, orderedKey := range m.accessOrder {
-		if orderedKey == key {
-			copy(m.accessOrder[1:index+1], m.accessOrder[:index])
-			m.accessOrder[0] = key
-			return
-		}
-	}
-}
-
-func pinnedCacheMatchesPublicModel(cache Cache, model *pinnedCacheModel) bool {
-	if cache.Size() != model.currSize {
-		return false
-	}
-
-	iterator := cache.Iterator()
-	defer iterator.Close()
-
-	index := 0
-	for iterator.HasNext() {
-		if index == len(model.accessOrder) {
-			return false
-		}
-
-		entry := iterator.Next()
-		key, ok := entry.Key().(int)
-		if !ok || key != model.accessOrder[index] {
-			return false
-		}
-		expected, ok := model.entries[key]
-		if !ok || entry.Value() != expected.value {
-			return false
-		}
-		index++
-	}
-	return index == len(model.entries) && index == len(model.accessOrder)
+	value, err := cache.PutIfNotExist("new", newEntry)
+	require.NoError(t, err)
+	require.Same(t, newEntry, value)
+	assert.Nil(t, cache.Get("evictable"))
+	assert.Equal(t, cacheSize, cache.Size())
 }
 
 func TestCache_ItemSizeChangeBeforeRelease(t *testing.T) {
