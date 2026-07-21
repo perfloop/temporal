@@ -647,11 +647,12 @@ func TestCache_PutIfNotExistWithSameKeys_Pin(t *testing.T) {
 	assert.Equal(t, 3, cache.Size())
 }
 
-func TestCache_PinnedEntryCountTracksPositiveReferences(t *testing.T) {
+func TestCache_PinnedLifecycleMatchesPublicModel(t *testing.T) {
 	t.Parallel()
 
 	err := quick.Check(func(randomOperations []uint8) bool {
-		cache := New(4, &Options{Pin: true}).(*lru)
+		cache := New(4, &Options{Pin: true})
+		model := newPinnedCacheModel(4)
 		operations := append([]uint8{
 			0, 1, 2, 3, // Fill the cache with pinned entries.
 			16, // Release key 0, then insert key 4 and evict key 0.
@@ -667,25 +668,33 @@ func TestCache_PinnedEntryCountTracksPositiveReferences(t *testing.T) {
 			key := int(operation & 0x07)
 			switch (operation >> 3) & 0x07 {
 			case 0:
-				_, err := cache.PutIfNotExist(key, &testEntryWithCacheSize{cacheSize: 1})
-				if err != nil && err != ErrCacheFull {
+				value := &testEntryWithCacheSize{cacheSize: 1 + int(operation>>6)}
+				actualValue, actualErr := cache.PutIfNotExist(key, value)
+				expectedValue, expectedErr := model.putIfNotExist(key, value)
+				if actualValue != expectedValue || actualErr != expectedErr {
 					return false
 				}
 			case 1:
-				cache.Get(key)
+				if cache.Get(key) != model.get(key) {
+					return false
+				}
 			case 2:
-				if cacheEntryRefCount(cache, key) > 0 {
+				if model.canRelease(key) {
 					cache.Release(key)
+					model.release(key)
 				}
 			case 3:
 				cache.Delete(key)
+				model.delete(key)
 			case 4:
-				if setPinnedEntrySize(cache, key, 1+int(operation>>6)) {
+				if model.canRelease(key) {
+					model.entries[key].value.cacheSize = 1 + int(operation>>6)
 					cache.Release(key)
+					model.release(key)
 				}
 			}
 
-			if !pinnedEntryCountMatchesRefCounts(cache) {
+			if !model.matches(cache) {
 				return false
 			}
 		}
@@ -694,44 +703,126 @@ func TestCache_PinnedEntryCountTracksPositiveReferences(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func cacheEntryRefCount(cache *lru, key int) int {
-	cache.mut.Lock()
-	defer cache.mut.Unlock()
-
-	element := cache.byKey[key]
-	if element == nil {
-		return 0
-	}
-	return element.Value.(*entryImpl).refCount
+type pinnedCacheModel struct {
+	entries map[int]*pinnedCacheModelEntry
+	order   []int
+	size    int
+	maxSize int
 }
 
-func setPinnedEntrySize(cache *lru, key int, size int) bool {
-	cache.mut.Lock()
-	defer cache.mut.Unlock()
-
-	element := cache.byKey[key]
-	if element == nil {
-		return false
-	}
-	entry := element.Value.(*entryImpl)
-	if entry.refCount <= 0 {
-		return false
-	}
-	entry.value.(*testEntryWithCacheSize).cacheSize = size
-	return true
+type pinnedCacheModelEntry struct {
+	value *testEntryWithCacheSize
+	refs  int
+	size  int
 }
 
-func pinnedEntryCountMatchesRefCounts(cache *lru) bool {
-	cache.mut.Lock()
-	defer cache.mut.Unlock()
+func newPinnedCacheModel(maxSize int) *pinnedCacheModel {
+	return &pinnedCacheModel{
+		entries: make(map[int]*pinnedCacheModelEntry),
+		maxSize: maxSize,
+	}
+}
 
-	pinnedEntryCount := 0
-	for element := cache.byAccess.Front(); element != nil; element = element.Next() {
-		if element.Value.(*entryImpl).refCount > 0 {
-			pinnedEntryCount++
+func (m *pinnedCacheModel) putIfNotExist(key int, value *testEntryWithCacheSize) (any, error) {
+	if entry := m.entries[key]; entry != nil {
+		entry.refs++
+		m.touch(key)
+		return entry.value, nil
+	}
+	if value.cacheSize > m.maxSize {
+		return nil, ErrCacheItemTooLarge
+	}
+
+	m.evictUntilFits(value.cacheSize)
+	if m.size+value.cacheSize > m.maxSize {
+		return nil, ErrCacheFull
+	}
+
+	m.entries[key] = &pinnedCacheModelEntry{
+		value: value,
+		refs:  1,
+		size:  value.cacheSize,
+	}
+	m.order = append([]int{key}, m.order...)
+	m.size += value.cacheSize
+	return value, nil
+}
+
+func (m *pinnedCacheModel) get(key int) any {
+	entry := m.entries[key]
+	if entry == nil {
+		return nil
+	}
+	entry.refs++
+	m.touch(key)
+	return entry.value
+}
+
+func (m *pinnedCacheModel) canRelease(key int) bool {
+	entry := m.entries[key]
+	return entry != nil && entry.refs > 0
+}
+
+func (m *pinnedCacheModel) release(key int) {
+	entry := m.entries[key]
+	entry.refs--
+	m.size += entry.value.cacheSize - entry.size
+	entry.size = entry.value.cacheSize
+	m.evictUntilFits(0)
+}
+
+func (m *pinnedCacheModel) delete(key int) {
+	for index, candidate := range m.order {
+		if candidate == key {
+			m.removeAt(index)
+			return
 		}
 	}
-	return cache.pinnedEntryCount == pinnedEntryCount
+}
+
+func (m *pinnedCacheModel) evictUntilFits(newEntrySize int) {
+	for index := len(m.order) - 1; m.size+newEntrySize > m.maxSize && index >= 0; index-- {
+		if m.entries[m.order[index]].refs == 0 {
+			m.removeAt(index)
+		}
+	}
+}
+
+func (m *pinnedCacheModel) removeAt(index int) {
+	key := m.order[index]
+	m.size -= m.entries[key].size
+	delete(m.entries, key)
+	copy(m.order[index:], m.order[index+1:])
+	m.order = m.order[:len(m.order)-1]
+}
+
+func (m *pinnedCacheModel) touch(key int) {
+	for index, candidate := range m.order {
+		if candidate == key {
+			copy(m.order[1:index+1], m.order[:index])
+			m.order[0] = key
+			return
+		}
+	}
+}
+
+func (m *pinnedCacheModel) matches(cache Cache) bool {
+	if cache.Size() != m.size {
+		return false
+	}
+
+	iterator := cache.Iterator()
+	defer iterator.Close()
+	for _, key := range m.order {
+		if !iterator.HasNext() {
+			return false
+		}
+		entry := iterator.Next()
+		if entry.Key() != key || entry.Value() != m.entries[key].value {
+			return false
+		}
+	}
+	return !iterator.HasNext()
 }
 
 func TestCache_DeletedPinnedEntryDoesNotBlockEviction(t *testing.T) {
