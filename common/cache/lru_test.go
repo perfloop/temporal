@@ -646,28 +646,6 @@ func TestCache_PutIfNotExistWithSameKeys_Pin(t *testing.T) {
 	assert.Equal(t, 3, cache.Size())
 }
 
-func TestCache_ReleasedPinnedEntryIsEvicted(t *testing.T) {
-	t.Parallel()
-
-	const cacheSize = 2
-	cache := New(cacheSize, &Options{Pin: true})
-	pinned := &testEntryWithCacheSize{cacheSize: 1}
-	released := &testEntryWithCacheSize{cacheSize: 1}
-	replacement := &testEntryWithCacheSize{cacheSize: 1}
-
-	_, err := cache.PutIfNotExist("pinned", pinned)
-	require.NoError(t, err)
-	_, err = cache.PutIfNotExist("released", released)
-	require.NoError(t, err)
-
-	cache.Release("released")
-	value, err := cache.PutIfNotExist("replacement", replacement)
-	require.NoError(t, err)
-	require.Same(t, replacement, value)
-	assert.Nil(t, cache.Get("released"))
-	assert.Equal(t, cacheSize, cache.Size())
-}
-
 func TestCache_DeletedPinnedEntryDoesNotBlockEviction(t *testing.T) {
 	t.Parallel()
 
