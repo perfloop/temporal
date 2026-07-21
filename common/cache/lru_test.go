@@ -673,7 +673,7 @@ func TestCache_DeletedPinnedEntryDoesNotBlockEviction(t *testing.T) {
 	assert.Equal(t, cacheSize, cache.Size())
 }
 
-func TestCache_FailedPinnedInsertEvictsReleasedZeroSizeEntry(t *testing.T) {
+func TestCache_FullPinnedCacheEvictsReleasedZeroSizeEntry(t *testing.T) {
 	t.Parallel()
 
 	cache := New(1, &Options{Pin: true})
@@ -685,7 +685,11 @@ func TestCache_FailedPinnedInsertEvictsReleasedZeroSizeEntry(t *testing.T) {
 	_, err = cache.PutIfNotExist("released-zero-size", releasedZeroSize)
 	require.NoError(t, err)
 	cache.Release("released-zero-size")
+	assert.Equal(t, 1, cache.Size())
 
+	// The released zero-size entry remains evictable even though the pinned
+	// entry occupies the cache's full capacity. It must be removed before the
+	// new entry is rejected for lack of evictable capacity.
 	value, err := cache.PutIfNotExist("new", &testEntryWithCacheSize{cacheSize: 1})
 	require.ErrorIs(t, err, ErrCacheFull)
 	assert.Nil(t, value)
