@@ -29,10 +29,10 @@ import (
 	historyi "go.temporal.io/server/service/history/interfaces"
 )
 
-// appendTransientEvents queries mutable state for transient/speculative events and appends them to the response.
-// This function attempts to use cached transient tasks from the initial mutable state call to avoid a second call.
-// If cached tasks are nil or stale (validation fails), it falls back to querying mutable state.
-// Validation of event IDs is handled by validateTransientWorkflowTaskEvents.
+// appendTransientTasks queries mutable state for transient/speculative events and appends them to the response.
+// It prefers a no-gap terminal-page freshness snapshot when available, including a known-empty snapshot,
+// before falling back to cached tasks or another mutable-state query. Validation of event IDs is handled
+// by ValidateTransientWorkflowTaskEvents.
 func appendTransientTasks(
 	ctx context.Context,
 	shardContext historyi.ShardContext,
@@ -45,6 +45,8 @@ func appendTransientTasks(
 	history *historypb.History,
 	historyBlob *[]*commonpb.DataBlob,
 	cachedTransientTasks *historyspb.TransientWorkflowTaskInfo,
+	freshTransientTasks *historyspb.TransientWorkflowTaskInfo,
+	hasFreshTerminalTransientTasks bool,
 	nextEventID int64,
 ) {
 	if !shardContext.GetConfig().SendTransientOrSpeculativeWorkflowTaskEvents(namespaceName) {
@@ -58,6 +60,11 @@ func appendTransientTasks(
 
 	var transientWorkflowTask *historyspb.TransientWorkflowTaskInfo
 
+	// A no-gap terminal-page freshness query is authoritative, including when it found no transient tasks.
+	if hasFreshTerminalTransientTasks {
+		cachedTransientTasks = freshTransientTasks
+	}
+
 	// Try cached tasks first
 	if cachedTransientTasks != nil {
 		// Validate cached tasks are still valid (not stale)
@@ -66,7 +73,12 @@ func appendTransientTasks(
 		}
 	}
 
-	// If no valid cache, fetch fresh from mutable state
+	// A known terminal snapshot is sufficient even when it was empty or its suffix was invalid.
+	if transientWorkflowTask == nil && hasFreshTerminalTransientTasks {
+		return
+	}
+
+	// If no valid cache, fetch fresh from mutable state.
 	if transientWorkflowTask == nil {
 		msResp, err := api.GetOrPollWorkflowMutableState(
 			ctx,
@@ -453,6 +465,9 @@ func Invoke(
 				if freshErr != nil {
 					return nil, freshErr
 				}
+				// A gap read can race with later workflow updates, so only use the terminal snapshot directly
+				// when no persisted gap must be fetched before it is appended.
+				hasFreshTerminalTransientTasks := freshIsRunning && freshNextEventID <= continuationToken.NextEventId
 				if freshNextEventID > continuationToken.NextEventId {
 					// Events were committed to DB during pagination — fetch the gap.
 					if freshErr = fetchGapEvents(continuationToken.NextEventId, freshNextEventID, continuationToken.BranchToken); freshErr != nil {
@@ -479,6 +494,8 @@ func Invoke(
 					history,
 					&historyBlob,
 					cachedTransientTasks,
+					freshTransientTasks,
+					hasFreshTerminalTransientTasks,
 					continuationToken.NextEventId,
 				)
 			}
