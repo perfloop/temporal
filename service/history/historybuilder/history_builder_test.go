@@ -2397,20 +2397,121 @@ func (s *historyBuilderSuite) TestBufferSize_Memory() {
 }
 
 func (s *historyBuilderSuite) TestBufferSize_DB() {
-	s.Assert().Zero(s.historyBuilder.NumBufferedEvents())
-	s.Assert().Zero(s.historyBuilder.SizeInBytesOfBufferedEvents())
-	s.historyBuilder.dbBufferBatch = []*historypb.HistoryEvent{{
+	dbBufferBatch := []*historypb.HistoryEvent{{
 		EventType: enumspb.EVENT_TYPE_TIMER_FIRED,
 		EventId:   common.BufferedEventID,
 		TaskId:    common.EmptyEventTaskID,
 	}}
+	s.historyBuilder = New(
+		s.mockTimeSource,
+		s.taskIDGenerator,
+		s.version,
+		s.nextEventID,
+		dbBufferBatch,
+		metrics.NoopMetricsHandler,
+		tests.NewDynamicConfig().MaximumEventBatchSizeInBytes,
+	)
+
 	s.Assert().Equal(1, s.historyBuilder.NumBufferedEvents())
-	// the size of the proto  is non-deterministic, so just assert that it's non-zero, and it isn't really high
+	// the size of the proto is non-deterministic, so just assert that it's non-zero, and it isn't really high
 	s.Assert().Greater(s.historyBuilder.SizeInBytesOfBufferedEvents(), 0)
 	s.Assert().Less(s.historyBuilder.SizeInBytesOfBufferedEvents(), 100)
 	s.flush()
 	s.Assert().Zero(s.historyBuilder.NumBufferedEvents())
 	s.Assert().Zero(s.historyBuilder.SizeInBytesOfBufferedEvents())
+}
+
+func (s *historyBuilderSuite) TestBufferedEventBatchSnapshotsCallerMutation() {
+	callerEvent := makeBufferedEvent(1)
+	batch := NewBufferedEventBatch([]*historypb.HistoryEvent{callerEvent})
+	wantSize := proto.Size(callerEvent)
+
+	callerEvent.GetWorkflowExecutionSignaledEventAttributes().SignalName = strings.Repeat("changed", 100)
+	s.historyBuilder = NewWithBufferedEventBatch(
+		s.mockTimeSource,
+		s.taskIDGenerator,
+		s.version,
+		s.nextEventID,
+		batch,
+		metrics.NoopMetricsHandler,
+		tests.NewDynamicConfig().MaximumEventBatchSizeInBytes,
+	)
+
+	s.Equal(wantSize, s.historyBuilder.SizeInBytesOfBufferedEvents())
+	s.Equal("s", s.historyBuilder.dbBufferBatch[0].GetWorkflowExecutionSignaledEventAttributes().GetSignalName())
+}
+
+func (s *historyBuilderSuite) TestBufferedEventBatchTracksTimerRemovalAcrossBuilders() {
+	batch := NewBufferedEventBatch(nil)
+	newBuilder := func() *HistoryBuilder {
+		return NewWithBufferedEventBatch(
+			s.mockTimeSource,
+			s.taskIDGenerator,
+			s.version,
+			s.nextEventID,
+			batch,
+			metrics.NoopMetricsHandler,
+			tests.NewDynamicConfig().MaximumEventBatchSizeInBytes,
+		)
+	}
+
+	seed := newBuilder()
+	firstTimer := seed.AddTimerFiredEvent(1, "first")
+	seed.AddTimerFiredEvent(1, "second")
+	_, err := seed.Finish(false)
+	s.NoError(err)
+
+	builder := newBuilder()
+	s.Same(firstTimer, builder.GetAndRemoveTimerFireEvent("first"))
+
+	reused := newBuilder()
+	s.Nil(reused.GetAndRemoveTimerFireEvent("first"))
+	s.Equal(1, reused.NumBufferedEvents())
+	s.Equal("second", reused.dbBufferBatch[0].GetTimerFiredEventAttributes().GetTimerId())
+	s.Equal(eventsSizeInBytes(reused.dbBufferBatch), reused.SizeInBytesOfBufferedEvents())
+}
+
+func (s *historyBuilderSuite) TestBufferedEventBatchRefreshesNewEventsBeforeReuse() {
+	batch := NewBufferedEventBatch(nil)
+	newBuilder := func() *HistoryBuilder {
+		return NewWithBufferedEventBatch(
+			s.mockTimeSource,
+			s.taskIDGenerator,
+			s.version,
+			s.nextEventID,
+			batch,
+			metrics.NoopMetricsHandler,
+			tests.NewDynamicConfig().MaximumEventBatchSizeInBytes,
+		)
+	}
+
+	builder := newBuilder()
+	builder.AddTimerFiredEvent(1, "refresh")
+	mutation, err := builder.Finish(false)
+	s.NoError(err)
+	mutation.MemBufferBatch[0].Principal = &commonpb.Principal{Name: strings.Repeat("changed", 100)}
+
+	reused := newBuilder()
+	batch.UpdateNewEventsSize()
+	s.Equal(eventsSizeInBytes(reused.dbBufferBatch), reused.SizeInBytesOfBufferedEvents())
+}
+
+func (s *historyBuilderSuite) TestNewSnapshotsCallerOwnedBufferedEvents() {
+	callerEvent := makeBufferedEvent(1)
+	wantSize := proto.Size(callerEvent)
+	s.historyBuilder = New(
+		s.mockTimeSource,
+		s.taskIDGenerator,
+		s.version,
+		s.nextEventID,
+		[]*historypb.HistoryEvent{callerEvent},
+		metrics.NoopMetricsHandler,
+		tests.NewDynamicConfig().MaximumEventBatchSizeInBytes,
+	)
+
+	callerEvent.GetWorkflowExecutionSignaledEventAttributes().SignalName = strings.Repeat("changed", 100)
+	s.Equal(wantSize, s.historyBuilder.SizeInBytesOfBufferedEvents())
+	s.Equal("s", s.historyBuilder.dbBufferBatch[0].GetWorkflowExecutionSignaledEventAttributes().GetSignalName())
 }
 
 func (s *historyBuilderSuite) TestLastEventVersion() {

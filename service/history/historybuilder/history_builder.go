@@ -20,6 +20,7 @@ import (
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/namespace"
 	"go.temporal.io/server/common/worker_versioning"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 )
 
@@ -52,17 +53,146 @@ type (
 		RequestIDToEventID map[string]int64
 	}
 
+	// BufferedEventBatch owns buffered events together with their serialized size.
+	// Its fields are kept private so a HistoryBuilder cannot receive mismatched
+	// events and aggregate size.
+	BufferedEventBatch struct {
+		events        []*historypb.HistoryEvent
+		size          int
+		newEvents     []*historypb.HistoryEvent
+		newEventsSize int
+	}
+
 	TaskIDGenerator func(number int) ([]int64, error)
 
 	BufferedEventFilter = func(*historypb.HistoryEvent) bool
 )
 
+// New snapshots dbBufferBatch before caching its serialized size, so later
+// mutations of the caller-owned input cannot affect the cached aggregate.
 func New(
 	timeSource clock.TimeSource,
 	taskIDGenerator TaskIDGenerator,
 	version int64,
 	nextEventID int64,
 	dbBufferBatch []*historypb.HistoryEvent,
+	metricsHandler metrics.Handler,
+	maxEventBatchSizeInBytes dynamicconfig.IntPropertyFn,
+) *HistoryBuilder {
+	ownedEvents, sourceEvents := snapshotHistoryEvents(dbBufferBatch)
+	bufferedEventsSize := eventsSizeInBytes(ownedEvents)
+	bufferedEventBatch := newBufferedEventBatch(ownedEvents, bufferedEventsSize, nil, 0)
+	return newHistoryBuilderWithBufferedEvents(
+		timeSource,
+		taskIDGenerator,
+		version,
+		nextEventID,
+		ownedEvents,
+		bufferedEventsSize,
+		sourceEvents,
+		bufferedEventBatch,
+		metricsHandler,
+		maxEventBatchSizeInBytes,
+	)
+}
+
+// NewBufferedEventBatch snapshots events and derives their serialized size so
+// callers cannot invalidate the aggregate by mutating their input after setup.
+func NewBufferedEventBatch(events []*historypb.HistoryEvent) *BufferedEventBatch {
+	ownedEvents := cloneHistoryEvents(events)
+	return newBufferedEventBatch(ownedEvents, eventsSizeInBytes(ownedEvents), nil, 0)
+}
+
+// UpdateNewEventsSize refreshes the aggregate after callers mutate events that
+// were added in the HistoryBuilder lifecycle that produced this batch.
+func (b *BufferedEventBatch) UpdateNewEventsSize() {
+	newEventsSize := eventsSizeInBytes(b.newEvents)
+	b.size += newEventsSize - b.newEventsSize
+	b.newEventsSize = newEventsSize
+}
+
+// NewWithBufferedEventBatch creates a HistoryBuilder from a batch that owns
+// both the buffered events and their exact serialized-size aggregate. Buffered
+// event mutations made through the builder are synchronized back to the batch
+// so it remains valid for a later builder lifecycle. Any pending new-event
+// size is refreshed before the batch is reused.
+func NewWithBufferedEventBatch(
+	timeSource clock.TimeSource,
+	taskIDGenerator TaskIDGenerator,
+	version int64,
+	nextEventID int64,
+	bufferedEvents *BufferedEventBatch,
+	metricsHandler metrics.Handler,
+	maxEventBatchSizeInBytes dynamicconfig.IntPropertyFn,
+) *HistoryBuilder {
+	if bufferedEvents == nil {
+		bufferedEvents = NewBufferedEventBatch(nil)
+	}
+	bufferedEvents.UpdateNewEventsSize()
+	return newHistoryBuilderWithBufferedEvents(
+		timeSource,
+		taskIDGenerator,
+		version,
+		nextEventID,
+		bufferedEvents.events,
+		bufferedEvents.size,
+		nil,
+		bufferedEvents,
+		metricsHandler,
+		maxEventBatchSizeInBytes,
+	)
+}
+
+func cloneHistoryEvents(events []*historypb.HistoryEvent) []*historypb.HistoryEvent {
+	if events == nil {
+		return nil
+	}
+	ownedEvents := make([]*historypb.HistoryEvent, len(events))
+	for i, event := range events {
+		if event != nil {
+			ownedEvents[i] = proto.Clone(event).(*historypb.HistoryEvent)
+		}
+	}
+	return ownedEvents
+}
+
+func snapshotHistoryEvents(events []*historypb.HistoryEvent) ([]*historypb.HistoryEvent, map[*historypb.HistoryEvent]*historypb.HistoryEvent) {
+	ownedEvents := cloneHistoryEvents(events)
+	var sourceEvents map[*historypb.HistoryEvent]*historypb.HistoryEvent
+	for i, event := range events {
+		if event != nil {
+			if sourceEvents == nil {
+				sourceEvents = make(map[*historypb.HistoryEvent]*historypb.HistoryEvent, len(events))
+			}
+			sourceEvents[ownedEvents[i]] = event
+		}
+	}
+	return ownedEvents, sourceEvents
+}
+
+func newBufferedEventBatch(
+	events []*historypb.HistoryEvent,
+	size int,
+	newEvents []*historypb.HistoryEvent,
+	newEventsSize int,
+) *BufferedEventBatch {
+	return &BufferedEventBatch{
+		events:        events,
+		size:          size,
+		newEvents:     newEvents,
+		newEventsSize: newEventsSize,
+	}
+}
+
+func newHistoryBuilderWithBufferedEvents(
+	timeSource clock.TimeSource,
+	taskIDGenerator TaskIDGenerator,
+	version int64,
+	nextEventID int64,
+	dbBufferBatch []*historypb.HistoryEvent,
+	bufferedEventsSize int,
+	sourceEvents map[*historypb.HistoryEvent]*historypb.HistoryEvent,
+	bufferedEventBatch *BufferedEventBatch,
 	metricsHandler metrics.Handler,
 	maxEventBatchSizeInBytes dynamicconfig.IntPropertyFn,
 ) *HistoryBuilder {
@@ -79,6 +209,9 @@ func New(
 
 			dbBufferBatch:          dbBufferBatch,
 			dbClearBuffer:          false,
+			bufferedEventsSize:     bufferedEventsSize,
+			sourceEvents:           sourceEvents,
+			bufferedEventBatch:     bufferedEventBatch,
 			memEventsBatches:       nil,
 			memLatestBatch:         nil,
 			memBufferBatch:         nil,

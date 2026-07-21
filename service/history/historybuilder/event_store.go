@@ -27,10 +27,27 @@ type EventStore struct {
 	dbBufferBatch []*historypb.HistoryEvent
 	dbClearBuffer bool
 
+	// Cumulative serialized size in bytes of events in dbBufferBatch and memBufferBatch.
+	bufferedEventsSize int
+
+	// sourceEvents preserves legacy New's returned-event identity while the
+	// store itself operates on its owned snapshots.
+	sourceEvents map[*historypb.HistoryEvent]*historypb.HistoryEvent
+
+	// bufferedEventBatch is the reusable, owned aggregate synchronized with
+	// every buffered-event mutation made by this store.
+	bufferedEventBatch *BufferedEventBatch
+
 	// in mem events
 	memEventsBatches [][]*historypb.HistoryEvent
 	memLatestBatch   []*historypb.HistoryEvent
 	memBufferBatch   []*historypb.HistoryEvent
+
+	// Cumulative serialized size in bytes of events in memBufferBatch.
+	memBufferBatchSize int
+
+	// Buffered events retained when Finish seals this store.
+	finishedBufferedEvents *BufferedEventBatch
 
 	// Cumulative serialized size in bytes of events currently in memLatestBatch.
 	// When appending the next event would push this above
@@ -96,7 +113,11 @@ func (b *EventStore) add(
 	batchID := common.EmptyEventID
 	if b.bufferEvent(event.GetEventType()) {
 		event.EventId = common.BufferedEventID
+		eventSize := proto.Size(event)
 		b.memBufferBatch = append(b.memBufferBatch, event)
+		b.bufferedEventsSize += eventSize
+		b.memBufferBatchSize += eventSize
+		b.appendToBufferedEventBatch(event)
 	} else {
 		event.EventId = b.AllocateEventID()
 		b.appendToLatestBatch(event)
@@ -148,14 +169,57 @@ func (b *EventStore) NumBufferedEvents() int {
 }
 
 func (b *EventStore) SizeInBytesOfBufferedEvents() int {
+	return b.bufferedEventsSize
+}
+
+// BufferedEventsAfterFinish returns the buffered-event batch retained by the
+// most recent successful Finish call.
+func (b *EventStore) BufferedEventsAfterFinish() *BufferedEventBatch {
+	return b.finishedBufferedEvents
+}
+
+func eventsSizeInBytes(events []*historypb.HistoryEvent) int {
 	size := 0
-	for _, ev := range b.dbBufferBatch {
-		size += proto.Size(ev)
-	}
-	for _, ev := range b.memBufferBatch {
-		size += proto.Size(ev)
+	for _, event := range events {
+		size += proto.Size(event)
 	}
 	return size
+}
+
+func (b *EventStore) appendToBufferedEventBatch(event *historypb.HistoryEvent) {
+	if b.bufferedEventBatch == nil {
+		return
+	}
+	b.bufferedEventBatch.events = append(b.bufferedEventBatch.events, event)
+	b.bufferedEventBatch.size = b.bufferedEventsSize
+	b.bufferedEventBatch.newEvents = b.memBufferBatch
+	b.bufferedEventBatch.newEventsSize = b.memBufferBatchSize
+}
+
+func (b *EventStore) syncBufferedEventBatch() {
+	if b.bufferedEventBatch == nil {
+		return
+	}
+	var events []*historypb.HistoryEvent
+	if len(b.dbBufferBatch)+len(b.memBufferBatch) != 0 {
+		events = make([]*historypb.HistoryEvent, 0, len(b.dbBufferBatch)+len(b.memBufferBatch))
+		events = append(events, b.dbBufferBatch...)
+		events = append(events, b.memBufferBatch...)
+	}
+	b.bufferedEventBatch.events = events
+	b.bufferedEventBatch.size = b.bufferedEventsSize
+	b.bufferedEventBatch.newEvents = b.memBufferBatch
+	b.bufferedEventBatch.newEventsSize = b.memBufferBatchSize
+}
+
+func (b *EventStore) clearBufferedEventBatch() {
+	if b.bufferedEventBatch == nil {
+		return
+	}
+	b.bufferedEventBatch.events = nil
+	b.bufferedEventBatch.size = 0
+	b.bufferedEventBatch.newEvents = nil
+	b.bufferedEventBatch.newEventsSize = 0
 }
 
 func (b *EventStore) FlushBufferToCurrentBatch() (map[int64]int64, map[string]int64) {
@@ -172,6 +236,9 @@ func (b *EventStore) FlushBufferToCurrentBatch() (map[int64]int64, map[string]in
 		// above will generate 2 then 1
 		b.dbBufferBatch = nil
 		b.memBufferBatch = nil
+		b.bufferedEventsSize = 0
+		b.memBufferBatchSize = 0
+		b.clearBufferedEventBatch()
 		return b.scheduledIDToStartedID, b.requestIDToEventID
 	}
 
@@ -179,6 +246,9 @@ func (b *EventStore) FlushBufferToCurrentBatch() (map[int64]int64, map[string]in
 	bufferBatch := append(b.dbBufferBatch, b.memBufferBatch...)
 	b.dbBufferBatch = nil
 	b.memBufferBatch = nil
+	b.bufferedEventsSize = 0
+	b.memBufferBatchSize = 0
+	b.clearBufferedEventBatch()
 
 	// 0th reorder events in case casandra reorder the buffered events
 	// TODO eventually remove this ordering
@@ -227,6 +297,20 @@ func (b *EventStore) Finish(
 	dbBufferBatch := b.memBufferBatch
 	memBufferBatch := b.dbBufferBatch
 	memBufferBatch = append(memBufferBatch, dbBufferBatch...)
+	finishedBufferedEvents := b.bufferedEventBatch
+	if finishedBufferedEvents == nil {
+		finishedBufferedEvents = newBufferedEventBatch(
+			memBufferBatch,
+			b.bufferedEventsSize,
+			dbBufferBatch,
+			b.memBufferBatchSize,
+		)
+	} else {
+		finishedBufferedEvents.events = memBufferBatch
+		finishedBufferedEvents.size = b.bufferedEventsSize
+		finishedBufferedEvents.newEvents = dbBufferBatch
+		finishedBufferedEvents.newEventsSize = b.memBufferBatchSize
+	}
 	scheduledIDToStartedID := b.scheduledIDToStartedID
 	requestIDToEventID := b.requestIDToEventID
 
@@ -236,11 +320,14 @@ func (b *EventStore) Finish(
 	b.memLatestBatchSize = 0
 	b.dbClearBuffer = false
 	b.dbBufferBatch = nil
+	b.bufferedEventsSize = 0
+	b.memBufferBatchSize = 0
 	b.scheduledIDToStartedID = nil
 
 	if err := b.assignTaskIDs(dbEventsBatches); err != nil {
 		return nil, err
 	}
+	b.finishedBufferedEvents = finishedBufferedEvents
 
 	return &HistoryMutation{
 		DBEventsBatches:        dbEventsBatches,
@@ -611,17 +698,30 @@ func (b *EventStore) GetAndRemoveTimerFireEvent(
 
 	b.dbBufferBatch, timerFireEvent = deleteTimerFiredEvent(timerID, b.dbBufferBatch)
 	if timerFireEvent != nil {
+		b.bufferedEventsSize -= proto.Size(timerFireEvent)
 		b.dbClearBuffer = true
-		return timerFireEvent
+		b.syncBufferedEventBatch()
+		return b.sourceEvent(timerFireEvent)
 	}
 
 	b.memBufferBatch, timerFireEvent = deleteTimerFiredEvent(timerID, b.memBufferBatch)
 	if timerFireEvent != nil {
+		timerFireEventSize := proto.Size(timerFireEvent)
+		b.bufferedEventsSize -= timerFireEventSize
+		b.memBufferBatchSize -= timerFireEventSize
 		b.dbClearBuffer = true
-		return timerFireEvent
+		b.syncBufferedEventBatch()
+		return b.sourceEvent(timerFireEvent)
 	}
 
 	return nil
+}
+
+func (b *EventStore) sourceEvent(event *historypb.HistoryEvent) *historypb.HistoryEvent {
+	if sourceEvent, ok := b.sourceEvents[event]; ok {
+		return sourceEvent
+	}
+	return event
 }
 
 func deleteTimerFiredEvent(
