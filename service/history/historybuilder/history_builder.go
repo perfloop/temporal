@@ -44,8 +44,6 @@ type (
 		DBBufferBatch []*historypb.HistoryEvent
 		// whether to clear buffer events on DB
 		DBClearBuffer bool
-		// accumulated buffered events, equal to all buffer events from execution table
-		MemBufferBatch []*historypb.HistoryEvent
 		// scheduled to started event ID mapping for flushed buffered event
 		ScheduledIDToStartedID map[int64]int64
 		// request id to event ID mapping for flushed buffered event
@@ -66,6 +64,31 @@ func New(
 	metricsHandler metrics.Handler,
 	maxEventBatchSizeInBytes dynamicconfig.IntPropertyFn,
 ) *HistoryBuilder {
+	return NewWithBufferedEventBatch(
+		timeSource,
+		taskIDGenerator,
+		version,
+		nextEventID,
+		NewBufferedEventBatch(dbBufferBatch),
+		metricsHandler,
+		maxEventBatchSizeInBytes,
+	)
+}
+
+// NewWithBufferedEventBatch rebuilds a builder from the cache-owned buffered
+// batch carried by MutableStateImpl between transactions.
+func NewWithBufferedEventBatch(
+	timeSource clock.TimeSource,
+	taskIDGenerator TaskIDGenerator,
+	version int64,
+	nextEventID int64,
+	bufferedEventBatch *BufferedEventBatch,
+	metricsHandler metrics.Handler,
+	maxEventBatchSizeInBytes dynamicconfig.IntPropertyFn,
+) *HistoryBuilder {
+	if bufferedEventBatch == nil {
+		bufferedEventBatch = NewBufferedEventBatch(nil)
+	}
 	return &HistoryBuilder{
 		EventStore: EventStore{
 			state:           HistoryBuilderStateMutable,
@@ -77,7 +100,8 @@ func New(
 
 			workflowFinished: false,
 
-			dbBufferBatch:          dbBufferBatch,
+			dbBufferBatch:          bufferedEventBatch.events,
+			bufferedEventSize:      bufferedEventBatch.size,
 			dbClearBuffer:          false,
 			memEventsBatches:       nil,
 			memLatestBatch:         nil,

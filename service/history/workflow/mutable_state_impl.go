@@ -168,8 +168,8 @@ type (
 		chasmNodeSizes  map[string]int // chasm node path -> key + node size in bytes
 		// Total number of tomestones tracked in mutable state
 		totalTombstones int
-		// Buffer events from DB
-		bufferEventsInDB []*historypb.HistoryEvent
+		// Cache-owned persisted buffered events carried across transactions.
+		bufferedEventBatch *historybuilder.BufferedEventBatch
 		// Indicates the workflow state in DB, can be used to calculate
 		// whether this workflow is pointed by current workflow record.
 		stateInDB enumsspb.WorkflowExecutionState
@@ -345,7 +345,7 @@ func NewMutableState(
 		chasmNodeSizes:               make(map[string]int),
 		totalTombstones:              0,
 		currentVersion:               namespaceEntry.FailoverVersion(workflowID),
-		bufferEventsInDB:             nil,
+		bufferedEventBatch:           historybuilder.NewBufferedEventBatch(nil),
 		stateInDB:                    enumsspb.WORKFLOW_EXECUTION_STATE_VOID,
 		nextEventIDInDB:              common.FirstEventID,
 		dbRecordVersion:              1,
@@ -406,12 +406,12 @@ func NewMutableState(
 	}
 	s.approximateSize += s.executionState.Size()
 
-	s.hBuilder = historybuilder.New(
+	s.hBuilder = historybuilder.NewWithBufferedEventBatch(
 		s.timeSource,
 		s.shard.GenerateTaskIDs,
 		s.currentVersion,
 		common.FirstEventID,
-		s.bufferEventsInDB,
+		s.bufferedEventBatch,
 		s.metricsHandler,
 		s.config.MaximumEventBatchSizeInBytes,
 	)
@@ -532,17 +532,17 @@ func NewMutableStateFromDB(
 		mutableState.executionState.StartTime = dbRecord.ExecutionInfo.StartTime
 	}
 
-	mutableState.hBuilder = historybuilder.New(
+	mutableState.bufferedEventBatch = historybuilder.NewBufferedEventBatch(dbRecord.BufferedEvents)
+	mutableState.hBuilder = historybuilder.NewWithBufferedEventBatch(
 		mutableState.timeSource,
 		mutableState.shard.GenerateTaskIDs,
 		common.EmptyVersion,
 		dbRecord.NextEventId,
-		dbRecord.BufferedEvents,
+		mutableState.bufferedEventBatch,
 		mutableState.metricsHandler,
 		mutableState.config.MaximumEventBatchSizeInBytes,
 	)
 	mutableState.currentVersion = common.EmptyVersion
-	mutableState.bufferEventsInDB = dbRecord.BufferedEvents
 	mutableState.stateInDB = dbRecord.ExecutionState.State
 	mutableState.nextEventIDInDB = dbRecord.NextEventId
 	mutableState.dbRecordVersion = dbRecordVersion
@@ -983,7 +983,7 @@ func (ms *MutableStateImpl) CloneToProto() *persistencespb.WorkflowMutableState 
 		ExecutionInfo:       ms.executionInfo,
 		ExecutionState:      ms.executionState,
 		NextEventId:         ms.hBuilder.NextEventID(),
-		BufferedEvents:      ms.bufferEventsInDB,
+		BufferedEvents:      ms.bufferedEventBatch.CloneEvents(),
 		Checksum:            ms.checksum,
 	}
 
@@ -1162,12 +1162,12 @@ func (ms *MutableStateImpl) UpdateCurrentVersion(
 		ms.currentVersion = version
 	}
 
-	ms.hBuilder = historybuilder.New(
+	ms.hBuilder = historybuilder.NewWithBufferedEventBatch(
 		ms.timeSource,
 		ms.shard.GenerateTaskIDs,
 		ms.currentVersion,
 		ms.nextEventIDInDB,
-		ms.bufferEventsInDB,
+		ms.bufferedEventBatch,
 		ms.metricsHandler,
 		ms.config.MaximumEventBatchSizeInBytes,
 	)
@@ -7714,6 +7714,7 @@ func (ms *MutableStateImpl) closeTransaction(
 		for _, event := range bufferEvents {
 			event.Principal = principal
 		}
+		ms.bufferedEventBatch.StampPrincipalOnLastEvents(len(bufferEvents), principal)
 	}
 
 	// CloseTransaction() on chasmTree may update execution state & status,
@@ -8388,12 +8389,12 @@ func (ms *MutableStateImpl) cleanupTransaction() error {
 	}
 	// ms.dbRecordVersion remains the same
 
-	ms.hBuilder = historybuilder.New(
+	ms.hBuilder = historybuilder.NewWithBufferedEventBatch(
 		ms.timeSource,
 		ms.shard.GenerateTaskIDs,
 		ms.GetCurrentVersion(),
 		ms.nextEventIDInDB,
-		ms.bufferEventsInDB,
+		ms.bufferedEventBatch,
 		ms.metricsHandler,
 		ms.config.MaximumEventBatchSizeInBytes,
 	)
@@ -8422,8 +8423,7 @@ func (ms *MutableStateImpl) closeTransactionPrepareEvents(
 		return nil, nil, nil, false, err
 	}
 
-	// TODO @wxing1292 need more refactoring to make the logic clean
-	ms.bufferEventsInDB = historyMutation.MemBufferBatch
+	ms.bufferedEventBatch = ms.hBuilder.FinishedBufferedEventBatch()
 	newBufferBatch := historyMutation.DBBufferBatch
 	clearBuffer := historyMutation.DBClearBuffer
 	newEventsBatches := historyMutation.DBEventsBatches

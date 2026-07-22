@@ -1719,7 +1719,6 @@ func (s *historyBuilderSuite) testAppendFlushFinishEventWithoutBufferSingleBatch
 		DBEventsBatches:        [][]*historypb.HistoryEvent{{event1, event2}},
 		DBClearBuffer:          false,
 		DBBufferBatch:          nil,
-		MemBufferBatch:         nil,
 		ScheduledIDToStartedID: make(map[int64]int64),
 		RequestIDToEventID:     make(map[string]int64),
 	}, historyMutation)
@@ -1799,7 +1798,6 @@ func (s *historyBuilderSuite) testAppendFlushFinishEventWithoutBufferMultiBatch(
 		},
 		DBClearBuffer:          false,
 		DBBufferBatch:          nil,
-		MemBufferBatch:         nil,
 		ScheduledIDToStartedID: make(map[int64]int64),
 		RequestIDToEventID:     make(map[string]int64),
 	}, historyMutation)
@@ -1832,7 +1830,6 @@ func (s *historyBuilderSuite) TestAppendFlushFinishEvent_WithBuffer_WithoutDBBuf
 		DBEventsBatches:        nil,
 		DBClearBuffer:          false,
 		DBBufferBatch:          []*historypb.HistoryEvent{event1, event2},
-		MemBufferBatch:         []*historypb.HistoryEvent{event1, event2},
 		ScheduledIDToStartedID: make(map[int64]int64),
 		RequestIDToEventID:     make(map[string]int64),
 	}, historyMutation)
@@ -1865,7 +1862,6 @@ func (s *historyBuilderSuite) TestAppendFlushFinishEvent_WithBuffer_WithoutDBBuf
 		DBEventsBatches:        [][]*historypb.HistoryEvent{{event1, event2}},
 		DBClearBuffer:          false,
 		DBBufferBatch:          nil,
-		MemBufferBatch:         nil,
 		ScheduledIDToStartedID: make(map[int64]int64),
 		RequestIDToEventID:     make(map[string]int64),
 	}, historyMutation)
@@ -1896,7 +1892,6 @@ func (s *historyBuilderSuite) TestAppendFlushFinishEvent_WithoutBuffer_WithDBBuf
 		DBEventsBatches:        nil,
 		DBClearBuffer:          false,
 		DBBufferBatch:          nil,
-		MemBufferBatch:         []*historypb.HistoryEvent{event1, event2},
 		ScheduledIDToStartedID: make(map[int64]int64),
 		RequestIDToEventID:     make(map[string]int64),
 	}, historyMutation)
@@ -1927,7 +1922,6 @@ func (s *historyBuilderSuite) TestAppendFlushFinishEvent_WithoutBuffer_WithDBBuf
 		DBEventsBatches:        [][]*historypb.HistoryEvent{{event1, event2}},
 		DBClearBuffer:          true,
 		DBBufferBatch:          nil,
-		MemBufferBatch:         nil,
 		ScheduledIDToStartedID: make(map[int64]int64),
 		RequestIDToEventID:     make(map[string]int64),
 	}, historyMutation)
@@ -1965,7 +1959,6 @@ func (s *historyBuilderSuite) TestAppendFlushFinishEvent_WithBuffer_WithDBBuffer
 		DBEventsBatches:        nil,
 		DBClearBuffer:          false,
 		DBBufferBatch:          []*historypb.HistoryEvent{event1, event2},
-		MemBufferBatch:         []*historypb.HistoryEvent{event0, event1, event2},
 		ScheduledIDToStartedID: make(map[int64]int64),
 		RequestIDToEventID:     make(map[string]int64),
 	}, historyMutation)
@@ -2003,7 +1996,6 @@ func (s *historyBuilderSuite) TestAppendFlushFinishEvent_WithBuffer_WithDBBuffer
 		DBEventsBatches:        [][]*historypb.HistoryEvent{{event0, event1, event2}},
 		DBClearBuffer:          true,
 		DBBufferBatch:          nil,
-		MemBufferBatch:         nil,
 		ScheduledIDToStartedID: make(map[int64]int64),
 		RequestIDToEventID:     make(map[string]int64),
 	}, historyMutation)
@@ -2396,14 +2388,62 @@ func (s *historyBuilderSuite) TestBufferSize_Memory() {
 	s.Assert().Zero(s.historyBuilder.SizeInBytesOfBufferedEvents())
 }
 
-func (s *historyBuilderSuite) TestBufferSize_DB() {
-	s.Assert().Zero(s.historyBuilder.NumBufferedEvents())
-	s.Assert().Zero(s.historyBuilder.SizeInBytesOfBufferedEvents())
-	s.historyBuilder.dbBufferBatch = []*historypb.HistoryEvent{{
+func (s *historyBuilderSuite) TestFinishBufferedEventBatchIsolatesMutationOutput() {
+	persisted := &historypb.HistoryEvent{
 		EventType: enumspb.EVENT_TYPE_TIMER_FIRED,
 		EventId:   common.BufferedEventID,
 		TaskId:    common.EmptyEventTaskID,
-	}}
+	}
+	s.historyBuilder = New(
+		s.mockTimeSource,
+		s.taskIDGenerator,
+		s.version,
+		s.nextEventID,
+		[]*historypb.HistoryEvent{persisted},
+		metrics.NoopMetricsHandler,
+		tests.NewDynamicConfig().MaximumEventBatchSizeInBytes,
+	)
+	s.historyBuilder.add(&historypb.HistoryEvent{
+		EventType: enumspb.EVENT_TYPE_SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_FAILED,
+	})
+	wantSize := s.historyBuilder.SizeInBytesOfBufferedEvents()
+
+	mutation, err := s.historyBuilder.Finish(false)
+	s.Require().NoError(err)
+	s.Require().Len(mutation.DBBufferBatch, 1)
+	mutation.DBBufferBatch[0].Principal = &commonpb.Principal{Type: "user", Name: "mutated-output"}
+
+	cachedEvents := s.historyBuilder.FinishedBufferedEventBatch().CloneEvents()
+	s.Require().Len(cachedEvents, 2)
+	s.Nil(cachedEvents[1].GetPrincipal())
+	nextBuilder := NewWithBufferedEventBatch(
+		s.mockTimeSource,
+		s.taskIDGenerator,
+		s.version,
+		s.nextEventID,
+		s.historyBuilder.FinishedBufferedEventBatch(),
+		metrics.NoopMetricsHandler,
+		tests.NewDynamicConfig().MaximumEventBatchSizeInBytes,
+	)
+	s.Equal(wantSize, nextBuilder.SizeInBytesOfBufferedEvents())
+}
+
+func (s *historyBuilderSuite) TestBufferSize_DB() {
+	s.Assert().Zero(s.historyBuilder.NumBufferedEvents())
+	s.Assert().Zero(s.historyBuilder.SizeInBytesOfBufferedEvents())
+	s.historyBuilder = New(
+		s.mockTimeSource,
+		s.taskIDGenerator,
+		s.version,
+		s.nextEventID,
+		[]*historypb.HistoryEvent{{
+			EventType: enumspb.EVENT_TYPE_TIMER_FIRED,
+			EventId:   common.BufferedEventID,
+			TaskId:    common.EmptyEventTaskID,
+		}},
+		metrics.NoopMetricsHandler,
+		tests.NewDynamicConfig().MaximumEventBatchSizeInBytes,
+	)
 	s.Assert().Equal(1, s.historyBuilder.NumBufferedEvents())
 	// the size of the proto  is non-deterministic, so just assert that it's non-zero, and it isn't really high
 	s.Assert().Greater(s.historyBuilder.SizeInBytesOfBufferedEvents(), 0)
@@ -2645,11 +2685,6 @@ func (s *historyBuilderSuite) assertEventIDTaskID(
 		s.Equal(common.EmptyEventTaskID, event.TaskId)
 	}
 
-	for _, event := range historyMutation.MemBufferBatch {
-		s.Equal(common.BufferedEventID, event.EventId)
-		s.Equal(common.EmptyEventTaskID, event.TaskId)
-	}
-
 	for _, eventBatch := range historyMutation.DBEventsBatches {
 		for _, event := range eventBatch {
 			s.NotEqual(common.BufferedEventID, event.EventId)
@@ -2671,9 +2706,15 @@ func (s *historyBuilderSuite) flush() *historypb.HistoryEvent {
 		return historyMutation.DBEventsBatches[0][0]
 	}
 
-	if len(historyMutation.MemBufferBatch) > 0 {
-		s.Equal(1, len(historyMutation.MemBufferBatch))
-		return historyMutation.MemBufferBatch[0]
+	if len(historyMutation.DBBufferBatch) > 0 {
+		s.Equal(1, len(historyMutation.DBBufferBatch))
+		return historyMutation.DBBufferBatch[0]
+	}
+
+	bufferedEvents := s.historyBuilder.FinishedBufferedEventBatch().CloneEvents()
+	if len(bufferedEvents) > 0 {
+		s.Equal(1, len(bufferedEvents))
+		return bufferedEvents[0]
 	}
 
 	s.Fail("expect one and only event")
