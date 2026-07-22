@@ -3676,7 +3676,7 @@ func (ms *MutableStateImpl) validateBuildIdRedirectInfo(
 // tasks are rescheduled to Matching with the new build ID. An unpaused pending retry whose scheduled time is
 // strictly in the future is the exception: it keeps its retry timer and dispatch is deferred until that timer fires,
 // when the timer executor derives the directive from the current workflow assignment. The activity is still recorded
-// as updated so a partial refresh can reconstruct the derived retry timer after recovery or replication.
+// as updated so replication can safely rebuild its derived tasks and fence stale physical timers after recovery or replication.
 func (ms *MutableStateImpl) ApplyBuildIdRedirect(
 	startingTaskScheduledEventId int64,
 	buildId string,
@@ -3716,7 +3716,7 @@ func (ms *MutableStateImpl) ApplyBuildIdRedirect(
 
 		if activityPendingRetry(ai) && now.Before(ai.GetScheduledTime().AsTime()) {
 			// Keep the existing retry timer authoritative, but record the activity in
-			// the mutation so a partial refresh can recreate that derived timer.
+			// the mutation so replication can refresh its derived timer safely.
 			err := ms.UpdateActivity(ai.ScheduledEventId, func(*persistencespb.ActivityInfo, historyi.MutableState) error {
 				return nil
 			})

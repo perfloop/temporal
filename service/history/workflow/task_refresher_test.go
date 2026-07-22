@@ -9,7 +9,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	enumspb "go.temporal.io/api/enums/v1"
-	failurepb "go.temporal.io/api/failure/v1"
 	historypb "go.temporal.io/api/history/v1"
 	enumsspb "go.temporal.io/server/api/enums/v1"
 	historyspb "go.temporal.io/server/api/history/v1"
@@ -18,7 +17,6 @@ import (
 	"go.temporal.io/server/common/cluster"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/namespace"
-	"go.temporal.io/server/common/persistence/transitionhistory"
 	"go.temporal.io/server/service/history/events"
 	"go.temporal.io/server/service/history/hsm"
 	"go.temporal.io/server/service/history/hsm/hsmtest"
@@ -89,120 +87,6 @@ func (s *taskRefresherSuite) SetupTest() {
 
 	s.taskRefresher = NewTaskRefresher(s.mockShard)
 	s.taskRefresher.taskGeneratorProvider = newMockTaskGeneratorProvider(s.mockTaskGenerator)
-}
-
-// TestPartialRefreshRestoresRedirectedRetryTimer constructs the retry through
-// RetryActivity, persists the subsequent redirect transaction, and reloads the
-// state without physical tasks. The actual redirect transition must include the
-// unchanged retry so PartialRefresh recreates its timer.
-func (s *taskRefresherSuite) TestPartialRefreshRestoresRedirectedRetryTimer() {
-	const (
-		startingTaskScheduledEventID int64 = 1
-		retryScheduledEventID        int64 = 2
-		initialBuildID                     = "build-before-redirect"
-		targetBuildID                      = "build-after-redirect"
-	)
-
-	mutableState := TestGlobalMutableState(
-		s.mockShard,
-		s.mockShard.GetEventsCache(),
-		s.mockShard.GetLogger(),
-		s.namespaceEntry.FailoverVersion(tests.WorkflowID),
-		tests.WorkflowID,
-		tests.RunID,
-	)
-	// Model a namespace where transition history is enabled. The redirect must
-	// own a transition so PartialRefresh sees the retained retry after reload.
-	mutableState.transitionHistoryEnabled = true
-	mutableState.GetExecutionInfo().AssignedBuildId = initialBuildID
-
-	now := mutableState.timeSource.Now().UTC()
-	retry := &persistencespb.ActivityInfo{
-		Version:                 mutableState.GetCurrentVersion(),
-		ScheduledEventId:        retryScheduledEventID,
-		StartedEventId:          1,
-		ActivityId:              "redirected-retry",
-		TaskQueue:               "redirected-retry-task-queue",
-		ScheduledTime:           timestamppb.New(now),
-		StartedTime:             timestamppb.New(now),
-		HasRetryPolicy:          true,
-		Attempt:                 1,
-		RetryInitialInterval:    durationpb.New(time.Hour),
-		RetryMaximumAttempts:    2,
-		RetryBackoffCoefficient: 1,
-		BuildIdInfo: &persistencespb.ActivityInfo_UseWorkflowBuildIdInfo_{
-			UseWorkflowBuildIdInfo: &persistencespb.ActivityInfo_UseWorkflowBuildIdInfo{
-				LastUsedBuildId: initialBuildID,
-			},
-		},
-	}
-	mutableState.addPendingActivityInfo(retry)
-
-	retryState, err := mutableState.RetryActivity(retry, &failurepb.Failure{Message: "retryable failure"})
-	s.Require().NoError(err)
-	s.Equal(enumspb.RETRY_STATE_IN_PROGRESS, retryState)
-
-	var originalRetryTimer *tasks.ActivityRetryTimerTask
-	for _, task := range mutableState.PopTasks()[tasks.CategoryTimer] {
-		if timer, ok := task.(*tasks.ActivityRetryTimerTask); ok && timer.EventID == retryScheduledEventID {
-			originalRetryTimer = timer
-		}
-	}
-	s.Require().NotNil(originalRetryTimer)
-
-	// Persist the normal retry first so the redirect owns a distinct transition.
-	_, _, err = mutableState.CloseTransactionAsSnapshot(context.Background(), historyi.TransactionPolicyActive)
-	s.Require().NoError(err)
-
-	s.Require().NoError(mutableState.ApplyBuildIdRedirect(
-		startingTaskScheduledEventID,
-		targetBuildID,
-		1,
-	))
-	_, _, err = mutableState.CloseTransactionAsSnapshot(context.Background(), historyi.TransactionPolicyActive)
-	s.Require().NoError(err)
-	redirectedState := mutableState.CloneToProto()
-
-	redirectedRetry := redirectedState.ActivityInfos[retryScheduledEventID]
-	s.Require().NotNil(redirectedRetry)
-	s.Equal(originalRetryTimer.Stamp, redirectedRetry.Stamp)
-	redirectTransition := transitionhistory.LastVersionedTransition(redirectedState.ExecutionInfo.TransitionHistory)
-	s.Require().NotNil(redirectTransition)
-	s.Equal(
-		redirectTransition.GetTransitionCount(),
-		redirectedRetry.GetLastUpdateVersionedTransition().GetTransitionCount(),
-		"redirect must update the retry transition for partial refresh",
-	)
-
-	// Physical tasks are not part of the persisted mutable-state record. Avoid
-	// unrelated visibility reconstruction so this test isolates the retry route.
-	redirectedState.ExecutionInfo.VisibilityLastUpdateVersionedTransition = nil
-	recoveredState, err := NewMutableStateFromDB(
-		s.mockShard,
-		s.mockShard.GetEventsCache(),
-		s.mockShard.GetLogger(),
-		s.namespaceEntry,
-		redirectedState,
-		1,
-	)
-	s.Require().NoError(err)
-
-	refresher := NewTaskRefresher(s.mockShard)
-	err = refresher.PartialRefresh(context.Background(), recoveredState, redirectTransition, nil, false)
-	s.Require().NoError(err)
-
-	var regeneratedRetryTimer *tasks.ActivityRetryTimerTask
-	for _, task := range recoveredState.PopTasks()[tasks.CategoryTimer] {
-		if timer, ok := task.(*tasks.ActivityRetryTimerTask); ok && timer.EventID == retryScheduledEventID {
-			s.Nil(regeneratedRetryTimer, "partial refresh must regenerate exactly one retry timer")
-			regeneratedRetryTimer = timer
-		}
-	}
-	s.Require().NotNil(regeneratedRetryTimer, "partial refresh must restore the missing retry timer")
-	s.Equal(redirectedRetry.GetScheduledTime().AsTime(), regeneratedRetryTimer.VisibilityTimestamp)
-	s.Equal(redirectedRetry.GetAttempt(), regeneratedRetryTimer.Attempt)
-	s.Equal(redirectedRetry.GetStamp(), regeneratedRetryTimer.Stamp)
-	s.Equal(targetBuildID, recoveredState.GetAssignedBuildId())
 }
 
 func (s *taskRefresherSuite) TestRefreshWorkflowStartTasks() {

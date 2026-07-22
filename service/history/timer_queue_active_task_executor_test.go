@@ -2889,54 +2889,51 @@ func (s *timerQueueActiveTaskExecutorSuite) newRedirectRetryLifecycle() *redirec
 	}
 }
 
-// TestActivityRetryTimerRedirectAfterReload exercises the complete retained-timer
-// lifecycle. The baseline still takes its supported immediate ActivityTask route,
-// while the redirect optimization must retain the original retry timer, reload the
-// persisted mutable state, and dispatch it to Matching with the redirected build ID.
+// TestActivityRetryTimerRedirectAfterReload verifies the normal deferred route:
+// a retry is persisted and reloaded before a redirect, remains idle until its
+// scheduled time, and then dispatches with the redirected build-ID directive.
 func (s *timerQueueActiveTaskExecutorSuite) TestActivityRetryTimerRedirectAfterReload() {
 	lifecycle := s.newRedirectRetryLifecycle()
 
-	s.Require().NoError(lifecycle.mutableState.ApplyBuildIdRedirect(
-		lifecycle.triggerEventID,
-		redirectRetryTargetBuildID,
-		1,
-	))
-
-	var immediateRetryTask *tasks.ActivityTask
-	for _, task := range lifecycle.mutableState.PopTasks()[tasks.CategoryTransfer] {
-		activityTask, ok := task.(*tasks.ActivityTask)
-		if ok && activityTask.ScheduledEventID == lifecycle.retry.GetScheduledEventId() {
-			immediateRetryTask = activityTask
-		}
-	}
-
-	timerStillCurrent := lifecycle.retryTimer.EventID == lifecycle.retry.GetScheduledEventId() &&
-		lifecycle.retryTimer.Attempt == lifecycle.retry.GetAttempt() &&
-		lifecycle.retryTimer.Stamp == lifecycle.retry.GetStamp()
-	if !timerStillCurrent {
-		// The pre-optimization implementation invalidates the old timer and uses a
-		// current-stamp immediate ActivityTask. Keep this branch so the sealed check
-		// can validate both revisions, while the retained-timer branch below verifies
-		// the candidate's new route end to end.
-		s.Require().NotNil(immediateRetryTask)
-		s.Equal(lifecycle.retry.GetStamp(), immediateRetryTask.Stamp)
-		return
-	}
-
-	s.Nil(immediateRetryTask, "a retained future retry must not be dispatched before its backoff expires")
-	s.Equal(redirectRetryTargetBuildID, lifecycle.mutableState.GetAssignedBuildId())
-
-	// The physical retry timer existed before the redirect. The executor reloads
-	// the post-redirect authoritative state before dispatching that original due task.
-	lifecycle.retryTimer.TaskID = s.mustGenerateTaskID()
-	persistedState := s.createPersistenceMutableState(
+	persistedRetry := s.createPersistenceMutableState(
 		lifecycle.mutableState,
 		lifecycle.lastEventID,
 		lifecycle.lastVersion,
 	)
+	reloadedState, err := workflow.NewMutableStateFromDB(
+		s.mockShard,
+		s.mockShard.GetEventsCache(),
+		s.logger,
+		s.namespaceEntry,
+		persistedRetry,
+		1,
+	)
+	s.Require().NoError(err)
+	retry, ok := reloadedState.GetActivityInfo(lifecycle.retry.GetScheduledEventId())
+	s.Require().True(ok)
+
+	s.Require().NoError(reloadedState.ApplyBuildIdRedirect(
+		lifecycle.triggerEventID,
+		redirectRetryTargetBuildID,
+		1,
+	))
+	s.Equal(redirectRetryTargetBuildID, reloadedState.GetAssignedBuildId())
+	s.Equal(lifecycle.retryTimer.Stamp, retry.Stamp)
+	s.Equal(lifecycle.retryTimer.Attempt, retry.Attempt)
+
+	for _, task := range reloadedState.PopTasks()[tasks.CategoryTransfer] {
+		activityTask, ok := task.(*tasks.ActivityTask)
+		if ok {
+			s.NotEqual(retry.GetScheduledEventId(), activityTask.ScheduledEventID,
+				"a future retry must not dispatch before its backoff expires")
+		}
+	}
+
+	lifecycle.retryTimer.TaskID = s.mustGenerateTaskID()
+	persistedRedirect := reloadedState.CloneToProto()
 
 	s.mockExecutionMgr.EXPECT().GetWorkflowExecution(gomock.Any(), gomock.Any()).Return(
-		&persistence.GetWorkflowExecutionResponse{State: persistedState},
+		&persistence.GetWorkflowExecutionResponse{State: persistedRedirect},
 		nil,
 	)
 	s.mockMatchingClient.EXPECT().AddActivityTask(
@@ -2957,10 +2954,122 @@ func (s *timerQueueActiveTaskExecutorSuite) TestActivityRetryTimerRedirectAfterR
 		gomock.Any(),
 	).Return(&matchingservice.AddActivityTaskResponse{}, nil)
 
-	s.timeSource.Update(lifecycle.retry.GetScheduledTime().AsTime())
+	s.timeSource.Update(retry.GetScheduledTime().AsTime())
 	response := s.timerQueueActiveTaskExecutor.Execute(
 		context.Background(),
 		s.newTaskExecutable(lifecycle.retryTimer),
+	)
+	s.NoError(response.ExecutionErr)
+}
+
+// TestActivityRetryTimerRedirectRecoveryRefresh verifies that a replicated or
+// recovered redirect fences the pre-redirect physical timer before rebuilding
+// the deferred retry timer. Exactly one due timer can reach Matching.
+func (s *timerQueueActiveTaskExecutorSuite) TestActivityRetryTimerRedirectRecoveryRefresh() {
+	lifecycle := s.newRedirectRetryLifecycle()
+	lifecycle.retryTimer.TaskID = s.mustGenerateTaskID()
+	// Advance the shard clock as it would advance after the pre-redirect timer
+	// was persisted. Refresh records the later clock as the task-generation fence.
+	_ = s.mustGenerateTaskID()
+
+	persistedRetry := s.createPersistenceMutableState(
+		lifecycle.mutableState,
+		lifecycle.lastEventID,
+		lifecycle.lastVersion,
+	)
+	reloadedState, err := workflow.NewMutableStateFromDB(
+		s.mockShard,
+		s.mockShard.GetEventsCache(),
+		s.logger,
+		s.namespaceEntry,
+		persistedRetry,
+		1,
+	)
+	s.Require().NoError(err)
+
+	s.Require().NoError(reloadedState.ApplyBuildIdRedirect(
+		lifecycle.triggerEventID,
+		redirectRetryTargetBuildID,
+		1,
+	))
+	for _, task := range reloadedState.PopTasks()[tasks.CategoryTransfer] {
+		activityTask, ok := task.(*tasks.ActivityTask)
+		if ok {
+			s.NotEqual(lifecycle.retry.GetScheduledEventId(), activityTask.ScheduledEventID,
+				"a future retry must not dispatch before its backoff expires")
+		}
+	}
+
+	redirectedState := reloadedState.CloneToProto()
+	recoveredState, err := workflow.NewMutableStateFromDB(
+		s.mockShard,
+		s.mockShard.GetEventsCache(),
+		s.logger,
+		s.namespaceEntry,
+		redirectedState,
+		1,
+	)
+	s.Require().NoError(err)
+
+	// Refresh is the replication/recovery path selected for a redirect. It emits
+	// a replacement retry timer and advances the durable task-generation fence.
+	refresher := workflow.NewTaskRefresher(s.mockShard)
+	s.Require().NoError(refresher.Refresh(context.Background(), recoveredState, false))
+	s.Greater(
+		recoveredState.GetExecutionInfo().GetTaskGenerationShardClockTimestamp(),
+		lifecycle.retryTimer.TaskID,
+	)
+
+	var regeneratedRetryTimer *tasks.ActivityRetryTimerTask
+	for _, task := range recoveredState.PopTasks()[tasks.CategoryTimer] {
+		timer, ok := task.(*tasks.ActivityRetryTimerTask)
+		if !ok || timer.EventID != lifecycle.retry.GetScheduledEventId() {
+			continue
+		}
+		s.Nil(regeneratedRetryTimer, "recovery refresh must create exactly one retry timer")
+		regeneratedRetryTimer = timer
+	}
+	s.Require().NotNil(regeneratedRetryTimer)
+	recoveredRetry, ok := recoveredState.GetActivityInfo(lifecycle.retry.GetScheduledEventId())
+	s.Require().True(ok)
+	s.Equal(lifecycle.retryTimer.Stamp, regeneratedRetryTimer.Stamp)
+	s.Equal(recoveredRetry.Stamp, regeneratedRetryTimer.Stamp)
+	regeneratedRetryTimer.TaskID = s.mustGenerateTaskID()
+
+	persistedRecovery := recoveredState.CloneToProto()
+	s.mockExecutionMgr.EXPECT().GetWorkflowExecution(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(context.Context, *persistence.GetWorkflowExecutionRequest) (*persistence.GetWorkflowExecutionResponse, error) {
+			return &persistence.GetWorkflowExecutionResponse{State: persistedRecovery}, nil
+		},
+	).Times(2)
+	s.mockMatchingClient.EXPECT().AddActivityTask(
+		gomock.Any(),
+		pm.Eq(&matchingservice.AddActivityTaskRequest{
+			NamespaceId: lifecycle.workflowKey.NamespaceID,
+			Execution:   lifecycle.execution,
+			TaskQueue: &taskqueuepb.TaskQueue{
+				Name: lifecycle.retry.GetTaskQueue(),
+				Kind: enumspb.TASK_QUEUE_KIND_NORMAL,
+			},
+			ScheduledEventId:       lifecycle.retry.GetScheduledEventId(),
+			ScheduleToStartTimeout: lifecycle.retry.GetScheduleToStartTimeout(),
+			Clock:                  vclock.NewVectorClock(s.mockClusterMetadata.GetClusterID(), s.mockShard.GetShardID(), regeneratedRetryTimer.TaskID),
+			VersionDirective:       worker_versioning.MakeBuildIdDirective(redirectRetryTargetBuildID),
+			Stamp:                  regeneratedRetryTimer.Stamp,
+		}),
+		gomock.Any(),
+	).Return(&matchingservice.AddActivityTaskResponse{}, nil)
+
+	s.timeSource.Update(recoveredRetry.GetScheduledTime().AsTime())
+	staleResponse := s.timerQueueActiveTaskExecutor.Execute(
+		context.Background(),
+		s.newTaskExecutable(lifecycle.retryTimer),
+	)
+	s.ErrorIs(staleResponse.ExecutionErr, consts.ErrStaleReference)
+
+	response := s.timerQueueActiveTaskExecutor.Execute(
+		context.Background(),
+		s.newTaskExecutable(regeneratedRetryTimer),
 	)
 	s.NoError(response.ExecutionErr)
 }

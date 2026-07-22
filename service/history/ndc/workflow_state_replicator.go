@@ -836,6 +836,11 @@ func (r *WorkflowStateReplicatorImpl) applyMutation(
 	}
 
 	prevPendingChildIds := localMutableState.GetPendingChildIds()
+	refreshAllTasks := retainedRetryTimerNeedsRefresh(
+		mutation.StateMutation.ExecutionInfo,
+		mutation.StateMutation.UpdatedActivityInfos,
+		localMutableState,
+	)
 
 	err = localMutableState.ApplyMutation(mutation.StateMutation)
 	if err != nil {
@@ -849,9 +854,26 @@ func (r *WorkflowStateReplicatorImpl) applyMutation(
 			return err
 		}
 	}
-	nextVersionedTransition := transitionhistory.CopyVersionedTransition(localVersionedTransition)
-	nextVersionedTransition.TransitionCount++
-	err = r.taskRefresher.PartialRefresh(ctx, localMutableState, nextVersionedTransition, prevPendingChildIds, versionedTransition.IsCloseTransferTaskAcked && versionedTransition.IsForceReplication)
+	if refreshAllTasks {
+		// A build-ID redirect may retain a future retry's physical timer. Rebuild
+		// all local derived tasks so Refresh's generation clock fences pre-refresh
+		// physical tasks before it recreates them from redirected mutable state.
+		err = r.taskRefresher.Refresh(
+			ctx,
+			localMutableState,
+			versionedTransition.IsCloseTransferTaskAcked && versionedTransition.IsForceReplication,
+		)
+	} else {
+		nextVersionedTransition := transitionhistory.CopyVersionedTransition(localVersionedTransition)
+		nextVersionedTransition.TransitionCount++
+		err = r.taskRefresher.PartialRefresh(
+			ctx,
+			localMutableState,
+			nextVersionedTransition,
+			prevPendingChildIds,
+			versionedTransition.IsCloseTransferTaskAcked && versionedTransition.IsForceReplication,
+		)
+	}
 	if err != nil {
 		return err
 	}
@@ -949,6 +971,11 @@ func (r *WorkflowStateReplicatorImpl) applySnapshotWhenWorkflowExist(
 	var isBranchSwitched bool
 	var localTransitionHistory []*persistencespb.VersionedTransition
 	var localVersionedTransition *persistencespb.VersionedTransition
+	refreshAllTasks := retainedRetryTimerNeedsRefresh(
+		sourceMutableState.ExecutionInfo,
+		sourceMutableState.ActivityInfos,
+		localMutableState,
+	)
 	if len(localMutableState.GetExecutionInfo().TransitionHistory) != 0 {
 		localTransitionHistory = transitionhistory.CopyVersionedTransitions(localMutableState.GetExecutionInfo().TransitionHistory)
 		localVersionedTransition = transitionhistory.LastVersionedTransition(localTransitionHistory)
@@ -1026,7 +1053,7 @@ func (r *WorkflowStateReplicatorImpl) applySnapshotWhenWorkflowExist(
 		localMutableState,
 		releaseFn,
 	)
-	if isBranchSwitched || len(localTransitionHistory) == 0 {
+	if isBranchSwitched || len(localTransitionHistory) == 0 || refreshAllTasks {
 		// TODO: If branch switched, maybe refresh from LCA?
 		err = r.taskRefresher.Refresh(ctx, localMutableState, false)
 		if err != nil {
@@ -1048,6 +1075,31 @@ func (r *WorkflowStateReplicatorImpl) applySnapshotWhenWorkflowExist(
 		targetWorkflow,
 		newRunWorkflow,
 	)
+}
+
+func retainedRetryTimerNeedsRefresh(
+	sourceExecutionInfo *persistencespb.WorkflowExecutionInfo,
+	sourceActivityInfos map[int64]*persistencespb.ActivityInfo,
+	localMutableState historyi.MutableState,
+) bool {
+	if sourceExecutionInfo.GetBuildIdRedirectCounter() <= localMutableState.GetExecutionInfo().GetBuildIdRedirectCounter() {
+		return false
+	}
+
+	for scheduledEventID, sourceActivityInfo := range sourceActivityInfos {
+		localActivityInfo, ok := localMutableState.GetActivityInfo(scheduledEventID)
+		if !ok || sourceActivityInfo.GetStamp() != localActivityInfo.GetStamp() {
+			continue
+		}
+		if sourceActivityInfo.GetStartedEventId() == common.EmptyEventID &&
+			!sourceActivityInfo.GetPaused() &&
+			sourceActivityInfo.GetHasRetryPolicy() &&
+			sourceActivityInfo.GetAttempt() > 1 &&
+			sourceActivityInfo.GetUseWorkflowBuildIdInfo() != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *WorkflowStateReplicatorImpl) backFillEvents(

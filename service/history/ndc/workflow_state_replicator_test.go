@@ -880,6 +880,105 @@ func (s *workflowReplicatorSuite) Test_ReplicateVersionedTransition_SameBranch_S
 	s.NoError(err)
 }
 
+func (s *workflowReplicatorSuite) Test_ReplicateVersionedTransition_SameBranch_BuildIDRedirectRefreshesTasks() {
+	workflowStateReplicator := NewWorkflowStateReplicator(
+		s.mockShard,
+		s.mockWorkflowCache,
+		nil,
+		s.serializer,
+		quotas.NoopRequestRateLimiter,
+		s.logger,
+		nil,
+	)
+	mockTransactionManager := NewMockTransactionManager(s.controller)
+	mockTaskRefresher := workflow.NewMockTaskRefresher(s.controller)
+	workflowStateReplicator.transactionMgr = mockTransactionManager
+	workflowStateReplicator.taskRefresher = mockTaskRefresher
+	namespaceID := uuid.NewString()
+	versionHistories := &historyspb.VersionHistories{
+		CurrentVersionHistoryIndex: 0,
+		Histories: []*historyspb.VersionHistory{
+			{
+				BranchToken: []byte("branchToken"),
+				Items: []*historyspb.VersionHistoryItem{
+					{EventId: 19, Version: 1},
+					{EventId: 30, Version: 2},
+				},
+			},
+		},
+	}
+	versionedTransitionArtifact := &replicationspb.VersionedTransitionArtifact{
+		StateAttributes: &replicationspb.VersionedTransitionArtifact_SyncWorkflowStateMutationAttributes{
+			SyncWorkflowStateMutationAttributes: &replicationspb.SyncWorkflowStateMutationAttributes{
+				StateMutation: &persistencespb.WorkflowMutableStateMutation{
+					ExecutionInfo: &persistencespb.WorkflowExecutionInfo{
+						WorkflowId:             s.workflowID,
+						NamespaceId:            namespaceID,
+						BuildIdRedirectCounter: 2,
+						VersionHistories:       versionHistories,
+						TransitionHistory: []*persistencespb.VersionedTransition{
+							{NamespaceFailoverVersion: 1, TransitionCount: 10},
+							{NamespaceFailoverVersion: 2, TransitionCount: 20},
+						},
+					},
+					ExecutionState: &persistencespb.WorkflowExecutionState{RunId: s.runID},
+					UpdatedActivityInfos: map[int64]*persistencespb.ActivityInfo{
+						42: {
+							ScheduledEventId: 42,
+							StartedEventId:   common.EmptyEventID,
+							HasRetryPolicy:   true,
+							Attempt:          2,
+							Stamp:            7,
+							BuildIdInfo: &persistencespb.ActivityInfo_UseWorkflowBuildIdInfo_{
+								UseWorkflowBuildIdInfo: &persistencespb.ActivityInfo_UseWorkflowBuildIdInfo{},
+							},
+						},
+					},
+				},
+				ExclusiveStartVersionedTransition: &persistencespb.VersionedTransition{
+					NamespaceFailoverVersion: 1,
+					TransitionCount:          10,
+				},
+			},
+		},
+	}
+	mockWeCtx := historyi.NewMockWorkflowContext(s.controller)
+	mockMutableState := historyi.NewMockMutableState(s.controller)
+	localExecutionInfo := &persistencespb.WorkflowExecutionInfo{
+		BuildIdRedirectCounter: 1,
+		VersionHistories:       versionHistories,
+		TransitionHistory: []*persistencespb.VersionedTransition{
+			{NamespaceFailoverVersion: 1, TransitionCount: 10},
+			{NamespaceFailoverVersion: 2, TransitionCount: 18},
+		},
+	}
+	s.mockWorkflowCache.EXPECT().GetOrCreateChasmExecution(
+		gomock.Any(),
+		s.mockShard,
+		namespace.ID(namespaceID),
+		&commonpb.WorkflowExecution{WorkflowId: s.workflowID, RunId: s.runID},
+		chasm.WorkflowArchetypeID,
+		locks.PriorityHigh,
+	).Return(mockWeCtx, wcache.NoopReleaseFn, nil)
+	mockMutableState.EXPECT().SetHistoryBuilder(gomock.Any()).Times(1)
+	mockWeCtx.EXPECT().LoadMutableState(gomock.Any(), s.mockShard).Return(mockMutableState, nil)
+	mockMutableState.EXPECT().GetExecutionInfo().Return(localExecutionInfo).AnyTimes()
+	mockMutableState.EXPECT().GetExecutionState().Return(&persistencespb.WorkflowExecutionState{RunId: s.runID}).AnyTimes()
+	mockMutableState.EXPECT().GetPendingChildIds().Return(nil).Times(1)
+	mockMutableState.EXPECT().GetActivityInfo(int64(42)).Return(&persistencespb.ActivityInfo{Stamp: 7}, true).Times(1)
+	mockMutableState.EXPECT().ApplyMutation(versionedTransitionArtifact.GetSyncWorkflowStateMutationAttributes().StateMutation)
+	mockTaskRefresher.EXPECT().Refresh(gomock.Any(), mockMutableState, false).Return(nil).Times(1)
+	mockTransactionManager.EXPECT().UpdateWorkflow(gomock.Any(), false, chasm.WorkflowArchetypeID, gomock.Any(), nil).Return(nil).Times(1)
+
+	err := workflowStateReplicator.ReplicateVersionedTransition(
+		context.Background(),
+		chasm.WorkflowArchetypeID,
+		versionedTransitionArtifact,
+		"test",
+	)
+	s.NoError(err)
+}
+
 func (s *workflowReplicatorSuite) Test_ReplicateVersionedTransition_FirstTask_SyncMutation() {
 	workflowStateReplicator := NewWorkflowStateReplicator(
 		s.mockShard,
