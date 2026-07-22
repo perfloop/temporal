@@ -1723,10 +1723,9 @@ func (n *Node) CloseTransaction() (NodesMutation, error) {
 		if err := n.closeTransactionForceUpdateVisibility(immutableContext, rootLifecycleChanged); err != nil {
 			return NodesMutation{}, err
 		}
-	}
-
-	if err := n.closeTransactionSerializeNodes(); err != nil {
-		return NodesMutation{}, err
+		if err := n.closeTransactionSerializeNodes(); err != nil {
+			return NodesMutation{}, err
+		}
 	}
 
 	if err := n.closeTransactionUpdateComponentTasks(nextVersionedTransition); err != nil {
