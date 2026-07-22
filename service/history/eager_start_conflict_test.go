@@ -2,6 +2,9 @@ package history
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -9,11 +12,9 @@ import (
 	"github.com/google/uuid"
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/workflowservice/v1"
-	historyspb "go.temporal.io/server/api/history/v1"
 	"go.temporal.io/server/api/historyservice/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/common"
-	"go.temporal.io/server/common/clock"
 	"go.temporal.io/server/common/cluster"
 	"go.temporal.io/server/common/config"
 	"go.temporal.io/server/common/dynamicconfig"
@@ -24,7 +25,7 @@ import (
 	"go.temporal.io/server/common/persistence/serialization"
 	persistencesql "go.temporal.io/server/common/persistence/sql"
 	"go.temporal.io/server/common/persistence/sql/sqlplugin"
-	"go.temporal.io/server/common/persistence/sql/sqlplugin/sqlite"
+	"go.temporal.io/server/common/persistence/sql/sqlplugin/postgresql"
 	"go.temporal.io/server/common/resolver"
 	"go.temporal.io/server/common/searchattribute"
 	"go.temporal.io/server/common/tasktoken"
@@ -41,48 +42,34 @@ import (
 	"go.temporal.io/server/service/history/workflow"
 	wcache "go.temporal.io/server/service/history/workflow/cache"
 	"go.uber.org/mock/gomock"
-	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
-	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-var eagerStartConflictFixtureTime = time.Date(2025, time.January, 1, 0, 0, 0, 0, time.UTC)
-
-type eagerStartConflictShardContext struct {
-	historyi.ShardContext
+type eagerStartConflictPersistence struct {
 	executionManager persistence.ExecutionManager
+	shardManager     persistence.ShardManager
+	factory          *persistencesql.Factory
 }
 
-func (s *eagerStartConflictShardContext) GetExecutionManager() persistence.ExecutionManager {
-	return s.executionManager
+func (p *eagerStartConflictPersistence) Close() {
+	p.executionManager.Close()
+	p.shardManager.Close()
+	p.factory.Close()
 }
 
-// sqliteHistoryReadCounter delegates the production history read to Temporal's
-// SQLite execution manager. The fixture persists the events through that same
-// manager before this counter is reached, so it never supplies synthetic history.
-type sqliteHistoryReadCounter struct {
+// storageHistoryReadCounter decorates the production ExecutionManager. It only
+// counts a successful history response after the real networked PostgreSQL
+// store has executed it; all other persistence operations use the same manager.
+type storageHistoryReadCounter struct {
 	persistence.ExecutionManager
-	sqliteExecutionManager persistence.ExecutionManager
-	readHistoryCalls       *atomic.Int64
+	readHistoryCalls *atomic.Int64
 }
 
-func (m *sqliteHistoryReadCounter) Close() {
-	m.sqliteExecutionManager.Close()
-}
-
-func (m *sqliteHistoryReadCounter) GetName() string {
-	return m.sqliteExecutionManager.GetName()
-}
-
-func (m *sqliteHistoryReadCounter) GetHistoryBranchUtil() persistence.HistoryBranchUtil {
-	return m.sqliteExecutionManager.GetHistoryBranchUtil()
-}
-
-func (m *sqliteHistoryReadCounter) ReadHistoryBranch(
+func (m *storageHistoryReadCounter) ReadHistoryBranch(
 	ctx context.Context,
 	request *persistence.ReadHistoryBranchRequest,
 ) (*persistence.ReadHistoryBranchResponse, error) {
-	response, err := m.sqliteExecutionManager.ReadHistoryBranch(ctx, request)
+	response, err := m.ExecutionManager.ReadHistoryBranch(ctx, request)
 	if err == nil {
 		m.readHistoryCalls.Add(1)
 	}
@@ -90,109 +77,148 @@ func (m *sqliteHistoryReadCounter) ReadHistoryBranch(
 }
 
 type eagerStartConflictFixture struct {
-	engine             *historyEngineImpl
-	request            *historyservice.StartWorkflowExecutionRequest
-	readHistoryCalls   atomic.Int64
-	resetWorkflowCache func()
-	close              func()
+	engine           *historyEngineImpl
+	prepare          func(int) []*historyservice.StartWorkflowExecutionRequest
+	readHistoryCalls atomic.Int64
+	close            func()
 }
 
-func newSQLiteHistoryExecutionManager(t testing.TB) persistence.ExecutionManager {
+func newEagerStartConflictPersistence(t testing.TB) *eagerStartConflictPersistence {
 	t.Helper()
+
+	address := os.Getenv("TEMPORAL_EAGER_START_CONFLICT_POSTGRES_ADDR")
+	schemaPath := os.Getenv("TEMPORAL_EAGER_START_CONFLICT_POSTGRES_SCHEMA")
+	if address == "" || schemaPath == "" {
+		t.Fatal("eager-start conflict fixture requires TEMPORAL_EAGER_START_CONFLICT_POSTGRES_ADDR and TEMPORAL_EAGER_START_CONFLICT_POSTGRES_SCHEMA")
+	}
+	schemaPath, err := filepath.Abs(schemaPath)
+	if err != nil {
+		t.Fatalf("resolve PostgreSQL schema path: %v", err)
+	}
 
 	logger := log.NewNoopLogger()
 	serializer := serialization.NewSerializer()
-	database, err := persistencesql.NewSQLDB(
-		sqlplugin.DbKindMain,
-		&config.SQL{
-			PluginName:        sqlite.PluginName,
-			DatabaseName:      uuid.NewString(),
-			ConnectAttributes: map[string]string{"mode": "memory", "cache": "private"},
-		},
+	cfg := config.SQL{
+		User:              "temporal",
+		ConnectAddr:       address,
+		ConnectProtocol:   "tcp",
+		PluginName:        postgresql.PluginName,
+		DatabaseName:      "temporal_eager_start_conflict_" + strings.ReplaceAll(uuid.NewString(), "-", ""),
+		ConnectAttributes: map[string]string{"sslmode": "disable"},
+	}
+	adminCfg := cfg
+	adminCfg.DatabaseName = ""
+	adminDB, err := persistencesql.NewSQLAdminDB(
+		sqlplugin.DbKindUnknown,
+		&adminCfg,
 		resolver.NewNoopResolver(),
 		logger,
 		metrics.NoopMetricsHandler,
 	)
 	if err != nil {
-		t.Fatalf("create SQLite database: %v", err)
+		t.Fatalf("open PostgreSQL admin connection: %v", err)
+	}
+	if err := adminDB.CreateDatabase(cfg.DatabaseName); err != nil {
+		_ = adminDB.Close()
+		t.Fatalf("create PostgreSQL fixture database: %v", err)
+	}
+	if err := adminDB.Close(); err != nil {
+		t.Fatalf("close PostgreSQL admin connection: %v", err)
 	}
 
-	executionStore, err := persistencesql.NewSQLExecutionStore(database, logger, serializer)
+	schemaStatements, err := persistence.LoadAndSplitQuery([]string{schemaPath})
 	if err != nil {
-		_ = database.Close()
-		t.Fatalf("create SQLite execution store: %v", err)
+		t.Fatalf("load PostgreSQL fixture schema: %v", err)
 	}
-	return persistence.NewExecutionManager(
-		executionStore,
-		serializer,
-		nil,
+	schemaDB, err := persistencesql.NewSQLAdminDB(
+		sqlplugin.DbKindUnknown,
+		&cfg,
+		resolver.NewNoopResolver(),
 		logger,
-		dynamicconfig.GetIntPropertyFn(4*1024*1024),
-		dynamicconfig.GetBoolPropertyFn(false),
+		metrics.NoopMetricsHandler,
 	)
-}
-
-func persistEagerStartConflictHistory(
-	ctx context.Context,
-	t testing.TB,
-	executionManager persistence.ExecutionManager,
-	request *persistence.UpdateWorkflowExecutionRequest,
-) {
-	t.Helper()
-	if len(request.NewWorkflowEvents) == 0 {
-		t.Fatal("eager-start conflict transaction did not produce history events")
+	if err != nil {
+		t.Fatalf("open PostgreSQL fixture database: %v", err)
 	}
-	for index, workflowEvents := range request.NewWorkflowEvents {
-		if len(workflowEvents.Events) == 0 {
-			t.Fatal("eager-start conflict transaction produced an empty history batch")
+	for _, statement := range schemaStatements {
+		if err := schemaDB.Exec(statement); err != nil {
+			_ = schemaDB.Close()
+			t.Fatalf("apply PostgreSQL fixture schema: %v", err)
 		}
-		_, err := executionManager.AppendHistoryNodes(ctx, &persistence.AppendHistoryNodesRequest{
-			ShardID:           request.ShardID,
-			IsNewBranch:       index == 0,
-			Info:              "eager-start-conflict-fixture",
-			BranchToken:       workflowEvents.BranchToken,
-			Events:            workflowEvents.Events,
-			PrevTransactionID: workflowEvents.PrevTxnID,
-			TransactionID:     workflowEvents.TxnID,
-		})
-		if err != nil {
-			t.Fatalf("persist eager-start conflict history: %v", err)
-		}
+	}
+	if err := schemaDB.Close(); err != nil {
+		t.Fatalf("close PostgreSQL fixture database: %v", err)
+	}
+
+	factory := persistencesql.NewFactory(
+		cfg,
+		resolver.NewNoopResolver(),
+		cluster.TestCurrentClusterName,
+		logger,
+		metrics.NoopMetricsHandler,
+		serializer,
+	)
+	shardStore, err := factory.NewShardStore()
+	if err != nil {
+		factory.Close()
+		t.Fatalf("create PostgreSQL shard store: %v", err)
+	}
+	executionStore, err := factory.NewExecutionStore()
+	if err != nil {
+		factory.Close()
+		t.Fatalf("create PostgreSQL execution store: %v", err)
+	}
+	return &eagerStartConflictPersistence{
+		executionManager: persistence.NewExecutionManager(
+			executionStore,
+			serializer,
+			nil,
+			logger,
+			dynamicconfig.GetIntPropertyFn(4*1024*1024),
+			dynamicconfig.GetBoolPropertyFn(false),
+		),
+		shardManager: persistence.NewShardManager(shardStore, serializer),
+		factory:      factory,
 	}
 }
 
 func newEagerStartConflictFixture(t testing.TB) *eagerStartConflictFixture {
 	tv := testvars.New(t).WithNamespaceID(tests.NamespaceID)
-	tv = tv.WithRunID(tv.Any().RunID())
 	config := tests.NewDynamicConfig()
+	config.WorkflowIdReuseMinimalInterval = dynamicconfig.GetDurationPropertyFnFilteredByNamespace(0)
 	logger := log.NewNoopLogger()
 	ctrl := gomock.NewController(t)
-	timeSource := clock.NewEventTimeSource().Update(eagerStartConflictFixtureTime)
+	persistenceStore := newEagerStartConflictPersistence(t)
+	fixture := &eagerStartConflictFixture{}
+	countingExecutionManager := &storageHistoryReadCounter{
+		ExecutionManager: persistenceStore.executionManager,
+		readHistoryCalls: &fixture.readHistoryCalls,
+	}
 
-	mockTxProcessor := queues.NewMockQueue(ctrl)
-	mockTimerProcessor := queues.NewMockQueue(ctrl)
-	mockVisibilityProcessor := queues.NewMockQueue(ctrl)
-	mockArchivalProcessor := queues.NewMockQueue(ctrl)
-	mockMemoryScheduledQueue := queues.NewMockQueue(ctrl)
-	mockTxProcessor.EXPECT().Category().Return(tasks.CategoryTransfer).AnyTimes()
-	mockTimerProcessor.EXPECT().Category().Return(tasks.CategoryTimer).AnyTimes()
-	mockVisibilityProcessor.EXPECT().Category().Return(tasks.CategoryVisibility).AnyTimes()
-	mockArchivalProcessor.EXPECT().Category().Return(tasks.CategoryArchival).AnyTimes()
-	mockMemoryScheduledQueue.EXPECT().Category().Return(tasks.CategoryMemoryTimer).AnyTimes()
-	mockTxProcessor.EXPECT().NotifyNewTasks(gomock.Any()).AnyTimes()
-	mockTimerProcessor.EXPECT().NotifyNewTasks(gomock.Any()).AnyTimes()
-	mockVisibilityProcessor.EXPECT().NotifyNewTasks(gomock.Any()).AnyTimes()
-	mockArchivalProcessor.EXPECT().NotifyNewTasks(gomock.Any()).AnyTimes()
-	mockMemoryScheduledQueue.EXPECT().NotifyNewTasks(gomock.Any()).AnyTimes()
+	shardInfo := &persistencespb.ShardInfo{
+		ShardId: 1,
+		RangeId: 1,
+	}
+	if _, err := persistenceStore.shardManager.GetOrCreateShard(context.Background(), &persistence.GetOrCreateShardRequest{
+		ShardID:          shardInfo.ShardId,
+		InitialShardInfo: shardInfo,
+	}); err != nil {
+		persistenceStore.Close()
+		t.Fatalf("create PostgreSQL fixture shard: %v", err)
+	}
 
-	mockShard := shard.NewTestContextWithTimeSource(
+	// StubContext installs the same actual execution manager used by the
+	// history engine into ContextImpl, so Create/Update/Get/Read all cross the
+	// production persistence boundary rather than a gomock expectation.
+	h := &historyEngineImpl{}
+	mockShard := shard.NewStubContext(
 		ctrl,
-		&persistencespb.ShardInfo{
-			ShardId: 1,
-			RangeId: 1,
+		shard.ContextConfigOverrides{
+			ShardInfo:        shardInfo,
+			Config:           config,
+			ExecutionManager: countingExecutionManager,
 		},
-		config,
-		timeSource,
+		h,
 	)
 	mockShard.SetLoggers(logger)
 
@@ -201,21 +227,9 @@ func newEagerStartConflictFixture(t testing.TB) *eagerStartConflictFixture {
 	mockShard.SetStateMachineRegistry(registry)
 
 	mockNamespaceCache := mockShard.Resource.NamespaceCache
-	mockExecutionMgr := mockShard.Resource.ExecutionMgr
 	mockClusterMetadata := mockShard.Resource.ClusterMetadata
 	mockVisibilityManager := mockShard.Resource.VisibilityManager
 	mockEventsCache := mockShard.MockEventsCache
-	fixture := &eagerStartConflictFixture{}
-	sqliteExecutionManager := newSQLiteHistoryExecutionManager(t)
-	countingExecutionManager := &sqliteHistoryReadCounter{
-		ExecutionManager:       mockExecutionMgr,
-		sqliteExecutionManager: sqliteExecutionManager,
-		readHistoryCalls:       &fixture.readHistoryCalls,
-	}
-	shardContext := &eagerStartConflictShardContext{
-		ShardContext:     mockShard,
-		executionManager: countingExecutionManager,
-	}
 
 	mockNamespaceCache.EXPECT().GetNamespaceByID(tests.NamespaceID).Return(tests.GlobalNamespaceEntry, nil).AnyTimes()
 	mockNamespaceCache.EXPECT().GetNamespaceByID(tests.ParentNamespaceID).Return(tests.GlobalParentNamespaceEntry, nil).AnyTimes()
@@ -236,10 +250,15 @@ func newEagerStartConflictFixture(t testing.TB) *eagerStartConflictFixture {
 
 	workflowCache := wcache.NewHostLevelCache(mockShard.GetConfig(), mockShard.GetLogger(), metrics.NoopMetricsHandler)
 	mockWorkflowStateReplicator := ndc.NewMockWorkflowStateReplicator(ctrl)
+	archivalProcessor := mockArchivalProcessor(ctrl)
+	txProcessor := mockTxProcessor(ctrl)
+	timerProcessor := mockTimerProcessor(ctrl)
+	visibilityProcessor := mockVisibilityProcessor(ctrl)
+	memoryScheduledQueue := mockMemoryScheduledQueue(ctrl)
 
-	h := &historyEngineImpl{
+	*h = historyEngineImpl{
 		currentClusterName: mockShard.GetClusterMetadata().GetCurrentClusterName(),
-		shardContext:       shardContext,
+		shardContext:       mockShard,
 		clusterMetadata:    mockClusterMetadata,
 		executionManager:   countingExecutionManager,
 		logger:             logger,
@@ -248,13 +267,13 @@ func newEagerStartConflictFixture(t testing.TB) *eagerStartConflictFixture {
 		tokenSerializer:    tasktoken.NewSerializer(),
 		config:             config,
 		timeSource:         mockShard.GetTimeSource(),
-		eventNotifier:      events.NewNotifier(timeSource, metrics.NoopMetricsHandler, func(namespace.ID, string) int32 { return 1 }),
+		eventNotifier:      events.NewNotifier(mockShard.GetTimeSource(), metrics.NoopMetricsHandler, func(namespace.ID, string) int32 { return 1 }),
 		queueProcessors: map[tasks.Category]queues.Queue{
-			mockArchivalProcessor.Category():    mockArchivalProcessor,
-			mockTxProcessor.Category():          mockTxProcessor,
-			mockTimerProcessor.Category():       mockTimerProcessor,
-			mockVisibilityProcessor.Category():  mockVisibilityProcessor,
-			mockMemoryScheduledQueue.Category(): mockMemoryScheduledQueue,
+			archivalProcessor.Category():    archivalProcessor,
+			txProcessor.Category():          txProcessor,
+			timerProcessor.Category():       timerProcessor,
+			visibilityProcessor.Category():  visibilityProcessor,
+			memoryScheduledQueue.Category(): memoryScheduledQueue,
 		},
 		searchAttributesValidator: searchattribute.NewValidator(
 			searchattribute.NewTestProvider(),
@@ -268,90 +287,126 @@ func newEagerStartConflictFixture(t testing.TB) *eagerStartConflictFixture {
 			metrics.NoopMetricsHandler,
 			log.NewNoopLogger(),
 		),
-		workflowConsistencyChecker: api.NewWorkflowConsistencyChecker(shardContext, workflowCache),
+		workflowConsistencyChecker: api.NewWorkflowConsistencyChecker(mockShard, workflowCache),
 		persistenceVisibilityMgr:   mockVisibilityManager,
 		nDCWorkflowStateReplicator: mockWorkflowStateReplicator,
 		workerDeploymentClient:     noopWorkerDeploymentClient{},
 	}
-	mockShard.SetEngineForTesting(h)
-
-	startTime := timestamppb.New(timeSource.Now().Add(-2 * time.Second))
-	currentWorkflowConditionFailedError := makeCurrentWorkflowConditionFailedError(tv, startTime)
-	mockExecutionMgr.EXPECT().CreateWorkflowExecution(
-		gomock.Any(),
-		gomock.Cond(func(request *persistence.CreateWorkflowExecutionRequest) bool {
-			return request.Mode == persistence.CreateWorkflowModeBrandNew
-		}),
-	).Return(nil, currentWorkflowConditionFailedError).AnyTimes()
-
-	currentMutableState := workflow.NewMutableState(
-		shardContext,
-		mockEventsCache,
-		log.NewTestLogger(),
-		tests.GlobalNamespaceEntry,
-		tv.WorkflowID(),
-		tv.RunID(),
-		startTime.AsTime(),
-	)
-	currentMutableState.GetExecutionInfo().ExecutionTime = currentMutableState.GetExecutionState().StartTime
-	currentMutableState.GetExecutionInfo().TransitionHistory = workflow.UpdatedTransitionHistory(
-		currentMutableState.GetExecutionInfo().TransitionHistory,
-		tests.Version,
-	)
-	_ = currentMutableState.UpdateCurrentVersion(tests.Version, false)
-	_ = currentMutableState.SetHistoryTree(nil, nil, tv.RunID())
-	currentMutableState.GetExecutionInfo().VersionHistories.Histories[0].Items = []*historyspb.VersionHistoryItem{{Version: 0, EventId: 0}}
-
-	mockExecutionMgr.EXPECT().UpdateWorkflowExecution(
-		gomock.Any(),
-		gomock.Cond(func(request *persistence.UpdateWorkflowExecutionRequest) bool {
-			return request.UpdateWorkflowMutation.ExecutionState.Status == enumspb.WORKFLOW_EXECUTION_STATUS_TERMINATED
-		}),
-	).DoAndReturn(func(ctx context.Context, request *persistence.UpdateWorkflowExecutionRequest) (*persistence.UpdateWorkflowExecutionResponse, error) {
-		persistEagerStartConflictHistory(ctx, t, sqliteExecutionManager, request)
-		return &persistence.UpdateWorkflowExecutionResponse{
-			UpdateMutableStateStats: persistence.MutableStateStatistics{
-				HistoryStatistics: &persistence.HistoryStatistics{SizeDiff: 1},
-			},
-		}, nil
-	}).AnyTimes()
-	currentWorkflowState := workflow.TestCloneToProto(context.Background(), currentMutableState)
-	mockExecutionMgr.EXPECT().GetWorkflowExecution(gomock.Any(), gomock.Any()).DoAndReturn(
-		func(context.Context, *persistence.GetWorkflowExecutionRequest) (*persistence.GetWorkflowExecutionResponse, error) {
-			return &persistence.GetWorkflowExecutionResponse{
-				State: proto.Clone(currentWorkflowState).(*persistencespb.WorkflowMutableState),
-			}, nil
-		},
-	).AnyTimes()
 
 	fixture.engine = h
-	fixture.request = &historyservice.StartWorkflowExecutionRequest{
-		Attempt:     1,
-		NamespaceId: tv.NamespaceID().String(),
-		StartRequest: &workflowservice.StartWorkflowExecutionRequest{
-			Namespace:                tv.NamespaceID().String(),
-			WorkflowId:               tv.WorkflowID(),
-			WorkflowType:             tv.WorkflowType(),
-			TaskQueue:                tv.TaskQueue(),
-			WorkflowExecutionTimeout: durationpb.New(time.Second),
-			WorkflowTaskTimeout:      durationpb.New(2 * time.Second),
-			WorkflowIdReusePolicy:    enumspb.WORKFLOW_ID_REUSE_POLICY_UNSPECIFIED,
-			WorkflowIdConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_TERMINATE_EXISTING,
-			Identity:                 tv.WorkerIdentity(),
-			RequestId:                uuid.NewString(),
-			RequestEagerExecution:    true,
-		},
-	}
-	fixture.resetWorkflowCache = func() {
-		workflowCache := wcache.NewHostLevelCache(mockShard.GetConfig(), mockShard.GetLogger(), metrics.NoopMetricsHandler)
-		h.workflowConsistencyChecker = api.NewWorkflowConsistencyChecker(shardContext, workflowCache)
+	fixture.prepare = func(count int) []*historyservice.StartWorkflowExecutionRequest {
+		requests := make([]*historyservice.StartWorkflowExecutionRequest, count)
+		for index := range requests {
+			workflowID := uuid.NewString()
+			runID := uuid.NewString()
+			currentMutableState := workflow.NewMutableState(
+				mockShard,
+				mockEventsCache,
+				log.NewTestLogger(),
+				tests.GlobalNamespaceEntry,
+				workflowID,
+				runID,
+				mockShard.GetTimeSource().Now().Add(-2*time.Second),
+			)
+			currentMutableState.GetExecutionInfo().ExecutionTime = currentMutableState.GetExecutionState().StartTime
+			currentMutableState.GetExecutionState().FirstExecutionRunId = runID
+			currentMutableState.GetExecutionInfo().FirstExecutionRunId = runID
+			currentMutableState.GetExecutionInfo().TransitionHistory = workflow.UpdatedTransitionHistory(
+				currentMutableState.GetExecutionInfo().TransitionHistory,
+				tests.Version,
+			)
+			if err := currentMutableState.UpdateCurrentVersion(tests.Version, false); err != nil {
+				t.Fatalf("set current workflow version: %v", err)
+			}
+			if err := currentMutableState.SetHistoryTree(nil, nil, runID); err != nil {
+				t.Fatalf("set current workflow history tree: %v", err)
+			}
+			snapshot, workflowEvents, err := currentMutableState.CloseTransactionAsSnapshot(
+				context.Background(),
+				historyi.TransactionPolicyActive,
+			)
+			if err != nil {
+				t.Fatalf("close current workflow snapshot: %v", err)
+			}
+			if _, err := mockShard.CreateWorkflowExecution(context.Background(), &persistence.CreateWorkflowExecutionRequest{
+				ShardID:             mockShard.GetShardID(),
+				Mode:                persistence.CreateWorkflowModeBrandNew,
+				NewWorkflowSnapshot: *snapshot,
+				NewWorkflowEvents:   workflowEvents,
+			}); err != nil {
+				t.Fatalf("persist current workflow: %v", err)
+			}
+
+			requests[index] = &historyservice.StartWorkflowExecutionRequest{
+				Attempt:     1,
+				NamespaceId: tv.NamespaceID().String(),
+				StartRequest: &workflowservice.StartWorkflowExecutionRequest{
+					Namespace:                tv.NamespaceID().String(),
+					WorkflowId:               workflowID,
+					WorkflowType:             tv.WorkflowType(),
+					TaskQueue:                tv.TaskQueue(),
+					WorkflowExecutionTimeout: durationpb.New(time.Second),
+					WorkflowTaskTimeout:      durationpb.New(2 * time.Second),
+					WorkflowIdReusePolicy:    enumspb.WORKFLOW_ID_REUSE_POLICY_UNSPECIFIED,
+					WorkflowIdConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_TERMINATE_EXISTING,
+					Identity:                 tv.WorkerIdentity(),
+					RequestId:                uuid.NewString(),
+					RequestEagerExecution:    true,
+				},
+			}
+		}
+		return requests
 	}
 	fixture.close = func() {
-		sqliteExecutionManager.Close()
+		persistenceStore.Close()
 		ctrl.Finish()
 		mockShard.StopForTest()
 	}
 	return fixture
+}
+
+func mockTxProcessor(ctrl *gomock.Controller) *queues.MockQueue {
+	queue := queues.NewMockQueue(ctrl)
+	queue.EXPECT().Category().Return(tasks.CategoryTransfer).AnyTimes()
+	queue.EXPECT().NotifyNewTasks(gomock.Any()).AnyTimes()
+	return queue
+}
+
+func mockTimerProcessor(ctrl *gomock.Controller) *queues.MockQueue {
+	queue := queues.NewMockQueue(ctrl)
+	queue.EXPECT().Category().Return(tasks.CategoryTimer).AnyTimes()
+	queue.EXPECT().NotifyNewTasks(gomock.Any()).AnyTimes()
+	return queue
+}
+
+func mockVisibilityProcessor(ctrl *gomock.Controller) *queues.MockQueue {
+	queue := queues.NewMockQueue(ctrl)
+	queue.EXPECT().Category().Return(tasks.CategoryVisibility).AnyTimes()
+	queue.EXPECT().NotifyNewTasks(gomock.Any()).AnyTimes()
+	return queue
+}
+
+func mockArchivalProcessor(ctrl *gomock.Controller) *queues.MockQueue {
+	queue := queues.NewMockQueue(ctrl)
+	queue.EXPECT().Category().Return(tasks.CategoryArchival).AnyTimes()
+	queue.EXPECT().NotifyNewTasks(gomock.Any()).AnyTimes()
+	return queue
+}
+
+func mockMemoryScheduledQueue(ctrl *gomock.Controller) *queues.MockQueue {
+	queue := queues.NewMockQueue(ctrl)
+	queue.EXPECT().Category().Return(tasks.CategoryMemoryTimer).AnyTimes()
+	queue.EXPECT().NotifyNewTasks(gomock.Any()).AnyTimes()
+	return queue
+}
+
+func requireEagerStartConflictPostgres(t testing.TB) bool {
+	t.Helper()
+	if os.Getenv("TEMPORAL_EAGER_START_CONFLICT_POSTGRES_ADDR") == "" || os.Getenv("TEMPORAL_EAGER_START_CONFLICT_POSTGRES_SCHEMA") == "" {
+		t.Skip("requires the PostgreSQL fixture started by scripts/perf/run-eager-start-conflict-postgres.sh")
+		return false
+	}
+	return true
 }
 
 func assertEagerStartConflictResponse(t testing.TB, response *historyservice.StartWorkflowExecutionResponse, err error) {
@@ -383,27 +438,32 @@ func assertEagerStartConflictResponse(t testing.TB, response *historyservice.Sta
 }
 
 func TestEagerStartConflictReturnsInitialEvents(t *testing.T) {
+	if !requireEagerStartConflictPostgres(t) {
+		return
+	}
 	fixture := newEagerStartConflictFixture(t)
 	defer fixture.close()
 
-	response, err := fixture.engine.StartWorkflowExecution(metrics.AddMetricsContext(context.Background()), fixture.request)
+	request := fixture.prepare(1)[0]
+	response, err := fixture.engine.StartWorkflowExecution(metrics.AddMetricsContext(context.Background()), request)
 	assertEagerStartConflictResponse(t, response, err)
+	if historyReads := fixture.readHistoryCalls.Load(); historyReads > 1 {
+		t.Fatalf("eager conflict start made %d history reads, want at most 1", historyReads)
+	}
 }
 
 func BenchmarkEagerStartConflict(b *testing.B) {
+	if !requireEagerStartConflictPostgres(b) {
+		return
+	}
 	fixture := newEagerStartConflictFixture(b)
 	defer fixture.close()
 
-	var readHistoryCalls int64
+	request := fixture.prepare(1)[0]
 	for b.Loop() {
-		fixture.resetWorkflowCache()
-		fixture.request.StartRequest.RequestId = uuid.NewString()
-		readHistoryCallsBefore := fixture.readHistoryCalls.Load()
-
-		response, err := fixture.engine.StartWorkflowExecution(metrics.AddMetricsContext(context.Background()), fixture.request)
-
+		request.StartRequest.RequestId = uuid.NewString()
+		response, err := fixture.engine.StartWorkflowExecution(metrics.AddMetricsContext(context.Background()), request)
 		assertEagerStartConflictResponse(b, response, err)
-		readHistoryCalls += fixture.readHistoryCalls.Load() - readHistoryCallsBefore
 	}
-	b.ReportMetric(float64(readHistoryCalls)/float64(b.N), "db_calls/op")
+	b.ReportMetric(float64(fixture.readHistoryCalls.Load())/float64(b.N), "db_calls/op")
 }
