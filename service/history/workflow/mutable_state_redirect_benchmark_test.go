@@ -181,8 +181,8 @@ func TestFutureRetryTimerUsesRedirectedWorkflowBuildID(t *testing.T) {
 	if retryTimer.Stamp != retry.Stamp {
 		t.Fatalf("retry timer stamp = %d, want unchanged activity stamp %d", retryTimer.Stamp, retry.Stamp)
 	}
-	if got := MakeDirectiveForActivityTask(fixture.mutableState, retry).GetBuildId(); got != redirectBenchmarkTargetBuildID {
-		t.Fatalf("retry task directive build ID = %q, want %q", got, redirectBenchmarkTargetBuildID)
+	if got := fixture.mutableState.GetAssignedBuildId(); got != redirectBenchmarkTargetBuildID {
+		t.Fatalf("workflow build ID = %q, want %q", got, redirectBenchmarkTargetBuildID)
 	}
 }
 
