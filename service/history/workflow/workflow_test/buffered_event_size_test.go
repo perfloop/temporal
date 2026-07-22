@@ -116,7 +116,6 @@ func (h *bufferedEventSizeHarness) newActiveState(tb testing.TB) (*workflow.Muta
 				WorkflowTaskTimeout: durationpb.New(time.Second),
 			},
 		},
-		nil,
 	); err != nil {
 		tb.Fatalf("start workflow: %v", err)
 	}
