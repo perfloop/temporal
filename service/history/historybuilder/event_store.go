@@ -27,10 +27,10 @@ type EventStore struct {
 	dbBufferBatch []*historypb.HistoryEvent
 	dbClearBuffer bool
 
+	// Cache-owned buffered batch carried across transactions.
+	bufferedEventBatch *BufferedEventBatch
 	// Cumulative serialized size of DB and in-memory buffered events.
 	bufferedEventSize int
-	// Cache-owned buffered batch produced by Finish for the next transaction.
-	finishedBufferedEventBatch *BufferedEventBatch
 
 	// in mem events
 	memEventsBatches [][]*historypb.HistoryEvent
@@ -157,9 +157,9 @@ func (b *EventStore) SizeInBytesOfBufferedEvents() int {
 	return b.bufferedEventSize
 }
 
-// FinishedBufferedEventBatch returns the cache-owned batch produced by Finish.
+// FinishedBufferedEventBatch returns the cache-owned batch updated by Finish.
 func (b *EventStore) FinishedBufferedEventBatch() *BufferedEventBatch {
-	return b.finishedBufferedEventBatch
+	return b.bufferedEventBatch
 }
 
 func (b *EventStore) FlushBufferToCurrentBatch() (map[int64]int64, map[string]int64) {
@@ -230,11 +230,9 @@ func (b *EventStore) Finish(
 
 	dbEventsBatches := b.memEventsBatches
 	dbClearBuffer := b.dbClearBuffer
+	persistedBufferBatch := b.dbBufferBatch
 	dbBufferBatch := b.memBufferBatch
-	b.finishedBufferedEventBatch = newBufferedEventBatchFromOwnedEvents(
-		append(b.dbBufferBatch, dbBufferBatch...),
-		b.bufferedEventSize,
-	)
+	bufferedEventSize := b.bufferedEventSize
 	scheduledIDToStartedID := b.scheduledIDToStartedID
 	requestIDToEventID := b.requestIDToEventID
 
@@ -250,6 +248,9 @@ func (b *EventStore) Finish(
 	if err := b.assignTaskIDs(dbEventsBatches); err != nil {
 		return nil, err
 	}
+
+	b.bufferedEventBatch.events = append(persistedBufferBatch, dbBufferBatch...)
+	b.bufferedEventBatch.size = bufferedEventSize
 
 	return &HistoryMutation{
 		DBEventsBatches:        dbEventsBatches,

@@ -17,11 +17,7 @@ type BufferedEventBatch struct {
 // events so changes to the source record cannot stale the cached total.
 func NewBufferedEventBatch(events []*historypb.HistoryEvent) *BufferedEventBatch {
 	clonedEvents := cloneBufferedEvents(events)
-	return newBufferedEventBatchFromOwnedEvents(clonedEvents, bufferedEventBatchSize(clonedEvents))
-}
-
-func newBufferedEventBatchFromOwnedEvents(events []*historypb.HistoryEvent, size int) *BufferedEventBatch {
-	return &BufferedEventBatch{events: events, size: size}
+	return &BufferedEventBatch{events: clonedEvents, size: bufferedEventBatchSize(clonedEvents)}
 }
 
 // CloneEvents returns an isolated copy suitable for persistence output.
@@ -32,12 +28,16 @@ func (b *BufferedEventBatch) CloneEvents() []*historypb.HistoryEvent {
 // StampPrincipalOnLastEvents applies the active transaction's principal to
 // newly buffered events while keeping the cache's serialized total exact.
 func (b *BufferedEventBatch) StampPrincipalOnLastEvents(count int, principal *commonpb.Principal) {
+	cachedPrincipal := principal
+	if principal != nil {
+		cachedPrincipal = proto.Clone(principal).(*commonpb.Principal)
+	}
 	for _, event := range b.events[len(b.events)-count:] {
-		if event.Principal == nil && principal == nil {
+		if event.Principal == nil && cachedPrincipal == nil {
 			continue
 		}
 		oldSize := proto.Size(event)
-		event.Principal = principal
+		event.Principal = cachedPrincipal
 		b.size += proto.Size(event) - oldSize
 	}
 }

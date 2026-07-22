@@ -983,11 +983,12 @@ func (ms *MutableStateImpl) CloneToProto() *persistencespb.WorkflowMutableState 
 		ExecutionInfo:       ms.executionInfo,
 		ExecutionState:      ms.executionState,
 		NextEventId:         ms.hBuilder.NextEventID(),
-		BufferedEvents:      ms.bufferedEventBatch.CloneEvents(),
 		Checksum:            ms.checksum,
 	}
 
-	return common.CloneProto(msProto)
+	msProto = common.CloneProto(msProto)
+	msProto.BufferedEvents = ms.bufferedEventBatch.CloneEvents()
+	return msProto
 }
 
 func (ms *MutableStateImpl) GetWorkflowKey() definition.WorkflowKey {

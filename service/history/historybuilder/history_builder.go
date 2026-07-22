@@ -78,6 +78,7 @@ func New(
 			workflowFinished: false,
 
 			dbBufferBatch:          bufferedEventBatch.events,
+			bufferedEventBatch:     bufferedEventBatch,
 			bufferedEventSize:      bufferedEventBatch.size,
 			dbClearBuffer:          false,
 			memEventsBatches:       nil,
@@ -104,9 +105,10 @@ func NewImmutable(histories ...[]*historypb.HistoryEvent) *HistoryBuilder {
 	lastEvent := lastHistory[len(lastHistory)-1]
 	return &HistoryBuilder{
 		EventStore: EventStore{
-			state:           HistoryBuilderStateImmutable,
-			timeSource:      nil,
-			taskIDGenerator: nil,
+			state:              HistoryBuilderStateImmutable,
+			timeSource:         nil,
+			taskIDGenerator:    nil,
+			bufferedEventBatch: NewBufferedEventBatch(nil),
 
 			version:     lastEvent.GetVersion(),
 			nextEventID: lastEvent.GetEventId() + 1,
@@ -130,9 +132,10 @@ func NewImmutable(histories ...[]*historypb.HistoryEvent) *HistoryBuilder {
 func NewImmutableForUpdateNextEventID(lastVersionHistoryItem *historyspb.VersionHistoryItem) *HistoryBuilder {
 	return &HistoryBuilder{
 		EventStore: EventStore{
-			state:           HistoryBuilderStateImmutable,
-			timeSource:      nil,
-			taskIDGenerator: nil,
+			state:              HistoryBuilderStateImmutable,
+			timeSource:         nil,
+			taskIDGenerator:    nil,
+			bufferedEventBatch: NewBufferedEventBatch(nil),
 
 			version:     lastVersionHistoryItem.GetVersion(),
 			nextEventID: lastVersionHistoryItem.GetEventId() + 1,

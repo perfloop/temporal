@@ -1,6 +1,7 @@
 package historybuilder
 
 import (
+	"bytes"
 	"time"
 
 	commandpb "go.temporal.io/api/command/v1"
@@ -19,6 +20,7 @@ import (
 	"go.temporal.io/server/common/namespace"
 	"go.temporal.io/server/common/payload"
 	"go.temporal.io/server/common/worker_versioning"
+	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -830,15 +832,109 @@ func (b *EventFactory) CreateWorkflowExecutionSignaledEvent(
 	event.Attributes = &historypb.HistoryEvent_WorkflowExecutionSignaledEventAttributes{
 		WorkflowExecutionSignaledEventAttributes: &historypb.WorkflowExecutionSignaledEventAttributes{
 			SignalName:                signalName,
-			Input:                     input,
+			Input:                     cloneSignalPayloads(input),
 			Identity:                  identity,
-			Header:                    header,
-			ExternalWorkflowExecution: externalWorkflowExecution,
+			Header:                    cloneSignalHeader(header),
+			ExternalWorkflowExecution: cloneSignalWorkflowExecution(externalWorkflowExecution),
 			RequestId:                 requestID,
 		},
 	}
-	event.Links = links
+	event.Links = cloneSignalLinks(links)
 	return event
+}
+
+// Signal-event inputs can be retained in the buffered-event cache across
+// transactions. Snapshot the caller-owned structure that determines proto.Size
+// before retaining it so replacing an input, header, metadata entry, external
+// payload detail, or link cannot stale the cached byte total. Payload data is
+// intentionally shared: changing bytes in place cannot change proto.Size.
+func cloneSignalPayloads(input *commonpb.Payloads) *commonpb.Payloads {
+	if input == nil {
+		return nil
+	}
+	cloned := &commonpb.Payloads{Payloads: make([]*commonpb.Payload, len(input.Payloads))}
+	for i, payload := range input.Payloads {
+		cloned.Payloads[i] = cloneSignalPayload(payload)
+	}
+	cloneSignalUnknownFields(input, cloned)
+	return cloned
+}
+
+func cloneSignalHeader(header *commonpb.Header) *commonpb.Header {
+	if header == nil {
+		return nil
+	}
+	cloned := &commonpb.Header{Fields: make(map[string]*commonpb.Payload, len(header.Fields))}
+	for key, payload := range header.Fields {
+		cloned.Fields[key] = cloneSignalPayload(payload)
+	}
+	cloneSignalUnknownFields(header, cloned)
+	return cloned
+}
+
+func cloneSignalPayload(payload *commonpb.Payload) *commonpb.Payload {
+	if payload == nil {
+		return nil
+	}
+	cloned := &commonpb.Payload{
+		Metadata:         cloneSignalMetadata(payload.Metadata),
+		Data:             payload.Data,
+		ExternalPayloads: cloneSignalExternalPayloads(payload.ExternalPayloads),
+	}
+	cloneSignalUnknownFields(payload, cloned)
+	return cloned
+}
+
+func cloneSignalMetadata(metadata map[string][]byte) map[string][]byte {
+	if metadata == nil {
+		return nil
+	}
+	cloned := make(map[string][]byte, len(metadata))
+	for key, value := range metadata {
+		cloned[key] = bytes.Clone(value)
+	}
+	return cloned
+}
+
+func cloneSignalExternalPayloads(details []*commonpb.Payload_ExternalPayloadDetails) []*commonpb.Payload_ExternalPayloadDetails {
+	if details == nil {
+		return nil
+	}
+	cloned := make([]*commonpb.Payload_ExternalPayloadDetails, len(details))
+	for i, detail := range details {
+		if detail == nil {
+			continue
+		}
+		cloned[i] = &commonpb.Payload_ExternalPayloadDetails{SizeBytes: detail.SizeBytes}
+		cloneSignalUnknownFields(detail, cloned[i])
+	}
+	return cloned
+}
+
+func cloneSignalWorkflowExecution(execution *commonpb.WorkflowExecution) *commonpb.WorkflowExecution {
+	if execution == nil {
+		return nil
+	}
+	cloned := &commonpb.WorkflowExecution{WorkflowId: execution.WorkflowId, RunId: execution.RunId}
+	cloneSignalUnknownFields(execution, cloned)
+	return cloned
+}
+
+func cloneSignalLinks(links []*commonpb.Link) []*commonpb.Link {
+	if links == nil {
+		return nil
+	}
+	clonedLinks := make([]*commonpb.Link, len(links))
+	for i, link := range links {
+		if link != nil {
+			clonedLinks[i] = common.CloneProto(link)
+		}
+	}
+	return clonedLinks
+}
+
+func cloneSignalUnknownFields(source, destination interface{ ProtoReflect() protoreflect.Message }) {
+	destination.ProtoReflect().SetUnknown(bytes.Clone(source.ProtoReflect().GetUnknown()))
 }
 
 func (b *EventFactory) CreateStartChildWorkflowExecutionInitiatedEvent(
