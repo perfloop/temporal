@@ -63,7 +63,9 @@ const (
 const maxTokens = 1
 
 type pollerPQ struct {
-	heap []*waitingPoller
+	heap                      []*waitingPoller
+	queryOnlyCount            int
+	queryOnlyCountInitialized bool
 }
 
 // implements heap.Interface
@@ -93,6 +95,26 @@ func (p *pollerPQ) Remove(poller *waitingPoller) {
 	heap.Remove(p, poller.matchHeapIndex)
 }
 
+// ensureQueryOnlyCount initializes the cached count for an already-populated heap.
+func (p *pollerPQ) ensureQueryOnlyCount() {
+	if p.queryOnlyCountInitialized {
+		return
+	}
+
+	p.queryOnlyCount = 0
+	for _, poller := range p.heap {
+		if poller.queryOnly {
+			p.queryOnlyCount++
+		}
+	}
+	p.queryOnlyCountInitialized = true
+}
+
+func (p *pollerPQ) allQueryOnly() bool {
+	p.ensureQueryOnlyCount()
+	return len(p.heap) > 0 && p.queryOnlyCount == len(p.heap)
+}
+
 // implements heap.Interface, do not call directly
 func (p *pollerPQ) Swap(i int, j int) {
 	p.heap[i], p.heap[j] = p.heap[j], p.heap[i]
@@ -102,17 +124,25 @@ func (p *pollerPQ) Swap(i int, j int) {
 
 // implements heap.Interface, do not call directly
 func (p *pollerPQ) Push(x any) {
+	p.ensureQueryOnlyCount()
 	poller := x.(*waitingPoller) // nolint:revive
 	poller.matchHeapIndex = len(p.heap)
 	p.heap = append(p.heap, poller)
+	if poller.queryOnly {
+		p.queryOnlyCount++
+	}
 }
 
 // implements heap.Interface, do not call directly
 func (p *pollerPQ) Pop() any {
+	p.ensureQueryOnlyCount()
 	last := len(p.heap) - 1
 	poller := p.heap[last]
 	p.heap = p.heap[:last]
 	poller.matchHeapIndex = invalidHeapIndex
+	if poller.queryOnly {
+		p.queryOnlyCount--
+	}
 	return poller
 }
 
@@ -431,7 +461,13 @@ func (d *matcherData) findMatch(allowForwarding bool, now int64) (matchedTask *i
 		}
 	}
 
+	onlyQueryPollers := d.pollers.allQueryOnly()
 	d.tasks.tree.Scan(func(task *internalTask) bool {
+		if onlyQueryPollers && !task.isQuery() && !task.isPollForwarder() {
+			// Query-only pollers cannot match regular tasks.
+			return true
+		}
+
 		// disallow normal poll forwarding when allowForwarding is false, but allow the
 		// "priority backlog poll forwarders".
 		if !allowForwarding && task.pollForwarderType == parentPollForwarder {
