@@ -8,7 +8,6 @@ import (
 
 	"github.com/google/uuid"
 	enumspb "go.temporal.io/api/enums/v1"
-	historypb "go.temporal.io/api/history/v1"
 	"go.temporal.io/api/workflowservice/v1"
 	historyspb "go.temporal.io/server/api/history/v1"
 	"go.temporal.io/server/api/historyservice/v1"
@@ -16,17 +15,24 @@ import (
 	"go.temporal.io/server/common"
 	"go.temporal.io/server/common/clock"
 	"go.temporal.io/server/common/cluster"
+	"go.temporal.io/server/common/config"
 	"go.temporal.io/server/common/dynamicconfig"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/namespace"
 	"go.temporal.io/server/common/persistence"
+	"go.temporal.io/server/common/persistence/serialization"
+	persistencesql "go.temporal.io/server/common/persistence/sql"
+	"go.temporal.io/server/common/persistence/sql/sqlplugin"
+	"go.temporal.io/server/common/persistence/sql/sqlplugin/sqlite"
+	"go.temporal.io/server/common/resolver"
 	"go.temporal.io/server/common/searchattribute"
 	"go.temporal.io/server/common/tasktoken"
 	"go.temporal.io/server/common/testing/testvars"
 	"go.temporal.io/server/service/history/api"
 	"go.temporal.io/server/service/history/events"
 	"go.temporal.io/server/service/history/hsm"
+	historyi "go.temporal.io/server/service/history/interfaces"
 	"go.temporal.io/server/service/history/ndc"
 	"go.temporal.io/server/service/history/queues"
 	"go.temporal.io/server/service/history/shard"
@@ -42,12 +48,117 @@ import (
 
 var eagerStartConflictFixtureTime = time.Date(2025, time.January, 1, 0, 0, 0, 0, time.UTC)
 
+type eagerStartConflictShardContext struct {
+	historyi.ShardContext
+	executionManager persistence.ExecutionManager
+}
+
+func (s *eagerStartConflictShardContext) GetExecutionManager() persistence.ExecutionManager {
+	return s.executionManager
+}
+
+// sqliteHistoryReadCounter delegates the production history read to Temporal's
+// SQLite execution manager. The fixture persists the events through that same
+// manager before this counter is reached, so it never supplies synthetic history.
+type sqliteHistoryReadCounter struct {
+	persistence.ExecutionManager
+	sqliteExecutionManager persistence.ExecutionManager
+	readHistoryCalls       *atomic.Int64
+}
+
+func (m *sqliteHistoryReadCounter) Close() {
+	m.sqliteExecutionManager.Close()
+}
+
+func (m *sqliteHistoryReadCounter) GetName() string {
+	return m.sqliteExecutionManager.GetName()
+}
+
+func (m *sqliteHistoryReadCounter) GetHistoryBranchUtil() persistence.HistoryBranchUtil {
+	return m.sqliteExecutionManager.GetHistoryBranchUtil()
+}
+
+func (m *sqliteHistoryReadCounter) ReadHistoryBranch(
+	ctx context.Context,
+	request *persistence.ReadHistoryBranchRequest,
+) (*persistence.ReadHistoryBranchResponse, error) {
+	response, err := m.sqliteExecutionManager.ReadHistoryBranch(ctx, request)
+	if err == nil {
+		m.readHistoryCalls.Add(1)
+	}
+	return response, err
+}
+
 type eagerStartConflictFixture struct {
 	engine             *historyEngineImpl
 	request            *historyservice.StartWorkflowExecutionRequest
 	readHistoryCalls   atomic.Int64
 	resetWorkflowCache func()
 	close              func()
+}
+
+func newSQLiteHistoryExecutionManager(t testing.TB) persistence.ExecutionManager {
+	t.Helper()
+
+	logger := log.NewNoopLogger()
+	serializer := serialization.NewSerializer()
+	database, err := persistencesql.NewSQLDB(
+		sqlplugin.DbKindMain,
+		&config.SQL{
+			PluginName:        sqlite.PluginName,
+			DatabaseName:      uuid.NewString(),
+			ConnectAttributes: map[string]string{"mode": "memory", "cache": "private"},
+		},
+		resolver.NewNoopResolver(),
+		logger,
+		metrics.NoopMetricsHandler,
+	)
+	if err != nil {
+		t.Fatalf("create SQLite database: %v", err)
+	}
+
+	executionStore, err := persistencesql.NewSQLExecutionStore(database, logger, serializer)
+	if err != nil {
+		_ = database.Close()
+		t.Fatalf("create SQLite execution store: %v", err)
+	}
+	return persistence.NewExecutionManager(
+		executionStore,
+		serializer,
+		nil,
+		logger,
+		dynamicconfig.GetIntPropertyFn(4*1024*1024),
+		dynamicconfig.GetBoolPropertyFn(false),
+	)
+}
+
+func persistEagerStartConflictHistory(
+	t testing.TB,
+	executionManager persistence.ExecutionManager,
+	ctx context.Context,
+	request *persistence.UpdateWorkflowExecutionRequest,
+) {
+	t.Helper()
+	if len(request.NewWorkflowEvents) == 0 {
+		t.Fatal("eager-start conflict transaction did not produce history events")
+	}
+	for index, workflowEvents := range request.NewWorkflowEvents {
+		if len(workflowEvents.Events) == 0 {
+			t.Fatal("eager-start conflict transaction produced an empty history batch")
+		}
+		_, err := executionManager.AppendHistoryNodes(ctx, &persistence.AppendHistoryNodesRequest{
+			ShardID:           request.ShardID,
+			IsNewBranch:       index == 0,
+			Info:              "eager-start-conflict-fixture",
+			BranchToken:       workflowEvents.BranchToken,
+			Events:            workflowEvents.Events,
+			PrevTransactionID: workflowEvents.PrevTxnID,
+			TransactionID:     workflowEvents.TxnID,
+		})
+		if err != nil {
+			t.Fatalf("persist eager-start conflict history: %v", err)
+		}
+	}
 }
 
 func newEagerStartConflictFixture(t testing.TB) *eagerStartConflictFixture {
@@ -94,6 +205,17 @@ func newEagerStartConflictFixture(t testing.TB) *eagerStartConflictFixture {
 	mockClusterMetadata := mockShard.Resource.ClusterMetadata
 	mockVisibilityManager := mockShard.Resource.VisibilityManager
 	mockEventsCache := mockShard.MockEventsCache
+	fixture := &eagerStartConflictFixture{}
+	sqliteExecutionManager := newSQLiteHistoryExecutionManager(t)
+	countingExecutionManager := &sqliteHistoryReadCounter{
+		ExecutionManager:       mockExecutionMgr,
+		sqliteExecutionManager: sqliteExecutionManager,
+		readHistoryCalls:       &fixture.readHistoryCalls,
+	}
+	shardContext := &eagerStartConflictShardContext{
+		ShardContext:     mockShard,
+		executionManager: countingExecutionManager,
+	}
 
 	mockNamespaceCache.EXPECT().GetNamespaceByID(tests.NamespaceID).Return(tests.GlobalNamespaceEntry, nil).AnyTimes()
 	mockNamespaceCache.EXPECT().GetNamespaceByID(tests.ParentNamespaceID).Return(tests.GlobalParentNamespaceEntry, nil).AnyTimes()
@@ -117,9 +239,9 @@ func newEagerStartConflictFixture(t testing.TB) *eagerStartConflictFixture {
 
 	h := &historyEngineImpl{
 		currentClusterName: mockShard.GetClusterMetadata().GetCurrentClusterName(),
-		shardContext:       mockShard,
+		shardContext:       shardContext,
 		clusterMetadata:    mockClusterMetadata,
-		executionManager:   mockExecutionMgr,
+		executionManager:   countingExecutionManager,
 		logger:             logger,
 		throttledLogger:    logger,
 		metricsHandler:     metrics.NoopMetricsHandler,
@@ -146,7 +268,7 @@ func newEagerStartConflictFixture(t testing.TB) *eagerStartConflictFixture {
 			metrics.NoopMetricsHandler,
 			log.NewNoopLogger(),
 		),
-		workflowConsistencyChecker: api.NewWorkflowConsistencyChecker(mockShard, workflowCache),
+		workflowConsistencyChecker: api.NewWorkflowConsistencyChecker(shardContext, workflowCache),
 		persistenceVisibilityMgr:   mockVisibilityManager,
 		nDCWorkflowStateReplicator: mockWorkflowStateReplicator,
 		workerDeploymentClient:     noopWorkerDeploymentClient{},
@@ -163,7 +285,7 @@ func newEagerStartConflictFixture(t testing.TB) *eagerStartConflictFixture {
 	).Return(nil, currentWorkflowConditionFailedError).AnyTimes()
 
 	currentMutableState := workflow.NewMutableState(
-		mockShard,
+		shardContext,
 		mockEventsCache,
 		log.NewTestLogger(),
 		tests.GlobalNamespaceEntry,
@@ -185,30 +307,19 @@ func newEagerStartConflictFixture(t testing.TB) *eagerStartConflictFixture {
 		gomock.Cond(func(request *persistence.UpdateWorkflowExecutionRequest) bool {
 			return request.UpdateWorkflowMutation.ExecutionState.Status == enumspb.WORKFLOW_EXECUTION_STATUS_TERMINATED
 		}),
-	).Return(&persistence.UpdateWorkflowExecutionResponse{
-		UpdateMutableStateStats: persistence.MutableStateStatistics{
-			HistoryStatistics: &persistence.HistoryStatistics{SizeDiff: 1},
-		},
-	}, nil).AnyTimes()
+	).DoAndReturn(func(ctx context.Context, request *persistence.UpdateWorkflowExecutionRequest) (*persistence.UpdateWorkflowExecutionResponse, error) {
+		persistEagerStartConflictHistory(t, sqliteExecutionManager, ctx, request)
+		return &persistence.UpdateWorkflowExecutionResponse{
+			UpdateMutableStateStats: persistence.MutableStateStatistics{
+				HistoryStatistics: &persistence.HistoryStatistics{SizeDiff: 1},
+			},
+		}, nil
+	}).AnyTimes()
 	currentWorkflowState := workflow.TestCloneToProto(context.Background(), currentMutableState)
 	mockExecutionMgr.EXPECT().GetWorkflowExecution(gomock.Any(), gomock.Any()).DoAndReturn(
 		func(context.Context, *persistence.GetWorkflowExecutionRequest) (*persistence.GetWorkflowExecutionResponse, error) {
 			return &persistence.GetWorkflowExecutionResponse{
 				State: proto.Clone(currentWorkflowState).(*persistencespb.WorkflowMutableState),
-			}, nil
-		},
-	).AnyTimes()
-
-	fixture := &eagerStartConflictFixture{}
-	mockExecutionMgr.EXPECT().ReadHistoryBranch(gomock.Any(), gomock.Any()).DoAndReturn(
-		func(context.Context, *persistence.ReadHistoryBranchRequest) (*persistence.ReadHistoryBranchResponse, error) {
-			fixture.readHistoryCalls.Add(1)
-			return &persistence.ReadHistoryBranchResponse{
-				HistoryEvents: []*historypb.HistoryEvent{
-					{EventId: 1, EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED},
-					{EventId: 2, EventType: enumspb.EVENT_TYPE_WORKFLOW_TASK_SCHEDULED},
-					{EventId: 3, EventType: enumspb.EVENT_TYPE_WORKFLOW_TASK_STARTED},
-				},
 			}, nil
 		},
 	).AnyTimes()
@@ -233,9 +344,10 @@ func newEagerStartConflictFixture(t testing.TB) *eagerStartConflictFixture {
 	}
 	fixture.resetWorkflowCache = func() {
 		workflowCache := wcache.NewHostLevelCache(mockShard.GetConfig(), mockShard.GetLogger(), metrics.NoopMetricsHandler)
-		h.workflowConsistencyChecker = api.NewWorkflowConsistencyChecker(mockShard, workflowCache)
+		h.workflowConsistencyChecker = api.NewWorkflowConsistencyChecker(shardContext, workflowCache)
 	}
 	fixture.close = func() {
+		sqliteExecutionManager.Close()
 		ctrl.Finish()
 		mockShard.StopForTest()
 	}
