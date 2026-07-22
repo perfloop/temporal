@@ -318,6 +318,103 @@ func (s *mutableStateSuite) TestTransientWorkflowTaskCompletionFirstBatchApplied
 	s.Equal(0, s.mutableState.hBuilder.NumBufferedEvents())
 }
 
+func (s *mutableStateSuite) TestApplyBuildIdRedirectSkipsFutureRetryAndReschedulesOtherRetries() {
+	const (
+		startingTaskScheduledEventID int64 = 1
+		futureRetryScheduledEventID  int64 = 2
+		readyRetryScheduledEventID   int64 = 3
+		pausedRetryScheduledEventID  int64 = 4
+		initialBuildID                     = "build-before-redirect"
+		targetBuildID                      = "build-after-redirect"
+	)
+
+	s.mutableState.executionInfo.ExecutionTime = s.mutableState.executionState.StartTime
+	s.mutableState.executionInfo.AssignedBuildId = initialBuildID
+	s.mutableState.executionInfo.LastCompletedWorkflowTaskStartedEventId = startingTaskScheduledEventID
+	s.mutableState.addPendingActivityInfo(&persistencespb.ActivityInfo{
+		ScheduledEventId: startingTaskScheduledEventID,
+		StartedEventId:   common.EmptyEventID,
+		ActivityId:       "redirect-trigger",
+		TaskQueue:        "test-task-queue",
+	})
+
+	now := s.mutableState.timeSource.Now().UTC()
+	newRetry := func(scheduledEventID int64, scheduledTime time.Time, activityID string) *persistencespb.ActivityInfo {
+		return &persistencespb.ActivityInfo{
+			Version:          1,
+			ScheduledEventId: scheduledEventID,
+			StartedEventId:   common.EmptyEventID,
+			ScheduledTime:    timestamppb.New(scheduledTime),
+			ActivityId:       activityID,
+			TaskQueue:        "test-task-queue",
+			HasRetryPolicy:   true,
+			Attempt:          2,
+			BuildIdInfo: &persistencespb.ActivityInfo_UseWorkflowBuildIdInfo_{
+				UseWorkflowBuildIdInfo: &persistencespb.ActivityInfo_UseWorkflowBuildIdInfo{
+					LastUsedBuildId: initialBuildID,
+				},
+			},
+		}
+	}
+	futureRetry := newRetry(futureRetryScheduledEventID, now.Add(time.Hour), "future-retry")
+	readyRetry := newRetry(readyRetryScheduledEventID, now.Add(-time.Second), "ready-retry")
+	pausedRetry := newRetry(pausedRetryScheduledEventID, now.Add(time.Hour), "paused-retry")
+	pausedRetry.Paused = true
+	for _, retry := range []*persistencespb.ActivityInfo{futureRetry, readyRetry, pausedRetry} {
+		s.mutableState.addPendingActivityInfo(retry)
+		s.Require().NoError(s.mutableState.taskGenerator.GenerateActivityRetryTasks(retry))
+	}
+
+	timerTasks := s.mutableState.PopTasks()[tasks.CategoryTimer]
+	s.Require().Len(timerTasks, 3)
+	var futureRetryTimer *tasks.ActivityRetryTimerTask
+	for _, task := range timerTasks {
+		retryTimer, ok := task.(*tasks.ActivityRetryTimerTask)
+		s.Require().True(ok, "retry timer task type = %T", task)
+		if retryTimer.EventID == futureRetryScheduledEventID {
+			futureRetryTimer = retryTimer
+		}
+	}
+	s.Require().NotNil(futureRetryTimer)
+	s.mutableState.updateActivityInfos = make(map[int64]*persistencespb.ActivityInfo)
+
+	s.Require().NoError(s.mutableState.ApplyBuildIdRedirect(
+		startingTaskScheduledEventID,
+		targetBuildID,
+		1,
+	))
+
+	var readyActivityTask *tasks.ActivityTask
+	var pausedActivityTask *tasks.ActivityTask
+	for _, task := range s.mutableState.PopTasks()[tasks.CategoryTransfer] {
+		activityTask, ok := task.(*tasks.ActivityTask)
+		if !ok {
+			continue
+		}
+		s.NotEqual(futureRetryScheduledEventID, activityTask.ScheduledEventID, "future retry generated an immediate activity task")
+		if activityTask.ScheduledEventID == readyRetryScheduledEventID {
+			readyActivityTask = activityTask
+		}
+		if activityTask.ScheduledEventID == pausedRetryScheduledEventID {
+			pausedActivityTask = activityTask
+		}
+	}
+	s.Require().NotNil(readyActivityTask)
+	s.Require().NotNil(pausedActivityTask)
+	s.NotContains(s.mutableState.updateActivityInfos, futureRetryScheduledEventID)
+	s.Contains(s.mutableState.updateActivityInfos, readyRetryScheduledEventID)
+	s.Contains(s.mutableState.updateActivityInfos, pausedRetryScheduledEventID)
+	s.EqualValues(0, futureRetry.Stamp)
+	s.EqualValues(1, readyRetry.Stamp)
+	s.EqualValues(1, pausedRetry.Stamp)
+	s.Equal(readyRetry.Stamp, readyActivityTask.Stamp)
+	s.Equal(pausedRetry.Stamp, pausedActivityTask.Stamp)
+	s.Equal(futureRetryScheduledEventID, futureRetryTimer.EventID)
+	s.Equal(futureRetry.Attempt, futureRetryTimer.Attempt)
+	s.Equal(futureRetry.Stamp, futureRetryTimer.Stamp)
+	s.Equal(targetBuildID, s.mutableState.GetAssignedBuildId())
+}
+
 func (s *mutableStateSuite) TestRedirectInfoValidation_Valid() {
 	tq := &taskqueuepb.TaskQueue{Name: "tq"}
 	s.createVersionedMutableStateWithCompletedWFT(tq)

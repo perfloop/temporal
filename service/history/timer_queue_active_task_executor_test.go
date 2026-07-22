@@ -1342,6 +1342,37 @@ func (s *timerQueueActiveTaskExecutorSuite) TestWorkflowBackoffTimer_Noop() {
 	s.ErrorIs(resp.ExecutionErr, errNoTimerFired)
 }
 
+func (s *timerQueueActiveTaskExecutorSuite) TestMakeDirectiveForActivityTaskUsesRedirectedWorkflowBuildID() {
+	const (
+		initialBuildID = "build-before-redirect"
+		targetBuildID  = "build-after-redirect"
+	)
+
+	mutableState := workflow.TestGlobalMutableState(
+		s.mockShard,
+		s.mockShard.GetEventsCache(),
+		s.logger,
+		s.version,
+		"workflow-id",
+		"run-id",
+	)
+	mutableState.GetExecutionInfo().AssignedBuildId = targetBuildID
+	activityInfo := &persistencespb.ActivityInfo{
+		HasRetryPolicy: true,
+		Attempt:        2,
+		BuildIdInfo: &persistencespb.ActivityInfo_UseWorkflowBuildIdInfo_{
+			UseWorkflowBuildIdInfo: &persistencespb.ActivityInfo_UseWorkflowBuildIdInfo{
+				LastUsedBuildId: initialBuildID,
+			},
+		},
+	}
+
+	s.Equal(
+		worker_versioning.MakeBuildIdDirective(targetBuildID),
+		MakeDirectiveForActivityTask(mutableState, activityInfo),
+	)
+}
+
 func (s *timerQueueActiveTaskExecutorSuite) TestActivityRetryTimer_Fire() {
 	execution := &commonpb.WorkflowExecution{
 		WorkflowId: "some random workflow ID",

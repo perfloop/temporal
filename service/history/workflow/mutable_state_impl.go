@@ -3701,13 +3701,15 @@ func (ms *MutableStateImpl) ApplyBuildIdRedirect(
 		return err
 	}
 
+	now := ms.timeSource.Now().UTC()
 	for _, ai := range ms.GetPendingActivityInfos() {
 		if ai.ScheduledEventId == startingTaskScheduledEventId ||
 			// activity already started
 			ai.StartedEventId != common.EmptyEventID ||
 			// activity does not depend on wf build ID
-			ai.GetUseWorkflowBuildIdInfo() == nil {
-			// TODO: skip task generation also when activity is in backoff period
+			ai.GetUseWorkflowBuildIdInfo() == nil ||
+			// retry timer will dispatch it with the new workflow build ID when backoff expires
+			activityPendingRetry(ai) && now.Before(ai.GetScheduledTime().AsTime()) {
 			continue
 		}
 
