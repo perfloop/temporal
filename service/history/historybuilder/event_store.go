@@ -24,7 +24,17 @@ type BufferedEventBatch struct {
 // NewBufferedEventBatch takes exclusive ownership of events.
 // Callers must not mutate or reuse the events after handing them to the batch.
 func NewBufferedEventBatch(events []*historypb.HistoryEvent) *BufferedEventBatch {
-	return &BufferedEventBatch{events: events, sizeKnown: len(events) == 0}
+	batch := &BufferedEventBatch{}
+	batch.Reset(events)
+	return batch
+}
+
+// Reset takes exclusive ownership of events and discards the batch's prior state.
+// Callers must not mutate or reuse the events after handing them to the batch.
+func (b *BufferedEventBatch) Reset(events []*historypb.HistoryEvent) {
+	b.events = events
+	b.size = 0
+	b.sizeKnown = len(events) == 0
 }
 
 // Events returns copies of the buffered events owned by this batch.

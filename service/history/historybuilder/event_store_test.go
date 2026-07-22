@@ -59,6 +59,37 @@ func TestBufferedEventBatchDoesNotExposeEventsToFilters(t *testing.T) {
 	}
 }
 
+func TestBufferedEventBatchFilterCannotStaleSerializedSize(t *testing.T) {
+	input := &historypb.HistoryEvent{
+		EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_SIGNALED,
+		Attributes: &historypb.HistoryEvent_WorkflowExecutionSignaledEventAttributes{
+			WorkflowExecutionSignaledEventAttributes: &historypb.WorkflowExecutionSignaledEventAttributes{
+				Input: &commonpb.Payloads{Payloads: []*commonpb.Payload{{Data: []byte("initial-payload")}}},
+			},
+		},
+	}
+	wantSize := proto.Size(input)
+	batch := NewBufferedEventBatch([]*historypb.HistoryEvent{input})
+	builder := newBufferedEventBatchHistoryBuilder(batch)
+	if got := builder.SizeInBytesOfBufferedEvents(); got != wantSize {
+		t.Fatalf("initial cached buffered size: got %d, want %d", got, wantSize)
+	}
+
+	if !builder.HasAnyBufferedEvent(func(event *historypb.HistoryEvent) bool {
+		payload := event.GetWorkflowExecutionSignaledEventAttributes().GetInput().GetPayloads()[0]
+		payload.Data = append(payload.Data, "-filter-mutation"...)
+		return true
+	}) {
+		t.Fatal("filter did not receive buffered event")
+	}
+	if got := builder.SizeInBytesOfBufferedEvents(); got != wantSize {
+		t.Fatalf("filter mutation changed cached buffered size: got %d, want %d", got, wantSize)
+	}
+	if got := proto.Size(batch.Events()[0]); got != wantSize {
+		t.Fatalf("filter mutation changed retained buffered event: got %d, want %d", got, wantSize)
+	}
+}
+
 func TestBufferedEventBatchUsesCurrentSizeForNewEvents(t *testing.T) {
 	builder := newBufferedEventBatchHistoryBuilder(NewBufferedEventBatch(nil))
 	event := builder.AddWorkflowExecutionSignaledEvent("signal", nil, "identity", nil, nil, "request-id", nil)
