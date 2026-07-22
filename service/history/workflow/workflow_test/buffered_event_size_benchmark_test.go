@@ -29,10 +29,10 @@ type bufferedEventCadence struct {
 // transaction close, and cache-reuse boundary is timed.
 func BenchmarkBufferSizeAcceptableActiveSignalCadence(b *testing.B) {
 	shapes := []bufferedEventCadenceShape{
-		{name: "1x256B", initialSignals: 1, additionalCommits: 2, payloadBytes: 256},
-		{name: "25x1KiB", initialSignals: 20, additionalCommits: 5, payloadBytes: 1024},
-		{name: "50x4KiB", initialSignals: 45, additionalCommits: 5, payloadBytes: 4 * 1024},
-		{name: "100x4KiB", initialSignals: 95, additionalCommits: 5, payloadBytes: 4 * 1024},
+		{name: "1x256B", initialSignals: 1, additionalCommits: 1, payloadBytes: 256},
+		{name: "25x1KiB", initialSignals: 1, additionalCommits: 24, payloadBytes: 1024},
+		{name: "50x4KiB", initialSignals: 1, additionalCommits: 49, payloadBytes: 4 * 1024},
+		{name: "100x4KiB", initialSignals: 1, additionalCommits: 99, payloadBytes: 4 * 1024},
 	}
 	h := newBufferedEventSizeHarness(b, 100, math.MaxInt)
 	ctx := headers.SetPrincipal(context.Background(), &commonpb.Principal{Type: "user", Name: "benchmark-principal"})
