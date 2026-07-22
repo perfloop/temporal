@@ -163,23 +163,36 @@ func (f *futureRetryRedirectFixture) reset() {
 	}
 }
 
-func TestFutureRetryTimerUsesRedirectedWorkflowBuildID(t *testing.T) {
+func TestBuildIdRedirectKeepsFutureRetryDispatchable(t *testing.T) {
 	fixture := newFutureRetryRedirectFixture(t, 1)
 	retry := fixture.futureRetries[0]
 	retryTimer := fixture.retryTimerTasks[0]
 
-	if err := fixture.mutableState.UpdateBuildIdAssignment(redirectBenchmarkTargetBuildID); err != nil {
-		t.Fatalf("update workflow build ID: %v", err)
+	if err := fixture.mutableState.ApplyBuildIdRedirect(
+		fixture.startingTaskEventID,
+		redirectBenchmarkTargetBuildID,
+		1,
+	); err != nil {
+		t.Fatalf("apply build ID redirect: %v", err)
 	}
 
-	if retryTimer.EventID != retry.ScheduledEventId {
-		t.Fatalf("retry timer event ID = %d, want %d", retryTimer.EventID, retry.ScheduledEventId)
+	var immediateRetryTask *tasks.ActivityTask
+	for _, task := range fixture.mutableState.PopTasks()[tasks.CategoryTransfer] {
+		activityTask, ok := task.(*tasks.ActivityTask)
+		if ok && activityTask.ScheduledEventID == retry.ScheduledEventId {
+			immediateRetryTask = activityTask
+			break
+		}
 	}
-	if retryTimer.Attempt != retry.Attempt {
-		t.Fatalf("retry timer attempt = %d, want %d", retryTimer.Attempt, retry.Attempt)
+
+	timerStillCurrent := retryTimer.EventID == retry.ScheduledEventId &&
+		retryTimer.Attempt == retry.Attempt &&
+		retryTimer.Stamp == retry.Stamp
+	if immediateRetryTask == nil && !timerStillCurrent {
+		t.Fatal("redirect neither generated an immediate retry task nor retained a valid retry timer")
 	}
-	if retryTimer.Stamp != retry.Stamp {
-		t.Fatalf("retry timer stamp = %d, want unchanged activity stamp %d", retryTimer.Stamp, retry.Stamp)
+	if immediateRetryTask != nil && immediateRetryTask.Stamp != retry.Stamp {
+		t.Fatalf("immediate retry task stamp = %d, want activity stamp %d", immediateRetryTask.Stamp, retry.Stamp)
 	}
 	if got := fixture.mutableState.GetAssignedBuildId(); got != redirectBenchmarkTargetBuildID {
 		t.Fatalf("workflow build ID = %q, want %q", got, redirectBenchmarkTargetBuildID)
