@@ -13,20 +13,18 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// BufferedEventBatch owns deep copies of buffered events that survive one HistoryBuilder.
-// Its serialized size is maintained as events are added, removed, or changed.
+// BufferedEventBatch owns buffered events that survive one HistoryBuilder.
+// Its serialized size is initialized lazily and maintained as events are added, removed, or changed.
 type BufferedEventBatch struct {
-	events []*historypb.HistoryEvent
-	size   int
+	events    []*historypb.HistoryEvent
+	size      int
+	sizeKnown bool
 }
 
-// NewBufferedEventBatch deep-copies the supplied events into an ownership-safe buffered-event batch.
+// NewBufferedEventBatch takes exclusive ownership of events.
+// Callers must not mutate or reuse the events after handing them to the batch.
 func NewBufferedEventBatch(events []*historypb.HistoryEvent) *BufferedEventBatch {
-	batch := &BufferedEventBatch{events: cloneBufferedEvents(events)}
-	for _, event := range batch.events {
-		batch.size += proto.Size(event)
-	}
-	return batch
+	return &BufferedEventBatch{events: events, sizeKnown: len(events) == 0}
 }
 
 // Events returns copies of the buffered events owned by this batch.
@@ -48,23 +46,42 @@ func cloneBufferedEvents(events []*historypb.HistoryEvent) []*historypb.HistoryE
 	return clones
 }
 
-func (b *BufferedEventBatch) append(events []*historypb.HistoryEvent) []*historypb.HistoryEvent {
+func (b *BufferedEventBatch) append(events []*historypb.HistoryEvent) {
+	b.ensureSize()
 	clones := cloneBufferedEvents(events)
 	b.events = append(b.events, clones...)
 	for _, event := range clones {
 		b.size += proto.Size(event)
 	}
-	return clones
+}
+
+func (b *BufferedEventBatch) sizeInBytes() int {
+	b.ensureSize()
+	return b.size
+}
+
+func (b *BufferedEventBatch) ensureSize() {
+	if b.sizeKnown {
+		return
+	}
+
+	b.size = 0
+	for _, event := range b.events {
+		b.size += proto.Size(event)
+	}
+	b.sizeKnown = true
 }
 
 func (b *BufferedEventBatch) take() []*historypb.HistoryEvent {
 	events := b.events
 	b.events = nil
 	b.size = 0
+	b.sizeKnown = true
 	return events
 }
 
 func (b *BufferedEventBatch) getAndRemoveTimerFireEvent(timerID string) *historypb.HistoryEvent {
+	b.ensureSize()
 	var event *historypb.HistoryEvent
 	b.events, event = deleteTimerFiredEvent(timerID, b.events)
 	if event != nil {
@@ -211,7 +228,12 @@ func (b *EventStore) HasAnyBufferedEvent(predicate BufferedEventFilter) bool {
 	if slices.ContainsFunc(b.memBufferBatch, predicate) {
 		return true
 	}
-	return slices.ContainsFunc(b.dbBufferedEvents(), predicate)
+	if b.bufferedEventBatch != nil {
+		return slices.ContainsFunc(b.bufferedEventBatch.events, func(event *historypb.HistoryEvent) bool {
+			return predicate(proto.CloneOf(event))
+		})
+	}
+	return slices.ContainsFunc(b.dbBufferBatch, predicate)
 }
 
 func (b *EventStore) NumBufferedEvents() int {
@@ -221,13 +243,14 @@ func (b *EventStore) NumBufferedEvents() int {
 func (b *EventStore) SizeInBytesOfBufferedEvents() int {
 	var size int
 	if b.bufferedEventBatch != nil {
-		size = b.bufferedEventBatch.size
+		size = b.bufferedEventBatch.sizeInBytes()
 	} else {
 		for _, event := range b.dbBufferBatch {
 			size += proto.Size(event)
 		}
 	}
-	// Newly buffered events remain caller-owned until Finish, so their current size is authoritative.
+	// The batch caches the retained persisted prefix. Newly buffered events remain caller-owned
+	// until Finish, so their current size is authoritative.
 	for _, event := range b.memBufferBatch {
 		size += proto.Size(event)
 	}
@@ -327,12 +350,7 @@ func (b *EventStore) Finish(
 	dbBufferBatch := b.memBufferBatch
 	if b.stampBufferedEvents {
 		for _, event := range dbBufferBatch {
-			if event != nil {
-				event.Principal = newBufferedEventPrincipal(
-					b.bufferedEventPrincipal.GetType(),
-					b.bufferedEventPrincipal.GetName(),
-				)
-			}
+			event.Principal = b.bufferedEventPrincipal
 		}
 	}
 	var memBufferBatch []*historypb.HistoryEvent
@@ -358,12 +376,14 @@ func (b *EventStore) Finish(
 		return nil, err
 	}
 
+	bufferedEventBatch := b.bufferedEventBatch
+	b.bufferedEventBatch = nil
 	return &HistoryMutation{
 		DBEventsBatches:        dbEventsBatches,
 		DBClearBuffer:          dbClearBuffer,
 		DBBufferBatch:          dbBufferBatch,
 		MemBufferBatch:         memBufferBatch,
-		BufferedEventBatch:     b.bufferedEventBatch,
+		BufferedEventBatch:     bufferedEventBatch,
 		ScheduledIDToStartedID: scheduledIDToStartedID,
 		RequestIDToEventID:     requestIDToEventID,
 	}, nil

@@ -46,7 +46,7 @@ type (
 		DBClearBuffer bool
 		// accumulated buffered events for legacy HistoryBuilders, equal to all buffer events from execution table
 		MemBufferBatch []*historypb.HistoryEvent
-		// cached, ownership-safe accumulated buffered events for the next HistoryBuilder
+		// BufferedEventBatch transfers exclusive ownership of cached buffered events to the next HistoryBuilder.
 		BufferedEventBatch *BufferedEventBatch
 		// scheduled to started event ID mapping for flushed buffered event
 		ScheduledIDToStartedID map[int64]int64
@@ -80,7 +80,8 @@ func New(
 	)
 }
 
-// NewWithBufferedEventBatch constructs a HistoryBuilder that reuses buffered-event state.
+// NewWithBufferedEventBatch takes exclusive ownership of bufferedEventBatch.
+// Pass the batch returned by Finish to at most one next HistoryBuilder.
 func NewWithBufferedEventBatch(
 	timeSource clock.TimeSource,
 	taskIDGenerator TaskIDGenerator,
@@ -90,9 +91,6 @@ func NewWithBufferedEventBatch(
 	metricsHandler metrics.Handler,
 	maxEventBatchSizeInBytes dynamicconfig.IntPropertyFn,
 ) *HistoryBuilder {
-	if bufferedEventBatch == nil {
-		bufferedEventBatch = NewBufferedEventBatch(nil)
-	}
 	return newMutableHistoryBuilder(
 		timeSource,
 		taskIDGenerator,

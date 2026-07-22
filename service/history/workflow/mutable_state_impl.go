@@ -438,6 +438,7 @@ func NewMutableState(
 	return s
 }
 
+// NewMutableStateFromDB takes exclusive ownership of dbRecord and its mutable fields.
 func NewMutableStateFromDB(
 	shard historyi.ShardContext,
 	eventsCache events.Cache,
@@ -972,8 +973,7 @@ func (ms *MutableStateImpl) GetHSMCompletionCallbackArg(ctx context.Context) (*p
 }
 
 func (ms *MutableStateImpl) CloneToProto() *persistencespb.WorkflowMutableState {
-	bufferEventsInDB := ms.bufferEventsInDB.Events()
-	msProto := &persistencespb.WorkflowMutableState{
+	msProto := common.CloneProto(&persistencespb.WorkflowMutableState{
 		ActivityInfos:       ms.pendingActivityInfoIDs,
 		TimerInfos:          ms.pendingTimerInfoIDs,
 		ChildExecutionInfos: ms.pendingChildExecutionInfoIDs,
@@ -984,11 +984,10 @@ func (ms *MutableStateImpl) CloneToProto() *persistencespb.WorkflowMutableState 
 		ExecutionInfo:       ms.executionInfo,
 		ExecutionState:      ms.executionState,
 		NextEventId:         ms.hBuilder.NextEventID(),
-		BufferedEvents:      bufferEventsInDB,
 		Checksum:            ms.checksum,
-	}
-
-	return common.CloneProto(msProto)
+	})
+	msProto.BufferedEvents = ms.bufferEventsInDB.Events()
+	return msProto
 }
 
 func (ms *MutableStateImpl) GetWorkflowKey() definition.WorkflowKey {

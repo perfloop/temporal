@@ -11,7 +11,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-func TestBufferedEventBatchOwnsEvents(t *testing.T) {
+func TestBufferedEventBatchEventsAreCopied(t *testing.T) {
 	input := &historypb.HistoryEvent{
 		EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_SIGNALED,
 		Principal: &commonpb.Principal{
@@ -23,19 +23,39 @@ func TestBufferedEventBatchOwnsEvents(t *testing.T) {
 	batch := NewBufferedEventBatch([]*historypb.HistoryEvent{input})
 	builder := newBufferedEventBatchHistoryBuilder(batch)
 
-	input.Principal.Name = "caller-mutated-principal"
-	if got := builder.SizeInBytesOfBufferedEvents(); got != wantSize {
-		t.Fatalf("input mutation changed cached buffered size: got %d, want %d", got, wantSize)
-	}
-
 	exposedEvents := batch.Events()
 	exposedEvents[0].Principal.Name = "output-mutated-principal"
 	if got := builder.SizeInBytesOfBufferedEvents(); got != wantSize {
 		t.Fatalf("output mutation changed cached buffered size: got %d, want %d", got, wantSize)
 	}
-
 	if got := proto.Size(batch.Events()[0]); got != wantSize {
 		t.Fatalf("batch retained mutated event: got %d, want %d", got, wantSize)
+	}
+}
+
+func TestBufferedEventBatchDoesNotExposeEventsToFilters(t *testing.T) {
+	input := &historypb.HistoryEvent{
+		EventType: enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_SIGNALED,
+		Principal: &commonpb.Principal{
+			Type: "user",
+			Name: "initial-principal",
+		},
+	}
+	wantSize := proto.Size(input)
+	batch := NewBufferedEventBatch([]*historypb.HistoryEvent{input})
+	builder := newBufferedEventBatchHistoryBuilder(batch)
+
+	if !builder.HasAnyBufferedEvent(func(event *historypb.HistoryEvent) bool {
+		event.Principal.Name = "filter-mutated-principal"
+		return true
+	}) {
+		t.Fatal("filter did not receive buffered event")
+	}
+	if got := builder.SizeInBytesOfBufferedEvents(); got != wantSize {
+		t.Fatalf("filter mutation changed cached buffered size: got %d, want %d", got, wantSize)
+	}
+	if got := batch.Events()[0].Principal.GetName(); got != "initial-principal" {
+		t.Fatalf("filter mutation changed cached buffered event: got %q", got)
 	}
 }
 
@@ -49,7 +69,7 @@ func TestBufferedEventBatchUsesCurrentSizeForNewEvents(t *testing.T) {
 	}
 }
 
-func TestBufferedEventBatchCopiesAndStampsNewEvents(t *testing.T) {
+func TestBufferedEventBatchTransfersAndStampsNewEvents(t *testing.T) {
 	builder := newBufferedEventBatchHistoryBuilder(NewBufferedEventBatch(nil))
 	event := builder.AddWorkflowExecutionSignaledEvent("signal", nil, "identity", nil, nil, "request-id", nil)
 	builder.SetBufferedEventPrincipal("user", "header-principal")
@@ -82,4 +102,27 @@ func newBufferedEventBatchHistoryBuilder(batch *BufferedEventBatch) *HistoryBuil
 		StubHandler{},
 		tests.NewDynamicConfig().MaximumEventBatchSizeInBytes,
 	)
+}
+
+func TestBufferedEventBatchDetachesAfterFinish(t *testing.T) {
+	const timerID = "timer-id"
+	batch := NewBufferedEventBatch([]*historypb.HistoryEvent{{
+		EventType: enumspb.EVENT_TYPE_TIMER_FIRED,
+		Attributes: &historypb.HistoryEvent_TimerFiredEventAttributes{
+			TimerFiredEventAttributes: &historypb.TimerFiredEventAttributes{TimerId: timerID},
+		},
+	}})
+	builder := newBufferedEventBatchHistoryBuilder(batch)
+	mutation, err := builder.Finish(false)
+	if err != nil {
+		t.Fatalf("finish history builder: %v", err)
+	}
+	nextBuilder := newBufferedEventBatchHistoryBuilder(mutation.BufferedEventBatch)
+
+	if event := builder.GetAndRemoveTimerFireEvent(timerID); event != nil {
+		t.Fatalf("sealed builder removed transferred timer event: %#v", event)
+	}
+	if event := nextBuilder.GetAndRemoveTimerFireEvent(timerID); event == nil {
+		t.Fatal("next builder did not retain transferred timer event")
+	}
 }
