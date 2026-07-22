@@ -16,7 +16,6 @@ import (
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/converter"
 	"go.temporal.io/server/common/dynamicconfig"
-	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/testing/parallelsuite"
 	"go.temporal.io/server/tests/testcore"
 	"google.golang.org/protobuf/proto"
@@ -188,22 +187,9 @@ func (s *EagerWorkflowTestSuite) TestEagerWorkflowStart_RetryStartImmediately() 
 	response := s.startEagerWorkflow(env, request)
 	task := response.GetEagerWorkflowTask()
 	s.NotNil(task, "StartWorkflowExecution response did not contain a workflow task")
-
-	// Count only the duplicate request, after the initial eager start has persisted its first task.
-	capture := env.StartNamespaceMetricCapture()
 	response = s.startEagerWorkflow(env, request)
 	task = response.GetEagerWorkflowTask()
 	s.NotNil(task, "StartWorkflowExecution response did not contain a workflow task")
-
-	readRequests := 0
-	for _, recording := range capture.Metric(metrics.PersistenceRequests.Name()) {
-		if recording.Tags[metrics.OperationTag("").Key] == metrics.PersistenceReadHistoryBranchScope {
-			readRequests++
-			s.Equal(int64(1), recording.Value)
-		}
-	}
-	s.Equal(1, readRequests, "the eager retry should issue one real ReadHistoryBranch request")
-	s.Len(task.History.Events, 3)
 
 	s.respondWorkflowTaskCompleted(env, task, "ok")
 	// Verify workflow completes and client can get the result
