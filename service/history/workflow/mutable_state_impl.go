@@ -3671,9 +3671,12 @@ func (ms *MutableStateImpl) validateBuildIdRedirectInfo(
 	return redirectCounter + 1, nil
 }
 
-// ApplyBuildIdRedirect applies possible redirect to mutable state based on versioning stamp of a starting task.
-// If a redirect is applicable, assigned build ID of the wf will be updated and all scheduled but not
-// started tasks will be rescheduled to be put on the matching queue of the right build ID.
+// ApplyBuildIdRedirect applies a possible redirect to mutable state based on the versioning stamp of a starting task.
+// If a redirect is applicable, the workflow's assigned build ID is updated and eligible scheduled-but-not-started
+// tasks are rescheduled to Matching with the new build ID. An unpaused pending retry whose scheduled time is
+// strictly in the future is the exception: it keeps its retry timer and dispatch is deferred until that timer fires,
+// when the timer executor derives the directive from the current workflow assignment. The activity is still recorded
+// as updated so a partial refresh can reconstruct the derived retry timer after recovery or replication.
 func (ms *MutableStateImpl) ApplyBuildIdRedirect(
 	startingTaskScheduledEventId int64,
 	buildId string,
@@ -3707,9 +3710,19 @@ func (ms *MutableStateImpl) ApplyBuildIdRedirect(
 			// activity already started
 			ai.StartedEventId != common.EmptyEventID ||
 			// activity does not depend on wf build ID
-			ai.GetUseWorkflowBuildIdInfo() == nil ||
-			// retry timer will dispatch it with the new workflow build ID when backoff expires
-			activityPendingRetry(ai) && now.Before(ai.GetScheduledTime().AsTime()) {
+			ai.GetUseWorkflowBuildIdInfo() == nil {
+			continue
+		}
+
+		if activityPendingRetry(ai) && now.Before(ai.GetScheduledTime().AsTime()) {
+			// Keep the existing retry timer authoritative, but record the activity in
+			// the mutation so a partial refresh can recreate that derived timer.
+			err := ms.UpdateActivity(ai.ScheduledEventId, func(*persistencespb.ActivityInfo, historyi.MutableState) error {
+				return nil
+			})
+			if err != nil {
+				return err
+			}
 			continue
 		}
 

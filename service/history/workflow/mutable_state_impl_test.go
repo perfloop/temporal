@@ -320,12 +320,13 @@ func (s *mutableStateSuite) TestTransientWorkflowTaskCompletionFirstBatchApplied
 
 func (s *mutableStateSuite) TestApplyBuildIdRedirectSkipsFutureRetryAndReschedulesOtherRetries() {
 	const (
-		startingTaskScheduledEventID int64 = 1
-		futureRetryScheduledEventID  int64 = 2
-		readyRetryScheduledEventID   int64 = 3
-		pausedRetryScheduledEventID  int64 = 4
-		initialBuildID                     = "build-before-redirect"
-		targetBuildID                      = "build-after-redirect"
+		startingTaskScheduledEventID    int64 = 1
+		futureRetryScheduledEventID     int64 = 2
+		readyRetryScheduledEventID      int64 = 3
+		pausedRetryScheduledEventID     int64 = 4
+		exactlyDueRetryScheduledEventID int64 = 5
+		initialBuildID                        = "build-before-redirect"
+		targetBuildID                         = "build-after-redirect"
 	)
 
 	s.mutableState.executionInfo.ExecutionTime = s.mutableState.executionState.StartTime
@@ -360,13 +361,14 @@ func (s *mutableStateSuite) TestApplyBuildIdRedirectSkipsFutureRetryAndReschedul
 	readyRetry := newRetry(readyRetryScheduledEventID, now.Add(-time.Second), "ready-retry")
 	pausedRetry := newRetry(pausedRetryScheduledEventID, now.Add(time.Hour), "paused-retry")
 	pausedRetry.Paused = true
-	for _, retry := range []*persistencespb.ActivityInfo{futureRetry, readyRetry, pausedRetry} {
+	exactlyDueRetry := newRetry(exactlyDueRetryScheduledEventID, now, "exactly-due-retry")
+	for _, retry := range []*persistencespb.ActivityInfo{futureRetry, readyRetry, pausedRetry, exactlyDueRetry} {
 		s.mutableState.addPendingActivityInfo(retry)
 		s.Require().NoError(s.mutableState.taskGenerator.GenerateActivityRetryTasks(retry))
 	}
 
 	timerTasks := s.mutableState.PopTasks()[tasks.CategoryTimer]
-	s.Require().Len(timerTasks, 3)
+	s.Require().Len(timerTasks, 4)
 	var futureRetryTimer *tasks.ActivityRetryTimerTask
 	for _, task := range timerTasks {
 		retryTimer, ok := task.(*tasks.ActivityRetryTimerTask)
@@ -386,6 +388,7 @@ func (s *mutableStateSuite) TestApplyBuildIdRedirectSkipsFutureRetryAndReschedul
 
 	var readyActivityTask *tasks.ActivityTask
 	var pausedActivityTask *tasks.ActivityTask
+	var exactlyDueActivityTask *tasks.ActivityTask
 	for _, task := range s.mutableState.PopTasks()[tasks.CategoryTransfer] {
 		activityTask, ok := task.(*tasks.ActivityTask)
 		if !ok {
@@ -398,17 +401,24 @@ func (s *mutableStateSuite) TestApplyBuildIdRedirectSkipsFutureRetryAndReschedul
 		if activityTask.ScheduledEventID == pausedRetryScheduledEventID {
 			pausedActivityTask = activityTask
 		}
+		if activityTask.ScheduledEventID == exactlyDueRetryScheduledEventID {
+			exactlyDueActivityTask = activityTask
+		}
 	}
 	s.Require().NotNil(readyActivityTask)
 	s.Require().NotNil(pausedActivityTask)
-	s.NotContains(s.mutableState.updateActivityInfos, futureRetryScheduledEventID)
+	s.Require().NotNil(exactlyDueActivityTask)
+	s.Contains(s.mutableState.updateActivityInfos, futureRetryScheduledEventID)
 	s.Contains(s.mutableState.updateActivityInfos, readyRetryScheduledEventID)
 	s.Contains(s.mutableState.updateActivityInfos, pausedRetryScheduledEventID)
+	s.Contains(s.mutableState.updateActivityInfos, exactlyDueRetryScheduledEventID)
 	s.EqualValues(0, futureRetry.Stamp)
 	s.EqualValues(1, readyRetry.Stamp)
 	s.EqualValues(1, pausedRetry.Stamp)
+	s.EqualValues(1, exactlyDueRetry.Stamp)
 	s.Equal(readyRetry.Stamp, readyActivityTask.Stamp)
 	s.Equal(pausedRetry.Stamp, pausedActivityTask.Stamp)
+	s.Equal(exactlyDueRetry.Stamp, exactlyDueActivityTask.Stamp)
 	s.Equal(futureRetryScheduledEventID, futureRetryTimer.EventID)
 	s.Equal(futureRetry.Attempt, futureRetryTimer.Attempt)
 	s.Equal(futureRetry.Stamp, futureRetryTimer.Stamp)
