@@ -251,21 +251,21 @@ func assertEagerStartConflictResponse(t testing.TB, response *historyservice.Sta
 		t.Fatal("StartWorkflowExecution did not return an eager workflow task")
 	}
 
-	events := response.GetEagerWorkflowTask().GetHistory().GetEvents()
+	historyEvents := response.GetEagerWorkflowTask().GetHistory().GetEvents()
 	wantEventTypes := []enumspb.EventType{
 		enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
 		enumspb.EVENT_TYPE_WORKFLOW_TASK_SCHEDULED,
 		enumspb.EVENT_TYPE_WORKFLOW_TASK_STARTED,
 	}
-	if len(events) != len(wantEventTypes) {
-		t.Fatalf("eager workflow task returned %d history events, want %d", len(events), len(wantEventTypes))
+	if len(historyEvents) != len(wantEventTypes) {
+		t.Fatalf("eager workflow task returned %d history events, want %d", len(historyEvents), len(wantEventTypes))
 	}
 	for index, wantEventType := range wantEventTypes {
-		if events[index].GetEventId() != int64(index+1) {
-			t.Fatalf("history event %d has ID %d, want %d", index, events[index].GetEventId(), index+1)
+		if historyEvents[index].GetEventId() != int64(index+1) {
+			t.Fatalf("history event %d has ID %d, want %d", index, historyEvents[index].GetEventId(), index+1)
 		}
-		if events[index].GetEventType() != wantEventType {
-			t.Fatalf("history event %d has type %s, want %s", index, events[index].GetEventType(), wantEventType)
+		if historyEvents[index].GetEventType() != wantEventType {
+			t.Fatalf("history event %d has type %s, want %s", index, historyEvents[index].GetEventType(), wantEventType)
 		}
 	}
 }
