@@ -333,6 +333,7 @@ func (b *EventStore) FlushAndCreateNewBatch() {
 	b.memLatestBatchSize = 0
 }
 
+// Finish seals the store and transfers its buffered-event batch to the returned mutation.
 func (b *EventStore) Finish(
 	flushBufferEvent bool,
 ) (*HistoryMutation, error) {
