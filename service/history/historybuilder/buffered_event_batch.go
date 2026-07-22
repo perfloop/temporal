@@ -28,6 +28,9 @@ func (b *BufferedEventBatch) CloneEvents() []*historypb.HistoryEvent {
 // StampPrincipalOnLastEvents applies the active transaction's principal to
 // newly buffered events while keeping the cache's serialized total exact.
 func (b *BufferedEventBatch) StampPrincipalOnLastEvents(count int, principal *commonpb.Principal) {
+	if count == 0 {
+		return
+	}
 	cachedPrincipal := principal
 	if principal != nil {
 		cachedPrincipal = proto.Clone(principal).(*commonpb.Principal)
