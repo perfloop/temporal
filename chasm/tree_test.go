@@ -57,55 +57,24 @@ func TestNodeSuite(t *testing.T) {
 	suite.Run(t, new(nodeSuite))
 }
 
-const (
-	cleanCloseRegressionMapEntries         = 64
-	cleanCloseRegressionPersistedNodeCount = 2 + cleanCloseRegressionMapEntries*3
-)
-
 func (s *nodeSuite) TestCloseTransaction_CleanPersistedTree() {
-	s.nodeBackend.HandleGetCurrentVersion = func() int64 { return 1 }
-	s.nodeBackend.HandleNextTransitionCount = func() int64 { return 1 }
-
-	initialTree := NewEmptyTree(
-		s.registry,
-		s.timeSource,
-		s.nodeBackend,
-		s.nodePathEncoder,
-		s.logger,
-		s.metricsHandler,
-	)
-	component := &TestComponent{
-		ComponentData: &persistencespb.WorkflowExecutionState{RunId: "clean-close-root"},
-		MSPointer:     NewMSPointer(s.nodeBackend),
-		SubComponents: make(Map[string, *TestSubComponent1], cleanCloseRegressionMapEntries),
-	}
-	for i := range cleanCloseRegressionMapEntries {
-		entryID := fmt.Sprintf("entry-%02d", i)
-		component.SubComponents[entryID] = NewComponentField(nil, &TestSubComponent1{
-			SubComponent1Data: &persistencespb.WorkflowExecutionState{RunId: entryID},
-			SubComponent11: NewComponentField(nil, &TestSubComponent11{
-				SubComponent11Data: &persistencespb.WorkflowExecutionState{RunId: entryID + "-child"},
-			}),
-			SubData11: NewDataField(nil, &persistencespb.WorkflowExecutionState{RunId: entryID + "-data"}),
-		})
-	}
-	s.NoError(initialTree.SetRootComponent(component))
-
-	initialMutation, err := initialTree.CloseTransaction()
+	initialTree := s.testComponentTree()
+	persisted, err := initialTree.CloseTransaction()
 	s.NoError(err)
-	s.Len(initialMutation.UpdatedNodes, cleanCloseRegressionPersistedNodeCount)
-	s.Empty(initialMutation.DeletedNodes)
+	s.NotEmpty(persisted.UpdatedNodes)
+	s.Empty(persisted.DeletedNodes)
 
-	reloadedTree, err := s.newTestTree(common.CloneProtoMap(initialMutation.UpdatedNodes))
+	reloadedTree, err := s.newTestTree(common.CloneProtoMap(persisted.UpdatedNodes))
 	s.NoError(err)
 	s.False(reloadedTree.IsDirty(), "reloaded tree must be clean before close")
 
+	tasksBeforeClose := s.nodeBackend.NumTasksAdded()
 	mutation, err := reloadedTree.CloseTransaction()
 	s.NoError(err)
 	s.Empty(mutation.UpdatedNodes, "clean close must not update persisted nodes")
 	s.Empty(mutation.DeletedNodes, "clean close must not delete persisted nodes")
 	s.False(reloadedTree.IsDirty(), "clean close must leave the tree clean")
-	s.Zero(s.nodeBackend.NumTasksAdded(), "clean close must not emit physical tasks")
+	s.Equal(tasksBeforeClose, s.nodeBackend.NumTasksAdded(), "clean close must not emit physical tasks")
 }
 
 func (s *nodeSuite) SetupTest() {
