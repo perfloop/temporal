@@ -133,9 +133,9 @@ func newSQLiteHistoryExecutionManager(t testing.TB) persistence.ExecutionManager
 }
 
 func persistEagerStartConflictHistory(
+	ctx context.Context,
 	t testing.TB,
 	executionManager persistence.ExecutionManager,
-	ctx context.Context,
 	request *persistence.UpdateWorkflowExecutionRequest,
 ) {
 	t.Helper()
@@ -308,7 +308,7 @@ func newEagerStartConflictFixture(t testing.TB) *eagerStartConflictFixture {
 			return request.UpdateWorkflowMutation.ExecutionState.Status == enumspb.WORKFLOW_EXECUTION_STATUS_TERMINATED
 		}),
 	).DoAndReturn(func(ctx context.Context, request *persistence.UpdateWorkflowExecutionRequest) (*persistence.UpdateWorkflowExecutionResponse, error) {
-		persistEagerStartConflictHistory(t, sqliteExecutionManager, ctx, request)
+		persistEagerStartConflictHistory(ctx, t, sqliteExecutionManager, request)
 		return &persistence.UpdateWorkflowExecutionResponse{
 			UpdateMutableStateStats: persistence.MutableStateStatistics{
 				HistoryStatistics: &persistence.HistoryStatistics{SizeDiff: 1},
