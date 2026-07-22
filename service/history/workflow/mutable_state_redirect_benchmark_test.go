@@ -192,24 +192,24 @@ func BenchmarkApplyBuildIdRedirectFutureRetries(b *testing.B) {
 			fixture := newFutureRetryRedirectFixture(b, retryCount)
 			b.ReportAllocs()
 
+			var err error
 			for b.Loop() {
 				b.StopTimer()
 				fixture.reset()
 				b.StartTimer()
 
-				err := fixture.mutableState.ApplyBuildIdRedirect(
+				err = fixture.mutableState.ApplyBuildIdRedirect(
 					fixture.startingTaskEventID,
 					redirectBenchmarkTargetBuildID,
 					1,
 				)
-
-				b.StopTimer()
-				if err != nil {
-					b.Fatal(err)
-				}
-				if got := fixture.mutableState.GetAssignedBuildId(); got != redirectBenchmarkTargetBuildID {
-					b.Fatalf("assigned build ID = %q, want %q", got, redirectBenchmarkTargetBuildID)
-				}
+			}
+			b.StopTimer()
+			if err != nil {
+				b.Fatal(err)
+			}
+			if got := fixture.mutableState.GetAssignedBuildId(); got != redirectBenchmarkTargetBuildID {
+				b.Fatalf("assigned build ID = %q, want %q", got, redirectBenchmarkTargetBuildID)
 			}
 		})
 	}
