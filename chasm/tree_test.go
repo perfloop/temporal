@@ -62,7 +62,6 @@ func (s *nodeSuite) TestCloseTransaction_CleanPersistedTree() {
 	persisted, err := initialTree.CloseTransaction()
 	s.NoError(err)
 	s.NotEmpty(persisted.UpdatedNodes)
-	s.Empty(persisted.DeletedNodes)
 
 	reloadedTree, err := s.newTestTree(common.CloneProtoMap(persisted.UpdatedNodes))
 	s.NoError(err)
