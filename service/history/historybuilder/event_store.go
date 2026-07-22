@@ -3,6 +3,7 @@ package historybuilder
 import (
 	"slices"
 
+	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	historypb "go.temporal.io/api/history/v1"
 	"go.temporal.io/server/common"
@@ -11,6 +12,66 @@ import (
 	"go.temporal.io/server/common/metrics"
 	"google.golang.org/protobuf/proto"
 )
+
+// BufferedEventBatch owns deep copies of buffered events that survive one HistoryBuilder.
+// Its serialized size is maintained as events are added, removed, or changed.
+type BufferedEventBatch struct {
+	events []*historypb.HistoryEvent
+	size   int
+}
+
+// NewBufferedEventBatch deep-copies the supplied events into an ownership-safe buffered-event batch.
+func NewBufferedEventBatch(events []*historypb.HistoryEvent) *BufferedEventBatch {
+	batch := &BufferedEventBatch{events: cloneBufferedEvents(events)}
+	for _, event := range batch.events {
+		batch.size += proto.Size(event)
+	}
+	return batch
+}
+
+// Events returns copies of the buffered events owned by this batch.
+func (b *BufferedEventBatch) Events() []*historypb.HistoryEvent {
+	return cloneBufferedEvents(b.events)
+}
+
+func cloneBufferedEvents(events []*historypb.HistoryEvent) []*historypb.HistoryEvent {
+	if events == nil {
+		return nil
+	}
+
+	clones := make([]*historypb.HistoryEvent, len(events))
+	for index, event := range events {
+		if event != nil {
+			clones[index] = proto.CloneOf(event)
+		}
+	}
+	return clones
+}
+
+func (b *BufferedEventBatch) append(events []*historypb.HistoryEvent) []*historypb.HistoryEvent {
+	clones := cloneBufferedEvents(events)
+	b.events = append(b.events, clones...)
+	for _, event := range clones {
+		b.size += proto.Size(event)
+	}
+	return clones
+}
+
+func (b *BufferedEventBatch) take() []*historypb.HistoryEvent {
+	events := b.events
+	b.events = nil
+	b.size = 0
+	return events
+}
+
+func (b *BufferedEventBatch) getAndRemoveTimerFireEvent(timerID string) *historypb.HistoryEvent {
+	var event *historypb.HistoryEvent
+	b.events, event = deleteTimerFiredEvent(timerID, b.events)
+	if event != nil {
+		b.size -= proto.Size(event)
+	}
+	return event
+}
 
 type EventStore struct {
 	state           HistoryBuilderState
@@ -24,8 +85,11 @@ type EventStore struct {
 	workflowFinished bool
 
 	// buffer events in DB
-	dbBufferBatch []*historypb.HistoryEvent
-	dbClearBuffer bool
+	dbBufferBatch          []*historypb.HistoryEvent // legacy raw-buffer path
+	bufferedEventBatch     *BufferedEventBatch
+	dbClearBuffer          bool
+	stampBufferedEvents    bool
+	bufferedEventPrincipal *commonpb.Principal
 
 	// in mem events
 	memEventsBatches [][]*historypb.HistoryEvent
@@ -131,8 +195,15 @@ func (b *EventStore) appendToLatestBatch(event *historypb.HistoryEvent) {
 	b.memLatestBatch = append(b.memLatestBatch, event)
 }
 
+func (b *EventStore) dbBufferedEvents() []*historypb.HistoryEvent {
+	if b.bufferedEventBatch != nil {
+		return b.bufferedEventBatch.events
+	}
+	return b.dbBufferBatch
+}
+
 func (b *EventStore) HasBufferEvents() bool {
-	return len(b.dbBufferBatch) > 0 || len(b.memBufferBatch) > 0
+	return len(b.dbBufferedEvents()) > 0 || len(b.memBufferBatch) > 0
 }
 
 // HasAnyBufferedEvent returns true if there is at least one buffered event that matches the provided filter.
@@ -140,26 +211,45 @@ func (b *EventStore) HasAnyBufferedEvent(predicate BufferedEventFilter) bool {
 	if slices.ContainsFunc(b.memBufferBatch, predicate) {
 		return true
 	}
-	return slices.ContainsFunc(b.dbBufferBatch, predicate)
+	return slices.ContainsFunc(b.dbBufferedEvents(), predicate)
 }
 
 func (b *EventStore) NumBufferedEvents() int {
-	return len(b.dbBufferBatch) + len(b.memBufferBatch)
+	return len(b.dbBufferedEvents()) + len(b.memBufferBatch)
 }
 
 func (b *EventStore) SizeInBytesOfBufferedEvents() int {
-	size := 0
-	for _, ev := range b.dbBufferBatch {
-		size += proto.Size(ev)
+	var size int
+	if b.bufferedEventBatch != nil {
+		size = b.bufferedEventBatch.size
+	} else {
+		for _, event := range b.dbBufferBatch {
+			size += proto.Size(event)
+		}
 	}
-	for _, ev := range b.memBufferBatch {
-		size += proto.Size(ev)
+	// Newly buffered events remain caller-owned until Finish, so their current size is authoritative.
+	for _, event := range b.memBufferBatch {
+		size += proto.Size(event)
 	}
 	return size
 }
 
+// SetBufferedEventPrincipal records the header principal to stamp on new buffered events when this builder finishes.
+func (b *EventStore) SetBufferedEventPrincipal(principalType string, principalName string) {
+	b.stampBufferedEvents = true
+	b.bufferedEventPrincipal = newBufferedEventPrincipal(principalType, principalName)
+}
+
+func newBufferedEventPrincipal(principalType string, principalName string) *commonpb.Principal {
+	if principalType == "" && principalName == "" {
+		return nil
+	}
+	return &commonpb.Principal{Type: principalType, Name: principalName}
+}
+
 func (b *EventStore) FlushBufferToCurrentBatch() (map[int64]int64, map[string]int64) {
-	if len(b.dbBufferBatch) == 0 && len(b.memBufferBatch) == 0 {
+	dbBufferedEvents := b.dbBufferedEvents()
+	if len(dbBufferedEvents) == 0 && len(b.memBufferBatch) == 0 {
 		return b.scheduledIDToStartedID, b.requestIDToEventID
 	}
 
@@ -170,14 +260,24 @@ func (b *EventStore) FlushBufferToCurrentBatch() (map[int64]int64, map[string]in
 		// 1. request cancel activity
 		// 2. workflow task complete
 		// above will generate 2 then 1
-		b.dbBufferBatch = nil
+		if b.bufferedEventBatch != nil {
+			b.bufferedEventBatch.take()
+		} else {
+			b.dbBufferBatch = nil
+		}
 		b.memBufferBatch = nil
 		return b.scheduledIDToStartedID, b.requestIDToEventID
 	}
 
-	b.dbClearBuffer = b.dbClearBuffer || len(b.dbBufferBatch) > 0
-	bufferBatch := append(b.dbBufferBatch, b.memBufferBatch...)
-	b.dbBufferBatch = nil
+	b.dbClearBuffer = b.dbClearBuffer || len(dbBufferedEvents) > 0
+	var bufferBatch []*historypb.HistoryEvent
+	if b.bufferedEventBatch != nil {
+		bufferBatch = b.bufferedEventBatch.take()
+	} else {
+		bufferBatch = b.dbBufferBatch
+		b.dbBufferBatch = nil
+	}
+	bufferBatch = append(bufferBatch, b.memBufferBatch...)
 	b.memBufferBatch = nil
 
 	// 0th reorder events in case casandra reorder the buffered events
@@ -225,8 +325,22 @@ func (b *EventStore) Finish(
 	dbEventsBatches := b.memEventsBatches
 	dbClearBuffer := b.dbClearBuffer
 	dbBufferBatch := b.memBufferBatch
-	memBufferBatch := b.dbBufferBatch
-	memBufferBatch = append(memBufferBatch, dbBufferBatch...)
+	if b.stampBufferedEvents {
+		for _, event := range dbBufferBatch {
+			if event != nil {
+				event.Principal = newBufferedEventPrincipal(
+					b.bufferedEventPrincipal.GetType(),
+					b.bufferedEventPrincipal.GetName(),
+				)
+			}
+		}
+	}
+	var memBufferBatch []*historypb.HistoryEvent
+	if b.bufferedEventBatch != nil {
+		b.bufferedEventBatch.append(dbBufferBatch)
+	} else {
+		memBufferBatch = append(b.dbBufferBatch, dbBufferBatch...)
+	}
 	scheduledIDToStartedID := b.scheduledIDToStartedID
 	requestIDToEventID := b.requestIDToEventID
 
@@ -236,6 +350,8 @@ func (b *EventStore) Finish(
 	b.memLatestBatchSize = 0
 	b.dbClearBuffer = false
 	b.dbBufferBatch = nil
+	b.stampBufferedEvents = false
+	b.bufferedEventPrincipal = nil
 	b.scheduledIDToStartedID = nil
 
 	if err := b.assignTaskIDs(dbEventsBatches); err != nil {
@@ -247,6 +363,7 @@ func (b *EventStore) Finish(
 		DBClearBuffer:          dbClearBuffer,
 		DBBufferBatch:          dbBufferBatch,
 		MemBufferBatch:         memBufferBatch,
+		BufferedEventBatch:     b.bufferedEventBatch,
 		ScheduledIDToStartedID: scheduledIDToStartedID,
 		RequestIDToEventID:     requestIDToEventID,
 	}, nil
@@ -552,7 +669,7 @@ func (b *EventStore) HasActivityFinishEvent(
 	scheduledEventID int64,
 ) bool {
 
-	if hasActivityFinishEvent(scheduledEventID, b.dbBufferBatch) {
+	if hasActivityFinishEvent(scheduledEventID, b.dbBufferedEvents()) {
 		return true
 	}
 
@@ -609,7 +726,11 @@ func (b *EventStore) GetAndRemoveTimerFireEvent(
 ) *historypb.HistoryEvent {
 	var timerFireEvent *historypb.HistoryEvent
 
-	b.dbBufferBatch, timerFireEvent = deleteTimerFiredEvent(timerID, b.dbBufferBatch)
+	if b.bufferedEventBatch != nil {
+		timerFireEvent = b.bufferedEventBatch.getAndRemoveTimerFireEvent(timerID)
+	} else {
+		b.dbBufferBatch, timerFireEvent = deleteTimerFiredEvent(timerID, b.dbBufferBatch)
+	}
 	if timerFireEvent != nil {
 		b.dbClearBuffer = true
 		return timerFireEvent

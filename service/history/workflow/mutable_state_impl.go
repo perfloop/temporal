@@ -168,8 +168,8 @@ type (
 		chasmNodeSizes  map[string]int // chasm node path -> key + node size in bytes
 		// Total number of tomestones tracked in mutable state
 		totalTombstones int
-		// Buffer events from DB
-		bufferEventsInDB []*historypb.HistoryEvent
+		// Cached buffer events from DB.
+		bufferEventsInDB *historybuilder.BufferedEventBatch
 		// Indicates the workflow state in DB, can be used to calculate
 		// whether this workflow is pointed by current workflow record.
 		stateInDB enumsspb.WorkflowExecutionState
@@ -345,7 +345,7 @@ func NewMutableState(
 		chasmNodeSizes:               make(map[string]int),
 		totalTombstones:              0,
 		currentVersion:               namespaceEntry.FailoverVersion(workflowID),
-		bufferEventsInDB:             nil,
+		bufferEventsInDB:             historybuilder.NewBufferedEventBatch(nil),
 		stateInDB:                    enumsspb.WORKFLOW_EXECUTION_STATE_VOID,
 		nextEventIDInDB:              common.FirstEventID,
 		dbRecordVersion:              1,
@@ -406,7 +406,7 @@ func NewMutableState(
 	}
 	s.approximateSize += s.executionState.Size()
 
-	s.hBuilder = historybuilder.New(
+	s.hBuilder = historybuilder.NewWithBufferedEventBatch(
 		s.timeSource,
 		s.shard.GenerateTaskIDs,
 		s.currentVersion,
@@ -532,17 +532,17 @@ func NewMutableStateFromDB(
 		mutableState.executionState.StartTime = dbRecord.ExecutionInfo.StartTime
 	}
 
-	mutableState.hBuilder = historybuilder.New(
+	mutableState.bufferEventsInDB = historybuilder.NewBufferedEventBatch(dbRecord.BufferedEvents)
+	mutableState.hBuilder = historybuilder.NewWithBufferedEventBatch(
 		mutableState.timeSource,
 		mutableState.shard.GenerateTaskIDs,
 		common.EmptyVersion,
 		dbRecord.NextEventId,
-		dbRecord.BufferedEvents,
+		mutableState.bufferEventsInDB,
 		mutableState.metricsHandler,
 		mutableState.config.MaximumEventBatchSizeInBytes,
 	)
 	mutableState.currentVersion = common.EmptyVersion
-	mutableState.bufferEventsInDB = dbRecord.BufferedEvents
 	mutableState.stateInDB = dbRecord.ExecutionState.State
 	mutableState.nextEventIDInDB = dbRecord.NextEventId
 	mutableState.dbRecordVersion = dbRecordVersion
@@ -972,6 +972,7 @@ func (ms *MutableStateImpl) GetHSMCompletionCallbackArg(ctx context.Context) (*p
 }
 
 func (ms *MutableStateImpl) CloneToProto() *persistencespb.WorkflowMutableState {
+	bufferEventsInDB := ms.bufferEventsInDB.Events()
 	msProto := &persistencespb.WorkflowMutableState{
 		ActivityInfos:       ms.pendingActivityInfoIDs,
 		TimerInfos:          ms.pendingTimerInfoIDs,
@@ -983,7 +984,7 @@ func (ms *MutableStateImpl) CloneToProto() *persistencespb.WorkflowMutableState 
 		ExecutionInfo:       ms.executionInfo,
 		ExecutionState:      ms.executionState,
 		NextEventId:         ms.hBuilder.NextEventID(),
-		BufferedEvents:      ms.bufferEventsInDB,
+		BufferedEvents:      bufferEventsInDB,
 		Checksum:            ms.checksum,
 	}
 
@@ -1162,7 +1163,7 @@ func (ms *MutableStateImpl) UpdateCurrentVersion(
 		ms.currentVersion = version
 	}
 
-	ms.hBuilder = historybuilder.New(
+	ms.hBuilder = historybuilder.NewWithBufferedEventBatch(
 		ms.timeSource,
 		ms.shard.GenerateTaskIDs,
 		ms.currentVersion,
@@ -7690,6 +7691,11 @@ func (ms *MutableStateImpl) closeTransaction(
 	// the latter might fail the workflow task and buffered events must be flushed afterwards.
 	// We need to save the value of ms.isStateDirty() before calling closeTransactionPrepareEvents
 	// because flushing the buffered events might change the dirty state.
+	var principal *commonpb.Principal
+	if transactionPolicy == historyi.TransactionPolicyActive {
+		principal = headers.GetPrincipal(ctx)
+		ms.hBuilder.SetBufferedEventPrincipal(principal.GetType(), principal.GetName())
+	}
 	workflowEventsSeq, eventBatches, bufferEvents, clearBuffer, err := ms.closeTransactionPrepareEvents(transactionPolicy)
 	if err != nil {
 		return closeTransactionResult{}, err
@@ -7699,7 +7705,6 @@ func (ms *MutableStateImpl) closeTransaction(
 	// cluster — standby (passive) replays events that were already stamped by
 	// the active side, and we must not overwrite those principals.
 	if transactionPolicy == historyi.TransactionPolicyActive {
-		principal := headers.GetPrincipal(ctx)
 		for _, we := range workflowEventsSeq {
 			for _, event := range we.Events {
 				// Skip events that already have a principal. Those are previously
@@ -7710,9 +7715,6 @@ func (ms *MutableStateImpl) closeTransaction(
 					event.Principal = principal
 				}
 			}
-		}
-		for _, event := range bufferEvents {
-			event.Principal = principal
 		}
 	}
 
@@ -8388,7 +8390,7 @@ func (ms *MutableStateImpl) cleanupTransaction() error {
 	}
 	// ms.dbRecordVersion remains the same
 
-	ms.hBuilder = historybuilder.New(
+	ms.hBuilder = historybuilder.NewWithBufferedEventBatch(
 		ms.timeSource,
 		ms.shard.GenerateTaskIDs,
 		ms.GetCurrentVersion(),
@@ -8423,7 +8425,11 @@ func (ms *MutableStateImpl) closeTransactionPrepareEvents(
 	}
 
 	// TODO @wxing1292 need more refactoring to make the logic clean
-	ms.bufferEventsInDB = historyMutation.MemBufferBatch
+	if historyMutation.BufferedEventBatch != nil {
+		ms.bufferEventsInDB = historyMutation.BufferedEventBatch
+	} else {
+		ms.bufferEventsInDB = historybuilder.NewBufferedEventBatch(historyMutation.MemBufferBatch)
+	}
 	newBufferBatch := historyMutation.DBBufferBatch
 	clearBuffer := historyMutation.DBClearBuffer
 	newEventsBatches := historyMutation.DBEventsBatches

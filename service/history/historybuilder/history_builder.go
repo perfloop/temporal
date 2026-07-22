@@ -44,8 +44,10 @@ type (
 		DBBufferBatch []*historypb.HistoryEvent
 		// whether to clear buffer events on DB
 		DBClearBuffer bool
-		// accumulated buffered events, equal to all buffer events from execution table
+		// accumulated buffered events for legacy HistoryBuilders, equal to all buffer events from execution table
 		MemBufferBatch []*historypb.HistoryEvent
+		// cached, ownership-safe accumulated buffered events for the next HistoryBuilder
+		BufferedEventBatch *BufferedEventBatch
 		// scheduled to started event ID mapping for flushed buffered event
 		ScheduledIDToStartedID map[int64]int64
 		// request id to event ID mapping for flushed buffered event
@@ -66,6 +68,53 @@ func New(
 	metricsHandler metrics.Handler,
 	maxEventBatchSizeInBytes dynamicconfig.IntPropertyFn,
 ) *HistoryBuilder {
+	return newMutableHistoryBuilder(
+		timeSource,
+		taskIDGenerator,
+		version,
+		nextEventID,
+		dbBufferBatch,
+		nil,
+		metricsHandler,
+		maxEventBatchSizeInBytes,
+	)
+}
+
+// NewWithBufferedEventBatch constructs a HistoryBuilder that reuses buffered-event state.
+func NewWithBufferedEventBatch(
+	timeSource clock.TimeSource,
+	taskIDGenerator TaskIDGenerator,
+	version int64,
+	nextEventID int64,
+	bufferedEventBatch *BufferedEventBatch,
+	metricsHandler metrics.Handler,
+	maxEventBatchSizeInBytes dynamicconfig.IntPropertyFn,
+) *HistoryBuilder {
+	if bufferedEventBatch == nil {
+		bufferedEventBatch = NewBufferedEventBatch(nil)
+	}
+	return newMutableHistoryBuilder(
+		timeSource,
+		taskIDGenerator,
+		version,
+		nextEventID,
+		nil,
+		bufferedEventBatch,
+		metricsHandler,
+		maxEventBatchSizeInBytes,
+	)
+}
+
+func newMutableHistoryBuilder(
+	timeSource clock.TimeSource,
+	taskIDGenerator TaskIDGenerator,
+	version int64,
+	nextEventID int64,
+	dbBufferBatch []*historypb.HistoryEvent,
+	bufferedEventBatch *BufferedEventBatch,
+	metricsHandler metrics.Handler,
+	maxEventBatchSizeInBytes dynamicconfig.IntPropertyFn,
+) *HistoryBuilder {
 	return &HistoryBuilder{
 		EventStore: EventStore{
 			state:           HistoryBuilderStateMutable,
@@ -78,6 +127,7 @@ func New(
 			workflowFinished: false,
 
 			dbBufferBatch:          dbBufferBatch,
+			bufferedEventBatch:     bufferedEventBatch,
 			dbClearBuffer:          false,
 			memEventsBatches:       nil,
 			memLatestBatch:         nil,
