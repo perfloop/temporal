@@ -61,6 +61,7 @@ func BenchmarkBufferSizeAcceptableActiveSignalCadence(b *testing.B) {
 				b.Fatalf("%s retained %d buffered events, want %d", cadence.shape.name, got, cadence.shape.initialSignals+cadence.shape.additionalCommits)
 			}
 		}
+		b.StartTimer()
 	}
 }
 
