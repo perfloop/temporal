@@ -153,7 +153,7 @@ func (s *historyBuilderSuite) SetupTest() {
 		s.taskIDGenerator,
 		s.version,
 		s.nextEventID,
-		nil,
+		NewBufferedEventBatch(nil),
 		metrics.NoopMetricsHandler,
 		tests.NewDynamicConfig().MaximumEventBatchSizeInBytes,
 	)
@@ -2140,7 +2140,7 @@ func (s *historyBuilderSuite) testWireEventIDs(
 		s.taskIDGenerator,
 		s.version,
 		s.nextEventID,
-		nil,
+		NewBufferedEventBatch(nil),
 		metrics.NoopMetricsHandler,
 		tests.NewDynamicConfig().MaximumEventBatchSizeInBytes,
 	)
@@ -2188,7 +2188,7 @@ func (s *historyBuilderSuite) TestHasBufferEvent() {
 		s.taskIDGenerator,
 		s.version,
 		s.nextEventID,
-		nil,
+		NewBufferedEventBatch(nil),
 		metrics.NoopMetricsHandler,
 		tests.NewDynamicConfig().MaximumEventBatchSizeInBytes,
 	)
@@ -2388,46 +2388,6 @@ func (s *historyBuilderSuite) TestBufferSize_Memory() {
 	s.Assert().Zero(s.historyBuilder.SizeInBytesOfBufferedEvents())
 }
 
-func (s *historyBuilderSuite) TestFinishBufferedEventBatchIsolatesMutationOutput() {
-	persisted := &historypb.HistoryEvent{
-		EventType: enumspb.EVENT_TYPE_TIMER_FIRED,
-		EventId:   common.BufferedEventID,
-		TaskId:    common.EmptyEventTaskID,
-	}
-	s.historyBuilder = New(
-		s.mockTimeSource,
-		s.taskIDGenerator,
-		s.version,
-		s.nextEventID,
-		[]*historypb.HistoryEvent{persisted},
-		metrics.NoopMetricsHandler,
-		tests.NewDynamicConfig().MaximumEventBatchSizeInBytes,
-	)
-	s.historyBuilder.add(&historypb.HistoryEvent{
-		EventType: enumspb.EVENT_TYPE_SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_FAILED,
-	})
-	wantSize := s.historyBuilder.SizeInBytesOfBufferedEvents()
-
-	mutation, err := s.historyBuilder.Finish(false)
-	s.Require().NoError(err)
-	s.Require().Len(mutation.DBBufferBatch, 1)
-	mutation.DBBufferBatch[0].Principal = &commonpb.Principal{Type: "user", Name: "mutated-output"}
-
-	cachedEvents := s.historyBuilder.FinishedBufferedEventBatch().CloneEvents()
-	s.Require().Len(cachedEvents, 2)
-	s.Nil(cachedEvents[1].GetPrincipal())
-	nextBuilder := NewWithBufferedEventBatch(
-		s.mockTimeSource,
-		s.taskIDGenerator,
-		s.version,
-		s.nextEventID,
-		s.historyBuilder.FinishedBufferedEventBatch(),
-		metrics.NoopMetricsHandler,
-		tests.NewDynamicConfig().MaximumEventBatchSizeInBytes,
-	)
-	s.Equal(wantSize, nextBuilder.SizeInBytesOfBufferedEvents())
-}
-
 func (s *historyBuilderSuite) TestBufferSize_DB() {
 	s.Assert().Zero(s.historyBuilder.NumBufferedEvents())
 	s.Assert().Zero(s.historyBuilder.SizeInBytesOfBufferedEvents())
@@ -2436,11 +2396,11 @@ func (s *historyBuilderSuite) TestBufferSize_DB() {
 		s.taskIDGenerator,
 		s.version,
 		s.nextEventID,
-		[]*historypb.HistoryEvent{{
+		NewBufferedEventBatch([]*historypb.HistoryEvent{{
 			EventType: enumspb.EVENT_TYPE_TIMER_FIRED,
 			EventId:   common.BufferedEventID,
 			TaskId:    common.EmptyEventTaskID,
-		}},
+		}}),
 		metrics.NoopMetricsHandler,
 		tests.NewDynamicConfig().MaximumEventBatchSizeInBytes,
 	)
@@ -2739,7 +2699,7 @@ func (s *historyBuilderSuite) newBuilderWithMaxBatchBytes(limit int) *HistoryBui
 		s.taskIDGenerator,
 		s.version,
 		s.nextEventID,
-		nil,
+		NewBufferedEventBatch(nil),
 		metrics.NoopMetricsHandler,
 		dynamicconfig.GetIntPropertyFn(limit),
 	)

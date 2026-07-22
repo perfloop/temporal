@@ -55,29 +55,9 @@ type (
 	BufferedEventFilter = func(*historypb.HistoryEvent) bool
 )
 
+// New rebuilds a builder from the cache-owned buffered batch carried by
+// MutableStateImpl between transactions.
 func New(
-	timeSource clock.TimeSource,
-	taskIDGenerator TaskIDGenerator,
-	version int64,
-	nextEventID int64,
-	dbBufferBatch []*historypb.HistoryEvent,
-	metricsHandler metrics.Handler,
-	maxEventBatchSizeInBytes dynamicconfig.IntPropertyFn,
-) *HistoryBuilder {
-	return NewWithBufferedEventBatch(
-		timeSource,
-		taskIDGenerator,
-		version,
-		nextEventID,
-		NewBufferedEventBatch(dbBufferBatch),
-		metricsHandler,
-		maxEventBatchSizeInBytes,
-	)
-}
-
-// NewWithBufferedEventBatch rebuilds a builder from the cache-owned buffered
-// batch carried by MutableStateImpl between transactions.
-func NewWithBufferedEventBatch(
 	timeSource clock.TimeSource,
 	taskIDGenerator TaskIDGenerator,
 	version int64,
@@ -86,9 +66,6 @@ func NewWithBufferedEventBatch(
 	metricsHandler metrics.Handler,
 	maxEventBatchSizeInBytes dynamicconfig.IntPropertyFn,
 ) *HistoryBuilder {
-	if bufferedEventBatch == nil {
-		bufferedEventBatch = NewBufferedEventBatch(nil)
-	}
 	return &HistoryBuilder{
 		EventStore: EventStore{
 			state:           HistoryBuilderStateMutable,

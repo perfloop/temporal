@@ -406,7 +406,7 @@ func NewMutableState(
 	}
 	s.approximateSize += s.executionState.Size()
 
-	s.hBuilder = historybuilder.NewWithBufferedEventBatch(
+	s.hBuilder = historybuilder.New(
 		s.timeSource,
 		s.shard.GenerateTaskIDs,
 		s.currentVersion,
@@ -533,7 +533,7 @@ func NewMutableStateFromDB(
 	}
 
 	mutableState.bufferedEventBatch = historybuilder.NewBufferedEventBatch(dbRecord.BufferedEvents)
-	mutableState.hBuilder = historybuilder.NewWithBufferedEventBatch(
+	mutableState.hBuilder = historybuilder.New(
 		mutableState.timeSource,
 		mutableState.shard.GenerateTaskIDs,
 		common.EmptyVersion,
@@ -1162,7 +1162,7 @@ func (ms *MutableStateImpl) UpdateCurrentVersion(
 		ms.currentVersion = version
 	}
 
-	ms.hBuilder = historybuilder.NewWithBufferedEventBatch(
+	ms.hBuilder = historybuilder.New(
 		ms.timeSource,
 		ms.shard.GenerateTaskIDs,
 		ms.currentVersion,
@@ -7711,9 +7711,6 @@ func (ms *MutableStateImpl) closeTransaction(
 				}
 			}
 		}
-		for _, event := range bufferEvents {
-			event.Principal = principal
-		}
 		ms.bufferedEventBatch.StampPrincipalOnLastEvents(len(bufferEvents), principal)
 	}
 
@@ -8389,7 +8386,7 @@ func (ms *MutableStateImpl) cleanupTransaction() error {
 	}
 	// ms.dbRecordVersion remains the same
 
-	ms.hBuilder = historybuilder.NewWithBufferedEventBatch(
+	ms.hBuilder = historybuilder.New(
 		ms.timeSource,
 		ms.shard.GenerateTaskIDs,
 		ms.GetCurrentVersion(),

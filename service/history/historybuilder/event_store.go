@@ -231,9 +231,8 @@ func (b *EventStore) Finish(
 	dbEventsBatches := b.memEventsBatches
 	dbClearBuffer := b.dbClearBuffer
 	dbBufferBatch := b.memBufferBatch
-	b.finishedBufferedEventBatch = newBufferedEventBatchWithAppendedEvents(
-		b.dbBufferBatch,
-		dbBufferBatch,
+	b.finishedBufferedEventBatch = newBufferedEventBatchFromOwnedEvents(
+		append(b.dbBufferBatch, dbBufferBatch...),
 		b.bufferedEventSize,
 	)
 	scheduledIDToStartedID := b.scheduledIDToStartedID
