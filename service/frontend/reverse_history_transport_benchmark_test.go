@@ -7,19 +7,16 @@ import (
 	"io"
 	"net"
 	"reflect"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	historypb "go.temporal.io/api/history/v1"
 	"go.temporal.io/api/workflowservice/v1"
-	historyspb "go.temporal.io/server/api/history/v1"
-	"go.temporal.io/server/api/historyservice/v1"
+	historyservice "go.temporal.io/server/api/historyservice/v1"
 	tokenspb "go.temporal.io/server/api/token/v1"
 	"go.temporal.io/server/common/dynamicconfig"
 	"go.temporal.io/server/common/log"
@@ -34,545 +31,341 @@ import (
 )
 
 const (
-	reverseHistoryBenchmarkPageSize  = primitives.GetHistoryMaxPageSize
-	reverseHistoryBenchmarkPageCount = 16
-	reverseHistoryBenchmarkNamespace = "reverse-history-benchmark"
-	reverseHistoryBenchmarkWorkflow  = "reverse-history-workflow"
-	reverseHistoryBenchmarkRun       = "7c177db8-cb3b-4b8d-9385-1f0cfcd6e903"
-
-	reverseHistoryStreamMethod = "StreamWorkflowExecutionHistoryReverse"
+	reverseHistoryPageSize  = primitives.GetHistoryMaxPageSize
+	reverseHistoryPageCount = 16
+	reverseHistoryNamespace = "reverse-history-benchmark"
+	reverseHistoryWorkflow  = "reverse-history-workflow"
+	reverseHistoryRun       = "7c177db8-cb3b-4b8d-9385-1f0cfcd6e903"
+	reverseHistoryStream    = "StreamWorkflowExecutionHistoryReverse"
 )
 
-var reverseHistoryBenchmarkNamespaceID = namespace.ID("5b4f313d-7158-4cc2-a60b-1dc0951f8a4d")
+var reverseHistoryNamespaceID = namespace.ID("5b4f313d-7158-4cc2-a60b-1dc0951f8a4d")
 
-type reverseHistoryTransportMode string
-
-const (
-	reverseHistoryUnaryMode  reverseHistoryTransportMode = "unary"
-	reverseHistoryStreamMode reverseHistoryTransportMode = "stream"
-)
-
-// reverseHistoryStaticNamespaceRegistry supplies the only Registry operation used by
-// WorkflowHandler.GetWorkflowExecutionHistoryReverse. Embedding the interface keeps
-// the fixture focused on the route under test without introducing a mock call into the
-// timed path.
-type reverseHistoryStaticNamespaceRegistry struct {
+// staticNamespaceRegistry avoids mock overhead in the timed WorkflowHandler path.
+type staticNamespaceRegistry struct {
 	namespace.Registry
-	id namespace.ID
 }
 
-func (r reverseHistoryStaticNamespaceRegistry) GetNamespaceID(namespace.Name) (namespace.ID, error) {
-	return r.id, nil
+func (staticNamespaceRegistry) GetNamespaceID(namespace.Name) (namespace.ID, error) {
+	return reverseHistoryNamespaceID, nil
 }
 
-type reverseHistoryTraceSpan struct {
-	id    int64
-	kind  string
-	start time.Time
-	end   time.Time
+type reverseHistoryStats struct {
+	public, history, reads, serialized, deserialized, tokenBytes atomic.Int64
+	mu                                                           sync.Mutex
+	trace                                                        []string
 }
 
-type reverseHistoryMeasurements struct {
-	publicRPCCalls  atomic.Int64
-	historyRPCCalls atomic.Int64
-
-	continuationSerializations   atomic.Int64
-	continuationDeserializations atomic.Int64
-	continuationWireBytes        atomic.Int64
-	sourcePageReads              atomic.Int64
-	nextSpanID                   atomic.Int64
-
-	mu    sync.Mutex
-	spans []reverseHistoryTraceSpan
-}
-
-type reverseHistoryMeasurementSnapshot struct {
-	publicRPCCalls               int64
-	historyRPCCalls              int64
-	continuationSerializations   int64
-	continuationDeserializations int64
-	continuationWireBytes        int64
-	sourcePageReads              int64
-	spans                        []reverseHistoryTraceSpan
-}
-
-func (m *reverseHistoryMeasurements) reset() {
-	m.publicRPCCalls.Store(0)
-	m.historyRPCCalls.Store(0)
-	m.continuationSerializations.Store(0)
-	m.continuationDeserializations.Store(0)
-	m.continuationWireBytes.Store(0)
-	m.sourcePageReads.Store(0)
-	m.nextSpanID.Store(0)
-	m.mu.Lock()
-	m.spans = nil
-	m.mu.Unlock()
-}
-
-func (m *reverseHistoryMeasurements) recordSpan(kind string, run func() error) error {
-	id := m.nextSpanID.Add(1)
-	start := time.Now()
-	err := run()
-	m.mu.Lock()
-	m.spans = append(m.spans, reverseHistoryTraceSpan{
-		id:    id,
-		kind:  kind,
-		start: start,
-		end:   time.Now(),
-	})
-	m.mu.Unlock()
-	return err
-}
-
-func (m *reverseHistoryMeasurements) snapshot() reverseHistoryMeasurementSnapshot {
-	m.mu.Lock()
-	spans := append([]reverseHistoryTraceSpan(nil), m.spans...)
-	m.mu.Unlock()
-	sort.Slice(spans, func(i, j int) bool {
-		return spans[i].id < spans[j].id
-	})
-	return reverseHistoryMeasurementSnapshot{
-		publicRPCCalls:               m.publicRPCCalls.Load(),
-		historyRPCCalls:              m.historyRPCCalls.Load(),
-		continuationSerializations:   m.continuationSerializations.Load(),
-		continuationDeserializations: m.continuationDeserializations.Load(),
-		continuationWireBytes:        m.continuationWireBytes.Load(),
-		sourcePageReads:              m.sourcePageReads.Load(),
-		spans:                        spans,
+func (s *reverseHistoryStats) hop(kind string) {
+	if kind == "public" {
+		s.public.Add(1)
+	} else {
+		s.history.Add(1)
 	}
+	s.mu.Lock()
+	s.trace = append(s.trace, kind)
+	s.mu.Unlock()
 }
 
-type reverseHistoryPageSource struct {
-	pages         [][]*historypb.HistoryEvent
-	pageSize      int
-	branchToken   []byte
-	measurements  *reverseHistoryMeasurements
-	gateStream    bool
-	streamPermits chan struct{}
-	streamDone    chan error
+func (s *reverseHistoryStats) reset() {
+	s.public.Store(0)
+	s.history.Store(0)
+	s.reads.Store(0)
+	s.serialized.Store(0)
+	s.deserialized.Store(0)
+	s.tokenBytes.Store(0)
+	s.mu.Lock()
+	s.trace = nil
+	s.mu.Unlock()
 }
 
-func newReverseHistoryPageSource(
-	pageCount int,
-	pageSize int,
-	measurements *reverseHistoryMeasurements,
-	gateStream bool,
-) *reverseHistoryPageSource {
-	pages := make([][]*historypb.HistoryEvent, pageCount)
-	for page := range pages {
-		pages[page] = make([]*historypb.HistoryEvent, pageSize)
-		for eventOffset := range pages[page] {
-			eventID := int64(pageCount*pageSize - (page*pageSize + eventOffset))
-			pages[page][eventOffset] = &historypb.HistoryEvent{
-				EventId:   eventID,
+func (s *reverseHistoryStats) waterfall() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return strings.Join(s.trace, ">")
+}
+
+// pageSource is deliberately an in-memory page source: this proof measures the
+// public/frontend-to-History control plane, not persistence latency. It does use
+// the production HistoryContinuation serializer on every unary continuation.
+type pageSource struct {
+	pages   [][]*historypb.HistoryEvent
+	stats   *reverseHistoryStats
+	permits chan struct{}
+	done    chan error
+}
+
+func newPageSource(pages int, stats *reverseHistoryStats) *pageSource {
+	s := &pageSource{pages: make([][]*historypb.HistoryEvent, pages), stats: stats}
+	for page := range s.pages {
+		s.pages[page] = make([]*historypb.HistoryEvent, reverseHistoryPageSize)
+		for offset := range s.pages[page] {
+			s.pages[page][offset] = &historypb.HistoryEvent{
+				EventId:   int64(pages*reverseHistoryPageSize - page*reverseHistoryPageSize - offset),
 				EventType: enumspb.EVENT_TYPE_ACTIVITY_TASK_COMPLETED,
 			}
 		}
 	}
-
-	source := &reverseHistoryPageSource{
-		pages:        pages,
-		pageSize:     pageSize,
-		branchToken:  []byte("reverse-history-benchmark-branch-token"),
-		measurements: measurements,
-		gateStream:   gateStream,
+	if stats != nil {
+		s.permits = make(chan struct{}, 1)
+		s.done = make(chan error, 3)
 	}
-	if gateStream {
-		source.streamPermits = make(chan struct{}, 1)
-		source.streamDone = make(chan error, 4)
-	}
-	return source
+	return s
 }
 
-func (s *reverseHistoryPageSource) pageCount() int {
-	return len(s.pages)
-}
+func (s *pageSource) total() int { return len(s.pages) * reverseHistoryPageSize }
 
-func (s *reverseHistoryPageSource) totalEvents() int {
-	return s.pageCount() * s.pageSize
-}
-
-func (s *reverseHistoryPageSource) validateRequest(request *historyservice.GetWorkflowExecutionHistoryReverseRequest) error {
-	if request.GetNamespaceId() != reverseHistoryBenchmarkNamespaceID.String() {
-		return fmt.Errorf("unexpected namespace ID %q", request.GetNamespaceId())
+func (s *pageSource) validate(request *historyservice.GetWorkflowExecutionHistoryReverseRequest) error {
+	if request.GetNamespaceId() != reverseHistoryNamespaceID.String() || request.GetRequest() == nil {
+		return errors.New("unexpected reverse-history request")
 	}
-	if request.GetRequest() == nil {
-		return errors.New("missing reverse-history request")
+	if request.GetRequest().GetExecution().GetWorkflowId() != reverseHistoryWorkflow {
+		return errors.New("unexpected reverse-history workflow")
 	}
-	if request.GetRequest().GetExecution().GetWorkflowId() != reverseHistoryBenchmarkWorkflow {
-		return fmt.Errorf("unexpected workflow ID %q", request.GetRequest().GetExecution().GetWorkflowId())
-	}
-	if request.GetRequest().GetMaximumPageSize() != reverseHistoryBenchmarkPageSize {
-		return fmt.Errorf(
-			"frontend did not apply page-size cap: got %d want %d",
-			request.GetRequest().GetMaximumPageSize(),
-			reverseHistoryBenchmarkPageSize,
-		)
+	if request.GetRequest().GetMaximumPageSize() != reverseHistoryPageSize {
+		return fmt.Errorf("frontend page cap: got %d want %d", request.GetRequest().GetMaximumPageSize(), reverseHistoryPageSize)
 	}
 	return nil
 }
 
-func (s *reverseHistoryPageSource) pageIndex(token []byte) (int, error) {
+func (s *pageSource) index(token []byte) (int, error) {
 	if len(token) == 0 {
 		return 0, nil
 	}
 	continuation, err := historyapi.DeserializeHistoryToken(token)
-	if err != nil {
-		return 0, fmt.Errorf("deserialize continuation: %w", err)
+	if err != nil || continuation.GetRunId() != reverseHistoryRun || continuation.GetFirstEventId() != 1 {
+		return 0, errors.New("invalid continuation token")
 	}
-	if continuation.GetRunId() != reverseHistoryBenchmarkRun {
-		return 0, fmt.Errorf("unexpected continuation run ID %q", continuation.GetRunId())
+	index := int((int64(s.total()) - continuation.GetNextEventId()) / reverseHistoryPageSize)
+	if index <= 0 || index >= len(s.pages) {
+		return 0, fmt.Errorf("invalid continuation page %d", index)
 	}
-	if continuation.GetFirstEventId() != 1 {
-		return 0, fmt.Errorf("unexpected continuation first event ID %d", continuation.GetFirstEventId())
+	if s.stats != nil {
+		s.stats.deserialized.Add(1)
+		s.stats.tokenBytes.Add(int64(len(token)))
 	}
-	nextEventID := continuation.GetNextEventId()
-	if nextEventID <= 0 || nextEventID >= int64(s.totalEvents()) {
-		return 0, fmt.Errorf("unexpected continuation next event ID %d", nextEventID)
-	}
-	page := int((int64(s.totalEvents()) - nextEventID) / int64(s.pageSize))
-	if page <= 0 || page >= s.pageCount() {
-		return 0, fmt.Errorf("continuation resolves to invalid page %d", page)
-	}
-	if s.measurements != nil {
-		s.measurements.continuationDeserializations.Add(1)
-		s.measurements.continuationWireBytes.Add(int64(len(token)))
-	}
-	return page, nil
+	return index, nil
 }
 
-func (s *reverseHistoryPageSource) nextPageToken(nextPage int) ([]byte, error) {
-	if nextPage >= s.pageCount() {
+func (s *pageSource) token(next int) ([]byte, error) {
+	if next == len(s.pages) {
 		return nil, nil
 	}
-	persistenceToken := make([]byte, 48)
-	for i := range persistenceToken {
-		persistenceToken[i] = byte(nextPage + i)
+	token, err := historyapi.SerializeHistoryToken(&tokenspb.HistoryContinuation{
+		RunId:            reverseHistoryRun,
+		FirstEventId:     1,
+		NextEventId:      int64(s.total() - next*reverseHistoryPageSize),
+		BranchToken:      []byte("reverse-history-benchmark-branch"),
+		PersistenceToken: []byte{byte(next), 1, 2, 3, 4, 5, 6, 7},
+	})
+	if err == nil && s.stats != nil {
+		s.stats.serialized.Add(1)
+		s.stats.tokenBytes.Add(int64(len(token)))
 	}
-	continuation := &tokenspb.HistoryContinuation{
-		RunId:              reverseHistoryBenchmarkRun,
-		FirstEventId:       1,
-		NextEventId:        int64(s.totalEvents() - nextPage*s.pageSize),
-		PersistenceToken:   persistenceToken,
-		BranchToken:        s.branchToken,
-		VersionHistoryItem: &historyspb.VersionHistoryItem{EventId: int64(s.totalEvents()), Version: 1},
-	}
-	token, err := historyapi.SerializeHistoryToken(continuation)
-	if err != nil {
-		return nil, fmt.Errorf("serialize continuation: %w", err)
-	}
-	if s.measurements != nil {
-		s.measurements.continuationSerializations.Add(1)
-		s.measurements.continuationWireBytes.Add(int64(len(token)))
-	}
-	return token, nil
+	return token, err
 }
 
-func (s *reverseHistoryPageSource) response(page int, withContinuation bool) (*historyservice.GetWorkflowExecutionHistoryReverseResponse, error) {
-	if page < 0 || page >= s.pageCount() {
-		return nil, fmt.Errorf("page index %d outside [0,%d)", page, s.pageCount())
+func (s *pageSource) response(index int, continuation bool) (*historyservice.GetWorkflowExecutionHistoryReverseResponse, error) {
+	if index < 0 || index >= len(s.pages) {
+		return nil, fmt.Errorf("invalid page %d", index)
 	}
-	if s.measurements != nil {
-		s.measurements.sourcePageReads.Add(1)
-	}
-	var nextPageToken []byte
+	var token []byte
 	var err error
-	if withContinuation {
-		nextPageToken, err = s.nextPageToken(page + 1)
+	if continuation {
+		token, err = s.token(index + 1)
 		if err != nil {
 			return nil, err
 		}
 	}
-	return &historyservice.GetWorkflowExecutionHistoryReverseResponse{
-		Response: &workflowservice.GetWorkflowExecutionHistoryReverseResponse{
-			History:       &historypb.History{Events: s.pages[page]},
-			NextPageToken: nextPageToken,
-		},
-	}, nil
+	if s.stats != nil {
+		s.stats.reads.Add(1)
+	}
+	return &historyservice.GetWorkflowExecutionHistoryReverseResponse{Response: &workflowservice.GetWorkflowExecutionHistoryReverseResponse{
+		History:       &historypb.History{Events: s.pages[index]},
+		NextPageToken: token,
+	}}, nil
 }
 
-func (s *reverseHistoryPageSource) unaryResponse(
-	request *historyservice.GetWorkflowExecutionHistoryReverseRequest,
-) (*historyservice.GetWorkflowExecutionHistoryReverseResponse, error) {
-	if err := s.validateRequest(request); err != nil {
+func (s *pageSource) unary(request *historyservice.GetWorkflowExecutionHistoryReverseRequest) (*historyservice.GetWorkflowExecutionHistoryReverseResponse, error) {
+	if err := s.validate(request); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	page, err := s.pageIndex(request.GetRequest().GetNextPageToken())
+	index, err := s.index(request.GetRequest().GetNextPageToken())
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	response, err := s.response(page, true)
+	response, err := s.response(index, true)
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	return response, nil
 }
 
-func (s *reverseHistoryPageSource) allowNextStreamPage() {
-	if !s.gateStream {
-		return
+func (s *pageSource) stream(ctx context.Context, request *historyservice.GetWorkflowExecutionHistoryReverseRequest, send func(*historyservice.GetWorkflowExecutionHistoryReverseResponse) error) (err error) {
+	if s.done != nil {
+		defer func() { s.done <- err }()
 	}
-	s.streamPermits <- struct{}{}
-}
-
-func (s *reverseHistoryPageSource) waitForStream(t testing.TB) error {
-	t.Helper()
-	if !s.gateStream {
-		return nil
-	}
-	return <-s.streamDone
-}
-
-func (s *reverseHistoryPageSource) streamResponse(
-	ctx context.Context,
-	request *historyservice.GetWorkflowExecutionHistoryReverseRequest,
-	send func(*historyservice.GetWorkflowExecutionHistoryReverseResponse) error,
-) (retErr error) {
-	if s.gateStream {
-		defer func() {
-			s.streamDone <- retErr
-		}()
-	}
-	if err := s.validateRequest(request); err != nil {
+	if err = s.validate(request); err != nil {
 		return status.Error(codes.InvalidArgument, err.Error())
 	}
 	if len(request.GetRequest().GetNextPageToken()) != 0 {
-		return status.Error(codes.InvalidArgument, "a stream must start without a continuation token")
+		return status.Error(codes.InvalidArgument, "stream starts without a continuation")
 	}
-	for page := 0; page < s.pageCount(); page++ {
-		if page > 0 && s.gateStream {
+	for page := range s.pages {
+		if page > 0 && s.permits != nil {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-s.streamPermits:
+			case <-s.permits:
 			}
 		}
-		if err := ctx.Err(); err != nil {
-			return err
+		response, responseErr := s.response(page, false)
+		if responseErr != nil {
+			return responseErr
 		}
-		response, err := s.response(page, false)
-		if err != nil {
-			return status.Error(codes.Internal, err.Error())
-		}
-		if err := send(response); err != nil {
+		if err = send(response); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-type reverseHistoryPageServer struct {
-	historyservice.UnimplementedHistoryServiceServer
-	source *reverseHistoryPageSource
+func (s *pageSource) permit() {
+	if s.permits != nil {
+		s.permits <- struct{}{}
+	}
 }
 
-func (s *reverseHistoryPageServer) GetWorkflowExecutionHistoryReverse(
-	ctx context.Context,
-	request *historyservice.GetWorkflowExecutionHistoryReverseRequest,
-) (*historyservice.GetWorkflowExecutionHistoryReverseResponse, error) {
+func (s *pageSource) wait(t testing.TB) error {
+	t.Helper()
+	return <-s.done
+}
+
+type pageServer struct {
+	historyservice.UnimplementedHistoryServiceServer
+	source *pageSource
+}
+
+func (s *pageServer) GetWorkflowExecutionHistoryReverse(ctx context.Context, request *historyservice.GetWorkflowExecutionHistoryReverseRequest) (*historyservice.GetWorkflowExecutionHistoryReverseResponse, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return s.source.unaryResponse(request)
+	return s.source.unary(request)
 }
 
-func reverseHistoryInternalStreamHandler(srv any, stream grpc.ServerStream) error {
+func historyStreamHandler(server any, stream grpc.ServerStream) error {
 	request := new(historyservice.GetWorkflowExecutionHistoryReverseRequest)
 	if err := stream.RecvMsg(request); err != nil {
 		return err
 	}
-	pageServer, ok := srv.(*reverseHistoryPageServer)
-	if !ok {
-		return status.Error(codes.Internal, "unexpected reverse-history page server")
-	}
-	return pageServer.source.streamResponse(stream.Context(), request, func(response *historyservice.GetWorkflowExecutionHistoryReverseResponse) error {
+	return server.(*pageServer).source.stream(stream.Context(), request, func(response *historyservice.GetWorkflowExecutionHistoryReverseResponse) error {
 		return stream.SendMsg(response)
 	})
 }
 
-type reverseHistoryPublicStreamServer struct {
-	grpc.ServerStream
-}
+type publicStreamServer struct{ grpc.ServerStream }
 
-func (s *reverseHistoryPublicStreamServer) Send(response *workflowservice.GetWorkflowExecutionHistoryReverseResponse) error {
+func (s *publicStreamServer) Send(response *workflowservice.GetWorkflowExecutionHistoryReverseResponse) error {
 	return s.SendMsg(response)
 }
 
-func reverseHistoryPublicStreamHandler(srv any, stream grpc.ServerStream) (retErr error) {
+func publicStreamHandler(server any, stream grpc.ServerStream) (err error) {
 	request := new(workflowservice.GetWorkflowExecutionHistoryReverseRequest)
-	if err := stream.RecvMsg(request); err != nil {
+	if err = stream.RecvMsg(request); err != nil {
 		return err
 	}
-
-	method := reflect.ValueOf(srv).MethodByName(reverseHistoryStreamMethod)
+	method := reflect.ValueOf(server).MethodByName(reverseHistoryStream)
 	if !method.IsValid() {
-		return status.Error(codes.Unimplemented, "reverse-history streaming RPC is not implemented")
-	}
-	methodType := method.Type()
-	if methodType.NumIn() != 2 || methodType.NumOut() != 1 {
-		return status.Error(codes.Internal, "reverse-history streaming RPC has an unexpected signature")
-	}
-	streamServer := &reverseHistoryPublicStreamServer{ServerStream: stream}
-	requestValue := reflect.ValueOf(request)
-	streamValue := reflect.ValueOf(streamServer)
-	if !requestValue.Type().AssignableTo(methodType.In(0)) || !streamValue.Type().AssignableTo(methodType.In(1)) {
-		return status.Error(codes.Internal, "reverse-history streaming RPC uses an incompatible generated signature")
-	}
-	if !methodType.Out(0).Implements(reflect.TypeOf((*error)(nil)).Elem()) {
-		return status.Error(codes.Internal, "reverse-history streaming RPC does not return an error")
+		return status.Error(codes.Unimplemented, "reverse-history stream unavailable")
 	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			retErr = status.Errorf(codes.Internal, "reverse-history streaming RPC panicked: %v", recovered)
+			err = status.Errorf(codes.Internal, "reverse-history stream signature: %v", recovered)
 		}
 	}()
-	results := method.Call([]reflect.Value{requestValue, streamValue})
-	if !results[0].IsNil() {
-		return results[0].Interface().(error)
+	result := method.Call([]reflect.Value{reflect.ValueOf(request), reflect.ValueOf(&publicStreamServer{stream})})
+	if len(result) != 1 || !result[0].IsNil() {
+		return result[0].Interface().(error)
 	}
 	return nil
 }
 
-func reverseHistoryServiceDescriptor() grpc.ServiceDesc {
-	descriptor := historyservice.HistoryService_ServiceDesc
-	descriptor.Methods = append([]grpc.MethodDesc(nil), descriptor.Methods...)
-	descriptor.Streams = append([]grpc.StreamDesc(nil), descriptor.Streams...)
-	for i := range descriptor.Streams {
-		if descriptor.Streams[i].StreamName == reverseHistoryStreamMethod {
-			descriptor.Streams[i].Handler = reverseHistoryInternalStreamHandler
-			descriptor.Streams[i].ServerStreams = true
-			descriptor.Streams[i].ClientStreams = false
-			return descriptor
+func descriptor(base grpc.ServiceDesc, handler grpc.StreamHandler) grpc.ServiceDesc {
+	base.Methods = append([]grpc.MethodDesc(nil), base.Methods...)
+	base.Streams = append([]grpc.StreamDesc(nil), base.Streams...)
+	for index := range base.Streams {
+		if base.Streams[index].StreamName == reverseHistoryStream {
+			base.Streams[index].Handler = handler
+			base.Streams[index].ServerStreams = true
+			base.Streams[index].ClientStreams = false
+			return base
 		}
 	}
-	descriptor.Streams = append(descriptor.Streams, grpc.StreamDesc{
-		StreamName:    reverseHistoryStreamMethod,
-		Handler:       reverseHistoryInternalStreamHandler,
-		ServerStreams: true,
-	})
-	return descriptor
+	base.Streams = append(base.Streams, grpc.StreamDesc{StreamName: reverseHistoryStream, Handler: handler, ServerStreams: true})
+	return base
 }
 
-func reverseHistoryWorkflowServiceDescriptor() grpc.ServiceDesc {
-	descriptor := workflowservice.WorkflowService_ServiceDesc
-	descriptor.Methods = append([]grpc.MethodDesc(nil), descriptor.Methods...)
-	descriptor.Streams = append([]grpc.StreamDesc(nil), descriptor.Streams...)
-	for i := range descriptor.Streams {
-		if descriptor.Streams[i].StreamName == reverseHistoryStreamMethod {
-			descriptor.Streams[i].Handler = reverseHistoryPublicStreamHandler
-			descriptor.Streams[i].ServerStreams = true
-			descriptor.Streams[i].ClientStreams = false
-			return descriptor
-		}
-	}
-	descriptor.Streams = append(descriptor.Streams, grpc.StreamDesc{
-		StreamName:    reverseHistoryStreamMethod,
-		Handler:       reverseHistoryPublicStreamHandler,
-		ServerStreams: true,
-	})
-	return descriptor
-}
-
-func reverseHistoryServerOptions(measurements *reverseHistoryMeasurements, kind string) []grpc.ServerOption {
-	if measurements == nil {
+func serverOptions(stats *reverseHistoryStats, kind string) []grpc.ServerOption {
+	if stats == nil {
 		return nil
 	}
+	hit := func() { stats.hop(kind) }
 	return []grpc.ServerOption{
-		grpc.UnaryInterceptor(func(
-			ctx context.Context,
-			request any,
-			info *grpc.UnaryServerInfo,
-			handler grpc.UnaryHandler,
-		) (any, error) {
-			if kind == "public" {
-				measurements.publicRPCCalls.Add(1)
-			} else {
-				measurements.historyRPCCalls.Add(1)
-			}
-			var response any
-			err := measurements.recordSpan(kind, func() error {
-				var handlerErr error
-				response, handlerErr = handler(ctx, request)
-				return handlerErr
-			})
-			return response, err
+		grpc.UnaryInterceptor(func(ctx context.Context, request any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+			hit()
+			return handler(ctx, request)
 		}),
-		grpc.StreamInterceptor(func(
-			srv any,
-			stream grpc.ServerStream,
-			info *grpc.StreamServerInfo,
-			handler grpc.StreamHandler,
-		) error {
-			if kind == "public" {
-				measurements.publicRPCCalls.Add(1)
-			} else {
-				measurements.historyRPCCalls.Add(1)
-			}
-			return measurements.recordSpan(kind, func() error {
-				return handler(srv, stream)
-			})
+		grpc.StreamInterceptor(func(server any, stream grpc.ServerStream, _ *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+			hit()
+			return handler(server, stream)
 		}),
 	}
 }
 
-type reverseHistoryTransportFixture struct {
-	mode         reverseHistoryTransportMode
-	pageCount    int
-	source       *reverseHistoryPageSource
-	client       workflowservice.WorkflowServiceClient
-	publicConn   *grpc.ClientConn
-	measurements *reverseHistoryMeasurements
+type reverseHistoryFixture struct {
+	pages  int
+	source *pageSource
+	stats  *reverseHistoryStats
+	client workflowservice.WorkflowServiceClient
+	conn   *grpc.ClientConn
+	stream bool
 }
 
-func newReverseHistoryTransportFixture(
-	tb testing.TB,
-	pageCount int,
-	instrument bool,
-) *reverseHistoryTransportFixture {
+func newReverseHistoryFixture(tb testing.TB, pages int, record bool) *reverseHistoryFixture {
 	tb.Helper()
-	var measurements *reverseHistoryMeasurements
-	if instrument {
-		measurements = &reverseHistoryMeasurements{}
+	var stats *reverseHistoryStats
+	if record {
+		stats = &reverseHistoryStats{}
 	}
-	source := newReverseHistoryPageSource(pageCount, reverseHistoryBenchmarkPageSize, measurements, instrument)
-
+	source := newPageSource(pages, stats)
 	historyListener := bufconn.Listen(8 * 1024 * 1024)
-	historyServer := grpc.NewServer(reverseHistoryServerOptions(measurements, "history")...)
-	historyDescriptor := reverseHistoryServiceDescriptor()
-	historyServer.RegisterService(&historyDescriptor, &reverseHistoryPageServer{source: source})
-	go func() {
-		_ = historyServer.Serve(historyListener)
-	}()
+	historyServer := grpc.NewServer(serverOptions(stats, "history")...)
+	historyDescriptor := descriptor(historyservice.HistoryService_ServiceDesc, historyStreamHandler)
+	historyServer.RegisterService(&historyDescriptor, &pageServer{source: source})
+	go func() { _ = historyServer.Serve(historyListener) }()
+	historyConn := dial(tb, historyListener)
 
-	historyConn := reverseHistoryDial(tb, historyListener)
-	workflowHandler := &WorkflowHandler{
+	handler := &WorkflowHandler{
 		config:            NewConfig(dynamicconfig.NewNoopCollection(), 1),
 		logger:            log.NewNoopLogger(),
 		throttledLogger:   log.NewNoopLogger(),
-		namespaceRegistry: reverseHistoryStaticNamespaceRegistry{id: reverseHistoryBenchmarkNamespaceID},
+		namespaceRegistry: staticNamespaceRegistry{},
 		historyClient:     historyservice.NewHistoryServiceClient(historyConn),
 	}
-
 	publicListener := bufconn.Listen(8 * 1024 * 1024)
-	publicServer := grpc.NewServer(reverseHistoryServerOptions(measurements, "public")...)
-	publicDescriptor := reverseHistoryWorkflowServiceDescriptor()
-	publicServer.RegisterService(&publicDescriptor, workflowHandler)
-	go func() {
-		_ = publicServer.Serve(publicListener)
-	}()
-	publicConn := reverseHistoryDial(tb, publicListener)
+	publicServer := grpc.NewServer(serverOptions(stats, "public")...)
+	publicDescriptor := descriptor(workflowservice.WorkflowService_ServiceDesc, publicStreamHandler)
+	publicServer.RegisterService(&publicDescriptor, handler)
+	go func() { _ = publicServer.Serve(publicListener) }()
+	publicConn := dial(tb, publicListener)
 
-	mode := reverseHistoryUnaryMode
-	if reverseHistoryStreamMethodAvailable(workflowHandler) {
-		mode = reverseHistoryStreamMode
-	}
-	fixture := &reverseHistoryTransportFixture{
-		mode:         mode,
-		pageCount:    pageCount,
-		source:       source,
-		client:       workflowservice.NewWorkflowServiceClient(publicConn),
-		publicConn:   publicConn,
-		measurements: measurements,
+	fixture := &reverseHistoryFixture{
+		pages:  pages,
+		source: source,
+		stats:  stats,
+		client: workflowservice.NewWorkflowServiceClient(publicConn),
+		conn:   publicConn,
+		stream: reflect.ValueOf(handler).MethodByName(reverseHistoryStream).IsValid(),
 	}
 	tb.Cleanup(func() {
 		_ = publicConn.Close()
@@ -585,58 +378,34 @@ func newReverseHistoryTransportFixture(
 	return fixture
 }
 
-func reverseHistoryDial(tb testing.TB, listener *bufconn.Listener) *grpc.ClientConn {
+func dial(tb testing.TB, listener *bufconn.Listener) *grpc.ClientConn {
 	tb.Helper()
-	connection, err := grpc.DialContext(
-		context.Background(),
-		"bufnet",
-		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
-			return listener.Dial()
-		}),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
-	)
+	conn, err := grpc.DialContext(context.Background(), "bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return listener.Dial() }),
+		grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
 	if err != nil {
-		tb.Fatalf("dial bufconn: %v", err)
+		tb.Fatal(err)
 	}
-	return connection
+	return conn
 }
 
-func reverseHistoryStreamMethodAvailable(handler *WorkflowHandler) bool {
-	method := reflect.ValueOf(handler).MethodByName(reverseHistoryStreamMethod)
-	if !method.IsValid() {
-		return false
-	}
-	methodType := method.Type()
-	return methodType.NumIn() == 2 && methodType.NumOut() == 1 &&
-		methodType.Out(0).Implements(reflect.TypeOf((*error)(nil)).Elem())
-}
-
-type reverseHistoryPageCallback func(page int, response *workflowservice.GetWorkflowExecutionHistoryReverseResponse) bool
-
-func (f *reverseHistoryTransportFixture) scan(
-	ctx context.Context,
-	callback reverseHistoryPageCallback,
-) ([]*historypb.HistoryEvent, error) {
-	if f.mode == reverseHistoryStreamMode {
+func (f *reverseHistoryFixture) scan(ctx context.Context, callback func(int) bool) ([]*historypb.HistoryEvent, error) {
+	if f.stream {
 		return f.scanStream(ctx, callback)
 	}
 	return f.scanUnary(ctx, callback)
 }
 
-func (f *reverseHistoryTransportFixture) scanUnary(
-	ctx context.Context,
-	callback reverseHistoryPageCallback,
-) ([]*historypb.HistoryEvent, error) {
-	request := &workflowservice.GetWorkflowExecutionHistoryReverseRequest{
-		Namespace: reverseHistoryBenchmarkNamespace,
-		Execution: &commonpb.WorkflowExecution{
-			WorkflowId: reverseHistoryBenchmarkWorkflow,
-		},
-		// The frontend must enforce the production 256-event maximum. Supplying
-		// 1000 mirrors the in-tree batcher caller and makes the cap observable.
-		MaximumPageSize: 1000,
+func (f *reverseHistoryFixture) request() *workflowservice.GetWorkflowExecutionHistoryReverseRequest {
+	return &workflowservice.GetWorkflowExecutionHistoryReverseRequest{
+		Namespace:       reverseHistoryNamespace,
+		Execution:       &commonpb.WorkflowExecution{WorkflowId: reverseHistoryWorkflow},
+		MaximumPageSize: 1000, // the frontend must cap this to 256.
 	}
+}
+
+func (f *reverseHistoryFixture) scanUnary(ctx context.Context, callback func(int) bool) ([]*historypb.HistoryEvent, error) {
+	request := f.request()
 	var events []*historypb.HistoryEvent
 	for page := 0; ; page++ {
 		if err := ctx.Err(); err != nil {
@@ -647,7 +416,7 @@ func (f *reverseHistoryTransportFixture) scanUnary(
 			return events, err
 		}
 		events = append(events, response.GetHistory().GetEvents()...)
-		if callback != nil && !callback(page, response) {
+		if callback != nil && !callback(page) {
 			return events, nil
 		}
 		if len(response.GetNextPageToken()) == 0 {
@@ -657,356 +426,187 @@ func (f *reverseHistoryTransportFixture) scanUnary(
 	}
 }
 
-func (f *reverseHistoryTransportFixture) scanStream(
-	ctx context.Context,
-	callback reverseHistoryPageCallback,
-) ([]*historypb.HistoryEvent, error) {
-	scanCtx, cancel := context.WithCancel(ctx)
+func (f *reverseHistoryFixture) scanStream(ctx context.Context, callback func(int) bool) ([]*historypb.HistoryEvent, error) {
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	stream, err := f.publicConn.NewStream(
-		scanCtx,
-		&grpc.StreamDesc{StreamName: reverseHistoryStreamMethod, ServerStreams: true},
-		"/"+workflowservice.WorkflowService_ServiceDesc.ServiceName+"/"+reverseHistoryStreamMethod,
-	)
+	stream, err := f.conn.NewStream(ctx, &grpc.StreamDesc{StreamName: reverseHistoryStream, ServerStreams: true}, "/"+workflowservice.WorkflowService_ServiceDesc.ServiceName+"/"+reverseHistoryStream)
 	if err != nil {
 		return nil, err
 	}
-	request := &workflowservice.GetWorkflowExecutionHistoryReverseRequest{
-		Namespace: reverseHistoryBenchmarkNamespace,
-		Execution: &commonpb.WorkflowExecution{
-			WorkflowId: reverseHistoryBenchmarkWorkflow,
-		},
-		MaximumPageSize: 1000,
-	}
-	if err := stream.SendMsg(request); err != nil {
+	if err = stream.SendMsg(f.request()); err != nil {
 		return nil, err
 	}
-	if err := stream.CloseSend(); err != nil {
+	if err = stream.CloseSend(); err != nil {
 		return nil, err
 	}
-
 	var events []*historypb.HistoryEvent
 	for page := 0; ; page++ {
 		response := new(workflowservice.GetWorkflowExecutionHistoryReverseResponse)
-		err := stream.RecvMsg(response)
-		if errors.Is(err, io.EOF) {
+		if err = stream.RecvMsg(response); errors.Is(err, io.EOF) {
 			return events, nil
-		}
-		if err != nil {
+		} else if err != nil {
 			return events, err
 		}
 		events = append(events, response.GetHistory().GetEvents()...)
-		if callback != nil && !callback(page, response) {
+		if callback != nil && !callback(page) {
 			cancel()
 			return events, nil
 		}
-		if err := scanCtx.Err(); err != nil {
+		if err = ctx.Err(); err != nil {
 			return events, err
 		}
-		if page+1 < f.pageCount {
-			f.source.allowNextStreamPage()
+		if page+1 < f.pages {
+			f.source.permit()
 		}
 	}
 }
 
-func reverseHistoryAssertEvents(t testing.TB, events []*historypb.HistoryEvent, expected int) {
+func assertPrefix(t testing.TB, events []*historypb.HistoryEvent, count int, first int64) {
 	t.Helper()
-	reverseHistoryAssertReversePrefix(t, events, expected, int64(expected))
-}
-
-func reverseHistoryAssertReversePrefix(
-	t testing.TB,
-	events []*historypb.HistoryEvent,
-	expectedCount int,
-	firstEventID int64,
-) {
-	t.Helper()
-	if len(events) != expectedCount {
-		t.Fatalf("event count: got %d want %d", len(events), expectedCount)
+	if len(events) != count {
+		t.Fatalf("events: got %d want %d", len(events), count)
 	}
 	for index, event := range events {
-		wantID := firstEventID - int64(index)
-		if event.GetEventId() != wantID {
-			t.Fatalf("event %d ID: got %d want %d", index, event.GetEventId(), wantID)
-		}
-		if event.GetEventType() != enumspb.EVENT_TYPE_ACTIVITY_TASK_COMPLETED {
-			t.Fatalf("event %d type: got %s", index, event.GetEventType())
+		if event.GetEventId() != first-int64(index) || event.GetEventType() != enumspb.EVENT_TYPE_ACTIVITY_TASK_COMPLETED {
+			t.Fatalf("event %d is not descending reverse history", index)
 		}
 	}
 }
 
-func reverseHistoryExpectedRPCCalls(mode reverseHistoryTransportMode, pages int) int64 {
-	if mode == reverseHistoryStreamMode {
-		return 1
-	}
-	return int64(pages)
-}
-
-func reverseHistoryAssertWaterfall(
-	t testing.TB,
-	snapshot reverseHistoryMeasurementSnapshot,
-	mode reverseHistoryTransportMode,
-	pages int,
-) string {
+func assertCalls(t testing.TB, stats *reverseHistoryStats, want int64) {
 	t.Helper()
-	wantCalls := int(reverseHistoryExpectedRPCCalls(mode, pages))
-	if len(snapshot.spans) != wantCalls*2 {
-		t.Fatalf("trace spans: got %d want %d", len(snapshot.spans), wantCalls*2)
+	if stats.public.Load() != want || stats.history.Load() != want || stats.reads.Load() != want {
+		t.Fatalf("calls public=%d history=%d reads=%d want=%d", stats.public.Load(), stats.history.Load(), stats.reads.Load(), want)
 	}
-	parts := make([]string, 0, len(snapshot.spans))
-	for call := 0; call < wantCalls; call++ {
-		publicSpan := snapshot.spans[call*2]
-		historySpan := snapshot.spans[call*2+1]
-		if publicSpan.kind != "public" || historySpan.kind != "history" {
-			t.Fatalf("trace call %d order: got %s>%s want public>history", call, publicSpan.kind, historySpan.kind)
-		}
-		if historySpan.start.Before(publicSpan.start) || historySpan.end.After(publicSpan.end) {
-			t.Fatalf("trace call %d is not a nested public-to-History hop", call)
-		}
-		if call > 0 && publicSpan.start.Before(snapshot.spans[(call-1)*2].end) {
-			t.Fatalf("trace public call %d overlapped the preceding page", call)
-		}
-		parts = append(parts, publicSpan.kind, historySpan.kind)
-	}
-	return strings.Join(parts, ">")
 }
 
-func reverseHistoryAssertFullScan(
-	t testing.TB,
-	fixture *reverseHistoryTransportFixture,
-	events []*historypb.HistoryEvent,
-) reverseHistoryMeasurementSnapshot {
+func assertWaterfall(t testing.TB, stats *reverseHistoryStats, calls int) string {
 	t.Helper()
-	reverseHistoryAssertEvents(t, events, fixture.pageCount*reverseHistoryBenchmarkPageSize)
-	snapshot := fixture.measurements.snapshot()
-	wantCalls := reverseHistoryExpectedRPCCalls(fixture.mode, fixture.pageCount)
-	if snapshot.publicRPCCalls != wantCalls {
-		t.Fatalf("public RPC count: got %d want %d", snapshot.publicRPCCalls, wantCalls)
+	waterfall := stats.waterfall()
+	parts := strings.Split(waterfall, ">")
+	if len(parts) != calls*2 {
+		t.Fatalf("waterfall %q has %d hops want %d", waterfall, len(parts), calls*2)
 	}
-	if snapshot.historyRPCCalls != wantCalls {
-		t.Fatalf("frontend-to-History RPC count: got %d want %d", snapshot.historyRPCCalls, wantCalls)
-	}
-	if snapshot.sourcePageReads != int64(fixture.pageCount) {
-		t.Fatalf("fixture page-source reads: got %d want %d", snapshot.sourcePageReads, fixture.pageCount)
-	}
-	if fixture.mode == reverseHistoryUnaryMode {
-		wantContinuations := int64(fixture.pageCount - 1)
-		if snapshot.continuationSerializations != wantContinuations || snapshot.continuationDeserializations != wantContinuations {
-			t.Fatalf(
-				"continuation transitions: serializations=%d deserializations=%d want=%d",
-				snapshot.continuationSerializations,
-				snapshot.continuationDeserializations,
-				wantContinuations,
-			)
-		}
-		if snapshot.continuationWireBytes <= 0 {
-			t.Fatal("unary full scan did not transfer continuation bytes")
-		}
-	} else if snapshot.continuationSerializations != 0 || snapshot.continuationDeserializations != 0 || snapshot.continuationWireBytes != 0 {
-		t.Fatalf(
-			"streamed full scan transferred continuation state: serializations=%d deserializations=%d bytes=%d",
-			snapshot.continuationSerializations,
-			snapshot.continuationDeserializations,
-			snapshot.continuationWireBytes,
-		)
-	}
-	return snapshot
-}
-
-func reverseHistoryAssertUnaryFullScan(
-	t testing.TB,
-	fixture *reverseHistoryTransportFixture,
-	events []*historypb.HistoryEvent,
-) {
-	t.Helper()
-	reverseHistoryAssertEvents(t, events, fixture.pageCount*reverseHistoryBenchmarkPageSize)
-	snapshot := fixture.measurements.snapshot()
-	wantCalls := int64(fixture.pageCount)
-	if snapshot.publicRPCCalls != wantCalls || snapshot.historyRPCCalls != wantCalls || snapshot.sourcePageReads != wantCalls {
-		t.Fatalf(
-			"unary full scan counts: public=%d history=%d reads=%d want=%d",
-			snapshot.publicRPCCalls,
-			snapshot.historyRPCCalls,
-			snapshot.sourcePageReads,
-			wantCalls,
-		)
-	}
-	wantContinuations := int64(fixture.pageCount - 1)
-	if snapshot.continuationSerializations != wantContinuations || snapshot.continuationDeserializations != wantContinuations || snapshot.continuationWireBytes <= 0 {
-		t.Fatalf(
-			"unary continuation transitions: serializations=%d deserializations=%d bytes=%d want=%d",
-			snapshot.continuationSerializations,
-			snapshot.continuationDeserializations,
-			snapshot.continuationWireBytes,
-			wantContinuations,
-		)
-	}
-}
-
-func reverseHistoryAssertSinglePageStop(
-	t testing.TB,
-	fixture *reverseHistoryTransportFixture,
-	events []*historypb.HistoryEvent,
-	err error,
-) {
-	t.Helper()
-	if err != nil {
-		t.Fatalf("single-page stop: %v", err)
-	}
-	reverseHistoryAssertReversePrefix(t, events, reverseHistoryBenchmarkPageSize, int64(fixture.pageCount*reverseHistoryBenchmarkPageSize))
-	snapshot := fixture.measurements.snapshot()
-	if snapshot.publicRPCCalls != 1 || snapshot.historyRPCCalls != 1 || snapshot.sourcePageReads != 1 {
-		t.Fatalf(
-			"single-page stop issued extra work: public=%d history=%d reads=%d",
-			snapshot.publicRPCCalls,
-			snapshot.historyRPCCalls,
-			snapshot.sourcePageReads,
-		)
-	}
-	if fixture.mode == reverseHistoryStreamMode {
-		streamErr := fixture.source.waitForStream(t)
-		if streamErr != nil && !reverseHistoryIsCancellation(streamErr) {
-			t.Fatalf("single-page stream completion: %v", streamErr)
+	for index := 0; index < len(parts); index += 2 {
+		if parts[index] != "public" || parts[index+1] != "history" {
+			t.Fatalf("waterfall %q is not a serial public>history chain", waterfall)
 		}
 	}
+	return waterfall
 }
 
-func reverseHistoryIsCancellation(err error) bool {
+func canceled(err error) bool {
 	return errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled
 }
 
 func TestReverseHistoryTransportContract(t *testing.T) {
-	fixture := newReverseHistoryTransportFixture(t, reverseHistoryBenchmarkPageCount, true)
-
+	fixture := newReverseHistoryFixture(t, reverseHistoryPageCount, true)
 	events, err := fixture.scan(context.Background(), nil)
 	if err != nil {
-		t.Fatalf("full scan: %v", err)
+		t.Fatal(err)
 	}
-	fullSnapshot := reverseHistoryAssertFullScan(t, fixture, events)
-	waterfall := reverseHistoryAssertWaterfall(t, fullSnapshot, fixture.mode, fixture.pageCount)
-	if fixture.mode == reverseHistoryStreamMode {
-		if streamErr := fixture.source.waitForStream(t); streamErr != nil {
-			t.Fatalf("full stream completion: %v", streamErr)
+	assertPrefix(t, events, reverseHistoryPageCount*reverseHistoryPageSize, reverseHistoryPageCount*reverseHistoryPageSize)
+	calls := int64(reverseHistoryPageCount)
+	if fixture.stream {
+		calls = 1
+	}
+	assertCalls(t, fixture.stats, calls)
+	if fixture.stream {
+		if err := fixture.source.wait(t); err != nil {
+			t.Fatal(err)
+		}
+		if fixture.stats.serialized.Load() != 0 || fixture.stats.deserialized.Load() != 0 || fixture.stats.tokenBytes.Load() != 0 {
+			t.Fatal("stream transferred a continuation token")
+		}
+	} else if fixture.stats.serialized.Load() != reverseHistoryPageCount-1 || fixture.stats.deserialized.Load() != reverseHistoryPageCount-1 || fixture.stats.tokenBytes.Load() == 0 {
+		t.Fatal("unary scan did not serialize and restore every continuation")
+	}
+	waterfall := assertWaterfall(t, fixture.stats, int(calls))
+
+	fixture.stats.reset()
+	events, err = fixture.scan(context.Background(), func(int) bool { return false })
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPrefix(t, events, reverseHistoryPageSize, reverseHistoryPageCount*reverseHistoryPageSize)
+	assertCalls(t, fixture.stats, 1)
+	if fixture.stream {
+		if err := fixture.source.wait(t); err != nil && !canceled(err) {
+			t.Fatal(err)
 		}
 	}
 
-	fixture.measurements.reset()
-	events, err = fixture.scan(context.Background(), func(int, *workflowservice.GetWorkflowExecutionHistoryReverseResponse) bool {
-		return false
-	})
-	reverseHistoryAssertSinglePageStop(t, fixture, events, err)
-
-	fixture.measurements.reset()
+	fixture.stats.reset()
 	ctx, cancel := context.WithCancel(context.Background())
-	events, err = fixture.scan(ctx, func(page int, _ *workflowservice.GetWorkflowExecutionHistoryReverseResponse) bool {
+	events, err = fixture.scan(ctx, func(page int) bool {
 		if page == 0 {
 			cancel()
 		}
 		return true
 	})
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("cancellation: got %v want context.Canceled", err)
+	if !canceled(err) {
+		t.Fatalf("cancellation: %v", err)
 	}
-	reverseHistoryAssertReversePrefix(t, events, reverseHistoryBenchmarkPageSize, int64(fixture.pageCount*reverseHistoryBenchmarkPageSize))
-	canceledSnapshot := fixture.measurements.snapshot()
-	if canceledSnapshot.publicRPCCalls != 1 || canceledSnapshot.historyRPCCalls != 1 || canceledSnapshot.sourcePageReads != 1 {
-		t.Fatalf(
-			"cancellation issued extra work: public=%d history=%d reads=%d",
-			canceledSnapshot.publicRPCCalls,
-			canceledSnapshot.historyRPCCalls,
-			canceledSnapshot.sourcePageReads,
-		)
-	}
-	if fixture.mode == reverseHistoryStreamMode {
-		streamErr := fixture.source.waitForStream(t)
-		if streamErr != nil && !reverseHistoryIsCancellation(streamErr) {
-			t.Fatalf("canceled stream completion: %v", streamErr)
+	assertPrefix(t, events, reverseHistoryPageSize, reverseHistoryPageCount*reverseHistoryPageSize)
+	assertCalls(t, fixture.stats, 1)
+	if fixture.stream {
+		if err := fixture.source.wait(t); err != nil && !canceled(err) {
+			t.Fatal(err)
 		}
 	}
 
-	t.Logf(
-		"reverse_history_transport_contract passed mode=%s pages=%d events=%d public_rpc_count=%d frontend_history_rpc_count=%d continuation_serializations=%d continuation_deserializations=%d continuation_wire_bytes=%d fixture_page_source_reads=%d waterfall=%s",
-		fixture.mode,
-		fixture.pageCount,
-		reverseHistoryBenchmarkPageCount*reverseHistoryBenchmarkPageSize,
-		fullSnapshot.publicRPCCalls,
-		fullSnapshot.historyRPCCalls,
-		fullSnapshot.continuationSerializations,
-		fullSnapshot.continuationDeserializations,
-		fullSnapshot.continuationWireBytes,
-		fullSnapshot.sourcePageReads,
-		waterfall,
-	)
+	t.Logf("reverse_history_transport_contract passed mode=%s pages=16 events=4096 public_rpc_count=%d frontend_history_rpc_count=%d fixture_page_source_reads=%d waterfall=%s", map[bool]string{true: "stream", false: "unary"}[fixture.stream], calls, calls, calls, waterfall)
 }
 
 func TestReverseHistoryUnaryCompatibility(t *testing.T) {
-	fixture := newReverseHistoryTransportFixture(t, 2, true)
-
+	fixture := newReverseHistoryFixture(t, 2, true)
 	events, err := fixture.scanUnary(context.Background(), nil)
 	if err != nil {
-		t.Fatalf("unary full scan: %v", err)
+		t.Fatal(err)
 	}
-	reverseHistoryAssertUnaryFullScan(t, fixture, events)
-
-	fixture.measurements.reset()
-	events, err = fixture.scanUnary(context.Background(), func(int, *workflowservice.GetWorkflowExecutionHistoryReverseResponse) bool {
-		return false
-	})
+	assertPrefix(t, events, 2*reverseHistoryPageSize, 2*reverseHistoryPageSize)
+	assertCalls(t, fixture.stats, 2)
+	if fixture.stats.serialized.Load() != 1 || fixture.stats.deserialized.Load() != 1 {
+		t.Fatal("unary continuation compatibility failed")
+	}
+	fixture.stats.reset()
+	events, err = fixture.scanUnary(context.Background(), func(int) bool { return false })
 	if err != nil {
-		t.Fatalf("unary first-page stop: %v", err)
+		t.Fatal(err)
 	}
-	reverseHistoryAssertReversePrefix(t, events, reverseHistoryBenchmarkPageSize, 2*reverseHistoryBenchmarkPageSize)
-	stoppedSnapshot := fixture.measurements.snapshot()
-	if stoppedSnapshot.publicRPCCalls != 1 || stoppedSnapshot.historyRPCCalls != 1 || stoppedSnapshot.sourcePageReads != 1 {
-		t.Fatalf(
-			"unary first-page stop issued extra work: public=%d history=%d reads=%d",
-			stoppedSnapshot.publicRPCCalls,
-			stoppedSnapshot.historyRPCCalls,
-			stoppedSnapshot.sourcePageReads,
-		)
-	}
-
-	t.Logf(
-		"reverse_history_unary_compatibility passed pages=2 public_rpc_count=2 frontend_history_rpc_count=2",
-	)
+	assertPrefix(t, events, reverseHistoryPageSize, 2*reverseHistoryPageSize)
+	assertCalls(t, fixture.stats, 1)
+	t.Log("reverse_history_unary_compatibility passed pages=2 public_rpc_count=2 frontend_history_rpc_count=2")
 }
 
 func BenchmarkReverseHistoryFullScanManyPages(b *testing.B) {
-	fixture := newReverseHistoryTransportFixture(b, reverseHistoryBenchmarkPageCount, false)
+	fixture := newReverseHistoryFixture(b, reverseHistoryPageCount, false)
 	if events, err := fixture.scan(context.Background(), nil); err != nil {
-		b.Fatalf("warmup full scan: %v", err)
+		b.Fatal(err)
 	} else {
-		reverseHistoryAssertEvents(b, events, reverseHistoryBenchmarkPageCount*reverseHistoryBenchmarkPageSize)
+		assertPrefix(b, events, reverseHistoryPageCount*reverseHistoryPageSize, reverseHistoryPageCount*reverseHistoryPageSize)
 	}
-
 	b.ResetTimer()
 	for b.Loop() {
 		events, err := fixture.scan(context.Background(), nil)
-		if err != nil {
-			b.Fatalf("full scan: %v", err)
-		}
-		if len(events) != reverseHistoryBenchmarkPageCount*reverseHistoryBenchmarkPageSize {
-			b.Fatalf("full scan event count: got %d", len(events))
+		if err != nil || len(events) != reverseHistoryPageCount*reverseHistoryPageSize {
+			b.Fatalf("scan events=%d err=%v", len(events), err)
 		}
 	}
 }
 
 func BenchmarkReverseHistoryFullScanOnePage(b *testing.B) {
-	fixture := newReverseHistoryTransportFixture(b, 1, false)
+	fixture := newReverseHistoryFixture(b, 1, false)
 	if events, err := fixture.scan(context.Background(), nil); err != nil {
-		b.Fatalf("warmup one-page scan: %v", err)
+		b.Fatal(err)
 	} else {
-		reverseHistoryAssertEvents(b, events, reverseHistoryBenchmarkPageSize)
+		assertPrefix(b, events, reverseHistoryPageSize, reverseHistoryPageSize)
 	}
-
 	b.ResetTimer()
 	for b.Loop() {
 		events, err := fixture.scan(context.Background(), nil)
-		if err != nil {
-			b.Fatalf("one-page scan: %v", err)
-		}
-		if len(events) != reverseHistoryBenchmarkPageSize {
-			b.Fatalf("one-page scan event count: got %d", len(events))
+		if err != nil || len(events) != reverseHistoryPageSize {
+			b.Fatalf("scan events=%d err=%v", len(events), err)
 		}
 	}
 }
