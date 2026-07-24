@@ -15,20 +15,54 @@ import (
 	"go.temporal.io/api/serviceerror"
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
 	"go.temporal.io/api/workflowservice/v1"
-	historyservice "go.temporal.io/server/api/historyservice/v1"
+	"go.temporal.io/server/api/historyservice/v1"
+	"go.temporal.io/server/chasm"
+	"go.temporal.io/server/common/locks"
 	"go.temporal.io/server/common/log"
-	namespacepkg "go.temporal.io/server/common/namespace"
-	"go.temporal.io/server/common/testing/testhooks"
+	"go.temporal.io/server/common/namespace"
+	"go.temporal.io/server/common/primitives"
+	historyi "go.temporal.io/server/service/history/interfaces"
+	wcache "go.temporal.io/server/service/history/workflow/cache"
 	"go.temporal.io/server/tests/testcore"
+	"go.uber.org/fx"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/durationpb"
 )
 
 const (
-	genericTransitionsMetric = "generic_activity_completion_transitions_per_fault_injected_completion"
-	historyDeliveriesMetric  = "history_completion_deliveries_per_fault_injected_completion"
-	completionSuccessMetric  = "fault_injected_completion_success"
+	workflowLeaseAcquisitionsMetric = "workflow_lease_acquisitions_per_fault_injected_completion"
+	historyDeliveriesMetric         = "history_completion_deliveries_per_fault_injected_completion"
+	completionSuccessMetric         = "fault_injected_completion_success"
 )
+
+type activityCompletionRequestContextKey struct{}
+
+type workflowLeaseCounter struct {
+	acquisitions atomic.Int32
+}
+
+func (c *workflowLeaseCounter) reset() {
+	c.acquisitions.Store(0)
+}
+
+type activityCompletionWorkflowCache struct {
+	wcache.Cache
+	counter *workflowLeaseCounter
+}
+
+func (c *activityCompletionWorkflowCache) GetOrCreateChasmExecution(
+	ctx context.Context,
+	shardContext historyi.ShardContext,
+	namespaceID namespace.ID,
+	execution *commonpb.WorkflowExecution,
+	archetypeID chasm.ArchetypeID,
+	lockPriority locks.Priority,
+) (historyi.WorkflowContext, historyi.ReleaseWorkflowContextFunc, error) {
+	if ctx.Value(activityCompletionRequestContextKey{}) != nil {
+		c.counter.acquisitions.Add(1)
+	}
+	return c.Cache.GetOrCreateChasmExecution(ctx, shardContext, namespaceID, execution, archetypeID, lockPriority)
+}
 
 // lostCompletionResponseInterceptor simulates a response that is lost after
 // History has committed a successful activity completion. It sits outside the
@@ -50,8 +84,12 @@ func (i *lostCompletionResponseInterceptor) Intercept(
 	info *grpc.UnaryServerInfo,
 	handler grpc.UnaryHandler,
 ) (any, error) {
+	isActivityCompletion := info.FullMethod == historyservice.HistoryService_RespondActivityTaskCompleted_FullMethodName
+	if isActivityCompletion {
+		ctx = context.WithValue(ctx, activityCompletionRequestContextKey{}, struct{}{})
+	}
 	response, err := handler(ctx, request)
-	if info.FullMethod != historyservice.HistoryService_RespondActivityTaskCompleted_FullMethodName {
+	if !isActivityCompletion {
 		return response, err
 	}
 
@@ -63,23 +101,23 @@ func (i *lostCompletionResponseInterceptor) Intercept(
 }
 
 type completionRetryScenario struct {
-	t                  testing.TB
-	fault              *lostCompletionResponseInterceptor
-	cluster            *testcore.TestCluster
-	ctx                context.Context
-	namespace          string
-	workflowID         string
-	taskQueueName      string
-	identity           string
-	started            *workflowservice.StartWorkflowExecutionResponse
-	activityTask       *workflowservice.PollActivityTaskQueueResponse
-	genericTransitions atomic.Int32
+	t             testing.TB
+	fault         *lostCompletionResponseInterceptor
+	cluster       *testcore.TestCluster
+	ctx           context.Context
+	namespace     string
+	workflowID    string
+	taskQueueName string
+	identity      string
+	started       *workflowservice.StartWorkflowExecutionResponse
+	activityTask  *workflowservice.PollActivityTaskQueueResponse
+	leaseCounter  *workflowLeaseCounter
 }
 
 type completionRetryResult struct {
-	genericTransitions int32
-	historyDeliveries  int32
-	completionSuccess  int
+	workflowLeaseAcquisitions int32
+	historyDeliveries         int32
+	completionSuccess         int
 }
 
 func TestActivityCompletionLostResponseRetriesWorkflowLease(t *testing.T) {
@@ -93,7 +131,7 @@ func TestActivityCompletionWithoutLostResponseCompletesNormally(t *testing.T) {
 	result := scenario.complete(false)
 
 	require.Equal(t, 1, result.completionSuccess, "a fault-free activity completion must return success")
-	require.Equal(t, int32(1), result.genericTransitions, "a fault-free activity completion must enter one generic workflow transition")
+	require.Equal(t, int32(1), result.workflowLeaseAcquisitions, "a fault-free activity completion must acquire one workflow lease")
 	scenario.verify(result, 1)
 }
 
@@ -109,7 +147,7 @@ func BenchmarkActivityCompletionLostResponseRetriesWorkflowLease(b *testing.B) {
 	b.StopTimer()
 	scenario.verify(result, 2)
 
-	b.ReportMetric(float64(result.genericTransitions), genericTransitionsMetric)
+	b.ReportMetric(float64(result.workflowLeaseAcquisitions), workflowLeaseAcquisitionsMetric)
 	b.ReportMetric(float64(result.historyDeliveries), historyDeliveriesMetric)
 	b.ReportMetric(float64(result.completionSuccess), completionSuccessMetric)
 }
@@ -118,12 +156,13 @@ func newCompletionRetryScenario(t testing.TB) *completionRetryScenario {
 	t.Helper()
 
 	fault := &lostCompletionResponseInterceptor{}
-	cluster := newCompletionRetryTestCluster(t, fault)
+	leaseCounter := &workflowLeaseCounter{}
+	cluster := newCompletionRetryTestCluster(t, fault, leaseCounter)
 	frontendClient := cluster.FrontendClient()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	t.Cleanup(cancel)
 
-	namespace, namespaceID := registerCompletionRetryTestNamespace(t, ctx, frontendClient)
+	namespace := registerCompletionRetryTestNamespace(t, ctx, frontendClient)
 	scenario := &completionRetryScenario{
 		t:             t,
 		fault:         fault,
@@ -133,12 +172,8 @@ func newCompletionRetryScenario(t testing.TB) *completionRetryScenario {
 		workflowID:    testcore.RandomizeStr(t.Name() + "-workflow"),
 		taskQueueName: testcore.RandomizeStr(t.Name() + "-task-queue"),
 		identity:      "activity-completion-retry-test",
+		leaseCounter:  leaseCounter,
 	}
-	removeTransitionHook := cluster.InjectHook(t, testhooks.NewHook(
-		testhooks.HistoryActivityCompletionWorkflowLease,
-		func() { scenario.genericTransitions.Add(1) },
-	), namespacepkg.ID(namespaceID))
-	t.Cleanup(removeTransitionHook)
 
 	frontendClient = cluster.FrontendClient()
 	scenario.started = startCompletionRetryWorkflow(t, ctx, frontendClient, namespace, scenario.workflowID, scenario.taskQueueName, scenario.identity)
@@ -150,6 +185,7 @@ func newCompletionRetryScenario(t testing.TB) *completionRetryScenario {
 func (s *completionRetryScenario) complete(injectResponseFault bool) completionRetryResult {
 	s.t.Helper()
 
+	s.leaseCounter.reset()
 	if injectResponseFault {
 		s.fault.armResponseDrop()
 	}
@@ -165,9 +201,9 @@ func (s *completionRetryScenario) complete(injectResponseFault bool) completionR
 	}
 
 	return completionRetryResult{
-		genericTransitions: s.genericTransitions.Load(),
-		historyDeliveries:  s.fault.deliveries.Load(),
-		completionSuccess:  boolToInt(completionSucceeded),
+		workflowLeaseAcquisitions: s.leaseCounter.acquisitions.Load(),
+		historyDeliveries:         s.fault.deliveries.Load(),
+		completionSuccess:         boolToInt(completionSucceeded),
 	}
 }
 
@@ -175,7 +211,7 @@ func (s *completionRetryScenario) verify(result completionRetryResult, expectedH
 	s.t.Helper()
 
 	require.False(s.t, s.fault.dropNext.Load(), "the injected response drop was not consumed")
-	require.GreaterOrEqual(s.t, result.genericTransitions, int32(1), "the accepted completion must enter the generic workflow transition")
+	require.GreaterOrEqual(s.t, result.workflowLeaseAcquisitions, int32(1), "the accepted completion must acquire a workflow lease")
 	require.Equal(s.t, expectedHistoryDeliveries, result.historyDeliveries, "the History client delivery count must match the injected response behavior")
 
 	frontendClient := s.cluster.FrontendClient()
@@ -187,7 +223,11 @@ func (s *completionRetryScenario) verify(result completionRetryResult, expectedH
 	require.Equal(s.t, 1, countWorkflowCompletionEvents(events), "the workflow must complete normally after the activity completion")
 }
 
-func newCompletionRetryTestCluster(t testing.TB, fault *lostCompletionResponseInterceptor) *testcore.TestCluster {
+func newCompletionRetryTestCluster(
+	t testing.TB,
+	fault *lostCompletionResponseInterceptor,
+	leaseCounter *workflowLeaseCounter,
+) *testcore.TestCluster {
 	t.Helper()
 
 	cluster, err := testcore.NewTestClusterFactory().NewCluster(t, &testcore.TestClusterConfig{
@@ -197,6 +237,13 @@ func newCompletionRetryTestCluster(t testing.TB, fault *lostCompletionResponseIn
 		},
 		WorkerConfig:             testcore.WorkerConfig{DisableWorker: true},
 		HistoryOuterInterceptors: []grpc.UnaryServerInterceptor{fault.Intercept},
+		ServiceFxOptions: map[primitives.ServiceName][]fx.Option{
+			primitives.HistoryService: {
+				fx.Decorate(func(cache wcache.Cache) wcache.Cache {
+					return &activityCompletionWorkflowCache{Cache: cache, counter: leaseCounter}
+				}),
+			},
+		},
 	}, log.NewTestLogger())
 	require.NoError(t, err)
 	t.Cleanup(func() {
@@ -216,7 +263,7 @@ func registerCompletionRetryTestNamespace(
 	t testing.TB,
 	ctx context.Context,
 	frontendClient workflowservice.WorkflowServiceClient,
-) (string, string) {
+) string {
 	t.Helper()
 
 	namespace := testcore.RandomizeStr(t.Name() + "-namespace")
@@ -226,17 +273,12 @@ func registerCompletionRetryTestNamespace(
 	})
 	require.NoError(t, err)
 
-	var namespaceID string
 	require.Eventually(t, func() bool {
 		response, err := frontendClient.DescribeNamespace(ctx, &workflowservice.DescribeNamespaceRequest{Namespace: namespace})
-		if err != nil {
-			return false
-		}
-		namespaceID = response.GetNamespaceInfo().GetId()
-		return namespaceID != ""
+		return err == nil && response.GetNamespaceInfo().GetId() != ""
 	}, 10*time.Second, 50*time.Millisecond)
 
-	return namespace, namespaceID
+	return namespace
 }
 
 func startCompletionRetryWorkflow(

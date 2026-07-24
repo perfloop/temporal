@@ -607,7 +607,7 @@ func (e *historyEngineImpl) RespondActivityTaskCompleted(
 	ctx context.Context,
 	req *historyservice.RespondActivityTaskCompletedRequest,
 ) (*historyservice.RespondActivityTaskCompletedResponse, error) {
-	return respondactivitytaskcompleted.Invoke(ctx, req, e.shardContext, e.workflowConsistencyChecker, e.testHooks)
+	return respondactivitytaskcompleted.Invoke(ctx, req, e.shardContext, e.workflowConsistencyChecker)
 }
 
 // RespondActivityTaskFailed completes an activity task failure.
