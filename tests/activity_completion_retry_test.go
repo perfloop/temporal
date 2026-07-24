@@ -35,6 +35,7 @@ const (
 	workflowLeaseAcquisitionsMetric = "workflow_lease_acquisitions_per_fault_injected_completion"
 	historyDeliveriesMetric         = "history_completion_deliveries_per_fault_injected_completion"
 	completionSuccessMetric         = "fault_injected_completion_success"
+	completionRetryBenchmarkBatch   = 128
 )
 
 type activityCompletionRequestContextKey struct{}
@@ -124,6 +125,14 @@ func (c *deterministicCompletionResponseRetryClient) RespondActivityTaskComplete
 	return c.HistoryRawClient.RespondActivityTaskCompleted(ctx, request, opts...)
 }
 
+type completionRetryFixture struct {
+	t            testing.TB
+	fault        *lostCompletionResponseInterceptor
+	cluster      *testcore.TestCluster
+	ctx          context.Context
+	leaseCounter *workflowLeaseCounter
+}
+
 type completionRetryScenario struct {
 	t             testing.TB
 	fault         *lostCompletionResponseInterceptor
@@ -144,6 +153,12 @@ type completionRetryResult struct {
 	completionSuccess         int
 }
 
+func (r *completionRetryResult) add(other completionRetryResult) {
+	r.workflowLeaseAcquisitions += other.workflowLeaseAcquisitions
+	r.historyDeliveries += other.historyDeliveries
+	r.completionSuccess += other.completionSuccess
+}
+
 func TestActivityCompletionLostResponseRetriesWorkflowLease(t *testing.T) {
 	scenario := newCompletionRetryScenario(t)
 	result := scenario.complete(true)
@@ -161,47 +176,80 @@ func TestActivityCompletionWithoutLostResponseCompletesNormally(t *testing.T) {
 
 func BenchmarkActivityCompletionLostResponseRetriesWorkflowLease(b *testing.B) {
 	if b.N != 1 {
-		b.Fatal("benchmark requires -benchtime=1x because each sample starts an isolated test cluster")
+		b.Fatal("benchmark requires -benchtime=1x because each sample prepares a fixed batch before timing")
 	}
 
 	b.StopTimer()
-	scenario := newCompletionRetryScenario(b)
-	b.StartTimer()
-	result := scenario.complete(true)
-	b.StopTimer()
-	scenario.verify(result, 2)
+	fixture := newCompletionRetryFixture(b)
+	scenarios := make([]*completionRetryScenario, 0, completionRetryBenchmarkBatch)
+	for range completionRetryBenchmarkBatch {
+		scenarios = append(scenarios, fixture.newScenario())
+	}
 
-	b.ReportMetric(float64(result.workflowLeaseAcquisitions), workflowLeaseAcquisitionsMetric)
-	b.ReportMetric(float64(result.historyDeliveries), historyDeliveriesMetric)
-	b.ReportMetric(float64(result.completionSuccess), completionSuccessMetric)
+	results := make([]completionRetryResult, len(scenarios))
+	var totals completionRetryResult
+	// Average independent fault-injected completions in each sample so scheduler
+	// noise is not mistaken for a product latency change. b.N remains one because
+	// setup is intentionally outside the timed batch.
+	b.StartTimer()
+	startedAt := time.Now()
+	for i, scenario := range scenarios {
+		results[i] = scenario.complete(true)
+		totals.add(results[i])
+	}
+	elapsed := time.Since(startedAt)
+	b.StopTimer()
+
+	for i, scenario := range scenarios {
+		scenario.verify(results[i], 2)
+	}
+
+	operations := float64(len(scenarios))
+	// Override testing's batch-level ns/op with the per-completion average.
+	b.ReportMetric(float64(elapsed.Nanoseconds())/operations, "ns/op")
+	b.ReportMetric(float64(totals.workflowLeaseAcquisitions)/operations, workflowLeaseAcquisitionsMetric)
+	b.ReportMetric(float64(totals.historyDeliveries)/operations, historyDeliveriesMetric)
+	b.ReportMetric(float64(totals.completionSuccess)/operations, completionSuccessMetric)
 }
 
 func newCompletionRetryScenario(t testing.TB) *completionRetryScenario {
+	return newCompletionRetryFixture(t).newScenario()
+}
+
+func newCompletionRetryFixture(t testing.TB) *completionRetryFixture {
 	t.Helper()
 
 	fault := &lostCompletionResponseInterceptor{}
 	leaseCounter := &workflowLeaseCounter{}
-	cluster := newCompletionRetryTestCluster(t, fault, leaseCounter)
-	frontendClient := cluster.FrontendClient()
-	ctx := context.Background()
+	return &completionRetryFixture{
+		t:            t,
+		fault:        fault,
+		cluster:      newCompletionRetryTestCluster(t, fault, leaseCounter),
+		ctx:          context.Background(),
+		leaseCounter: leaseCounter,
+	}
+}
 
-	namespace := registerCompletionRetryTestNamespace(t, ctx, frontendClient)
+func (f *completionRetryFixture) newScenario() *completionRetryScenario {
+	f.t.Helper()
+
+	frontendClient := f.cluster.FrontendClient()
+	namespace := registerCompletionRetryTestNamespace(f.t, f.ctx, frontendClient)
 	scenario := &completionRetryScenario{
-		t:             t,
-		fault:         fault,
-		cluster:       cluster,
-		ctx:           ctx,
+		t:             f.t,
+		fault:         f.fault,
+		cluster:       f.cluster,
+		ctx:           f.ctx,
 		namespace:     namespace,
-		workflowID:    testcore.RandomizeStr(t.Name() + "-workflow"),
-		taskQueueName: testcore.RandomizeStr(t.Name() + "-task-queue"),
+		workflowID:    testcore.RandomizeStr(f.t.Name() + "-workflow"),
+		taskQueueName: testcore.RandomizeStr(f.t.Name() + "-task-queue"),
 		identity:      "activity-completion-retry-test",
-		leaseCounter:  leaseCounter,
+		leaseCounter:  f.leaseCounter,
 	}
 
-	frontendClient = cluster.FrontendClient()
-	scenario.started = startCompletionRetryWorkflow(t, ctx, frontendClient, namespace, scenario.workflowID, scenario.taskQueueName, scenario.identity)
-	scheduleCompletionRetryActivity(t, ctx, frontendClient, namespace, scenario.taskQueueName, scenario.identity)
-	scenario.activityTask = pollCompletionRetryActivity(t, ctx, frontendClient, namespace, scenario.taskQueueName, scenario.identity)
+	scenario.started = startCompletionRetryWorkflow(f.t, f.ctx, frontendClient, namespace, scenario.workflowID, scenario.taskQueueName, scenario.identity)
+	scheduleCompletionRetryActivity(f.t, f.ctx, frontendClient, namespace, scenario.taskQueueName, scenario.identity)
+	scenario.activityTask = pollCompletionRetryActivity(f.t, f.ctx, frontendClient, namespace, scenario.taskQueueName, scenario.identity)
 	return scenario
 }
 
