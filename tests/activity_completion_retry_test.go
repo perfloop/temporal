@@ -17,10 +17,12 @@ import (
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/server/api/historyservice/v1"
 	"go.temporal.io/server/chasm"
+	"go.temporal.io/server/common"
 	"go.temporal.io/server/common/locks"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/namespace"
 	"go.temporal.io/server/common/primitives"
+	"go.temporal.io/server/common/resource"
 	historyi "go.temporal.io/server/service/history/interfaces"
 	wcache "go.temporal.io/server/service/history/workflow/cache"
 	"go.temporal.io/server/tests/testcore"
@@ -65,16 +67,16 @@ func (c *activityCompletionWorkflowCache) GetOrCreateChasmExecution(
 }
 
 // lostCompletionResponseInterceptor simulates a response that is lost after
-// History has committed a successful activity completion. It sits outside the
-// retryable History interceptor, so its error makes the normal History client
-// issue the duplicate delivery.
+// History has committed a successful activity completion.
 type lostCompletionResponseInterceptor struct {
-	deliveries atomic.Int32
-	dropNext   atomic.Bool
+	deliveries   atomic.Int32
+	dropNext     atomic.Bool
+	retryPending atomic.Bool
 }
 
 func (i *lostCompletionResponseInterceptor) armResponseDrop() {
 	i.deliveries.Store(0)
+	i.retryPending.Store(false)
 	i.dropNext.Store(true)
 }
 
@@ -95,9 +97,31 @@ func (i *lostCompletionResponseInterceptor) Intercept(
 
 	i.deliveries.Add(1)
 	if err == nil && i.dropNext.CompareAndSwap(true, false) {
+		i.retryPending.Store(true)
 		return nil, serviceerror.NewUnavailable("test lost the successful History completion response")
 	}
 	return response, err
+}
+
+// deterministicCompletionResponseRetryClient replays precisely the response
+// loss injected above without waiting for a wall-clock retry backoff. It is
+// installed only in the test frontend and preserves the production request
+// shape: the second call is a separate History RPC with the same request.
+type deterministicCompletionResponseRetryClient struct {
+	resource.HistoryRawClient
+	fault *lostCompletionResponseInterceptor
+}
+
+func (c *deterministicCompletionResponseRetryClient) RespondActivityTaskCompleted(
+	ctx context.Context,
+	request *historyservice.RespondActivityTaskCompletedRequest,
+	opts ...grpc.CallOption,
+) (*historyservice.RespondActivityTaskCompletedResponse, error) {
+	response, err := c.HistoryRawClient.RespondActivityTaskCompleted(ctx, request, opts...)
+	if !c.fault.retryPending.CompareAndSwap(true, false) {
+		return response, err
+	}
+	return c.HistoryRawClient.RespondActivityTaskCompleted(ctx, request, opts...)
 }
 
 type completionRetryScenario struct {
@@ -159,8 +183,7 @@ func newCompletionRetryScenario(t testing.TB) *completionRetryScenario {
 	leaseCounter := &workflowLeaseCounter{}
 	cluster := newCompletionRetryTestCluster(t, fault, leaseCounter)
 	frontendClient := cluster.FrontendClient()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	t.Cleanup(cancel)
+	ctx := context.Background()
 
 	namespace := registerCompletionRetryTestNamespace(t, ctx, frontendClient)
 	scenario := &completionRetryScenario{
@@ -238,6 +261,11 @@ func newCompletionRetryTestCluster(
 		WorkerConfig:             testcore.WorkerConfig{DisableWorker: true},
 		HistoryOuterInterceptors: []grpc.UnaryServerInterceptor{fault.Intercept},
 		ServiceFxOptions: map[primitives.ServiceName][]fx.Option{
+			primitives.FrontendService: {
+				fx.Decorate(func(client resource.HistoryRawClient) resource.HistoryRawClient {
+					return &deterministicCompletionResponseRetryClient{HistoryRawClient: client, fault: fault}
+				}),
+			},
 			primitives.HistoryService: {
 				fx.Decorate(func(cache wcache.Cache) wcache.Cache {
 					return &activityCompletionWorkflowCache{Cache: cache, counter: leaseCounter}
@@ -317,7 +345,9 @@ func scheduleCompletionRetryActivity(
 ) {
 	t.Helper()
 
-	workflowTask, err := frontendClient.PollWorkflowTaskQueue(ctx, &workflowservice.PollWorkflowTaskQueueRequest{
+	pollCtx, cancel := completionRetryLongPollContext(ctx)
+	defer cancel()
+	workflowTask, err := frontendClient.PollWorkflowTaskQueue(pollCtx, &workflowservice.PollWorkflowTaskQueueRequest{
 		Namespace: namespace,
 		TaskQueue: normalTaskQueue(taskQueueName),
 		Identity:  identity,
@@ -356,7 +386,9 @@ func pollCompletionRetryActivity(
 ) *workflowservice.PollActivityTaskQueueResponse {
 	t.Helper()
 
-	response, err := frontendClient.PollActivityTaskQueue(ctx, &workflowservice.PollActivityTaskQueueRequest{
+	pollCtx, cancel := completionRetryLongPollContext(ctx)
+	defer cancel()
+	response, err := frontendClient.PollActivityTaskQueue(pollCtx, &workflowservice.PollActivityTaskQueueRequest{
 		Namespace: namespace,
 		TaskQueue: normalTaskQueue(taskQueueName),
 		Identity:  identity,
@@ -376,7 +408,9 @@ func completeCompletionRetryWorkflow(
 ) {
 	t.Helper()
 
-	workflowTask, err := frontendClient.PollWorkflowTaskQueue(ctx, &workflowservice.PollWorkflowTaskQueueRequest{
+	pollCtx, cancel := completionRetryLongPollContext(ctx)
+	defer cancel()
+	workflowTask, err := frontendClient.PollWorkflowTaskQueue(pollCtx, &workflowservice.PollWorkflowTaskQueueRequest{
 		Namespace: namespace,
 		TaskQueue: normalTaskQueue(taskQueueName),
 		Identity:  identity,
@@ -396,6 +430,13 @@ func completeCompletionRetryWorkflow(
 		}},
 	})
 	require.NoError(t, err)
+}
+
+// completionRetryLongPollContext scopes the deadline required by the public
+// long-poll API to one protocol poll after its producing workflow operation
+// completes. It is never used for the injected completion or retry.
+func completionRetryLongPollContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, common.DefaultLongPollTimeout)
 }
 
 func getCompletionRetryHistory(
