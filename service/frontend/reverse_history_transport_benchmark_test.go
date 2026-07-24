@@ -129,8 +129,8 @@ func (s *pageSource) validate(request *historyservice.GetWorkflowExecutionHistor
 	if request.GetRequest().GetExecution().GetWorkflowId() != reverseHistoryWorkflow {
 		return errors.New("unexpected reverse-history workflow")
 	}
-	if request.GetRequest().GetMaximumPageSize() != reverseHistoryPageSize {
-		return fmt.Errorf("frontend page cap: got %d want %d", request.GetRequest().GetMaximumPageSize(), reverseHistoryPageSize)
+	if request.GetRequest().GetMaximumPageSize() != int32(s.pageSize) {
+		return fmt.Errorf("frontend page size: got %d want %d", request.GetRequest().GetMaximumPageSize(), s.pageSize)
 	}
 	return nil
 }
@@ -330,13 +330,14 @@ func serverOptions(stats *reverseHistoryStats, kind string) []grpc.ServerOption 
 }
 
 type reverseHistoryFixture struct {
-	pages         int
-	eventsPerPage int
-	source        *pageSource
-	stats         *reverseHistoryStats
-	client        workflowservice.WorkflowServiceClient
-	conn          *grpc.ClientConn
-	stream        bool
+	pages           int
+	eventsPerPage   int
+	maximumPageSize int32
+	source          *pageSource
+	stats           *reverseHistoryStats
+	client          workflowservice.WorkflowServiceClient
+	conn            *grpc.ClientConn
+	stream          bool
 }
 
 func newReverseHistoryFixture(tb testing.TB, pages int, record bool) *reverseHistoryFixture {
@@ -344,14 +345,14 @@ func newReverseHistoryFixture(tb testing.TB, pages int, record bool) *reverseHis
 	if record {
 		stats = &reverseHistoryStats{traceEnabled: true}
 	}
-	return newReverseHistoryFixtureWithStats(tb, pages, reverseHistoryPageSize, stats, record)
+	return newReverseHistoryFixtureWithStats(tb, pages, reverseHistoryPageSize, 1000, stats, record)
 }
 
 func newMeasuredReverseHistoryFixture(tb testing.TB, pages, eventsPerPage int) *reverseHistoryFixture {
-	return newReverseHistoryFixtureWithStats(tb, pages, eventsPerPage, &reverseHistoryStats{}, false)
+	return newReverseHistoryFixtureWithStats(tb, pages, eventsPerPage, int32(eventsPerPage), &reverseHistoryStats{}, false)
 }
 
-func newReverseHistoryFixtureWithStats(tb testing.TB, pages, eventsPerPage int, stats *reverseHistoryStats, gate bool) *reverseHistoryFixture {
+func newReverseHistoryFixtureWithStats(tb testing.TB, pages, eventsPerPage int, maximumPageSize int32, stats *reverseHistoryStats, gate bool) *reverseHistoryFixture {
 	tb.Helper()
 	source := newPageSource(pages, eventsPerPage, stats, gate)
 	historyListener := bufconn.Listen(8 * 1024 * 1024)
@@ -376,13 +377,14 @@ func newReverseHistoryFixtureWithStats(tb testing.TB, pages, eventsPerPage int, 
 	publicConn := dial(tb, publicListener)
 
 	fixture := &reverseHistoryFixture{
-		pages:         pages,
-		eventsPerPage: eventsPerPage,
-		source:        source,
-		stats:         stats,
-		client:        workflowservice.NewWorkflowServiceClient(publicConn),
-		conn:          publicConn,
-		stream:        reflect.ValueOf(handler).MethodByName(reverseHistoryStream).IsValid(),
+		pages:           pages,
+		eventsPerPage:   eventsPerPage,
+		maximumPageSize: maximumPageSize,
+		source:          source,
+		stats:           stats,
+		client:          workflowservice.NewWorkflowServiceClient(publicConn),
+		conn:            publicConn,
+		stream:          reflect.ValueOf(handler).MethodByName(reverseHistoryStream).IsValid(),
 	}
 	tb.Cleanup(func() {
 		_ = publicConn.Close()
@@ -417,7 +419,7 @@ func (f *reverseHistoryFixture) request() *workflowservice.GetWorkflowExecutionH
 	return &workflowservice.GetWorkflowExecutionHistoryReverseRequest{
 		Namespace:       reverseHistoryNamespace,
 		Execution:       &commonpb.WorkflowExecution{WorkflowId: reverseHistoryWorkflow},
-		MaximumPageSize: 1000, // the frontend must cap this to 256.
+		MaximumPageSize: f.maximumPageSize,
 	}
 }
 
@@ -597,9 +599,9 @@ func TestReverseHistoryUnaryCompatibility(t *testing.T) {
 	t.Log("reverse_history_unary_compatibility passed pages=2 public_rpc_count=2 frontend_history_rpc_count=2")
 }
 
-// benchmarkReverseHistoryScan uses eight partial, bounded frames to isolate the
-// repeated public/frontend-to-History transport cost. The transport contract
-// above separately drains eight production-cap (256-event) frames.
+// benchmarkReverseHistoryScan uses a client-selected, supported 16-event page
+// size to isolate repeated public/frontend-to-History transport cost. The
+// transport contract above separately drains eight production-cap (256-event) frames.
 func benchmarkReverseHistoryScan(b *testing.B, pages int) {
 	fixture := newMeasuredReverseHistoryFixture(b, pages, reverseHistoryBenchmarkPageSize)
 	if events, err := fixture.scan(context.Background(), nil); err != nil {
