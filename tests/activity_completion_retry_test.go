@@ -330,8 +330,21 @@ func (s *completionRetryScenario) verifyAcceptedCompletion(result completionRetr
 	require.False(s.t, s.fault.dropNext.Load(), "the injected response drop was not consumed")
 	require.GreaterOrEqual(s.t, result.workflowLeaseAcquisitions, int32(1), "the accepted completion must acquire a workflow lease")
 	require.Equal(s.t, expectedHistoryDeliveries, result.historyDeliveries, "the History client delivery count must match the injected response behavior")
+	if expectedHistoryDeliveries == 2 {
+		verifyFaultedRetryOutcome(s.t, result)
+	}
 
 	s.verifyNoDuplicateActivityCompletion()
+}
+
+func verifyFaultedRetryOutcome(t testing.TB, result completionRetryResult) {
+	t.Helper()
+
+	if result.completionSuccess == 1 {
+		require.Equal(t, int32(1), result.workflowLeaseAcquisitions, "a successful retry must be a receipt hit that bypasses the second workflow lease")
+		return
+	}
+	require.Equal(t, int32(2), result.workflowLeaseAcquisitions, "a retry that returns NotFound must use the legacy generic duplicate path")
 }
 
 func (s *completionRetryScenario) verifyNoDuplicateActivityCompletion() {
