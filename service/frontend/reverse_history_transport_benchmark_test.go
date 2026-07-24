@@ -31,12 +31,13 @@ import (
 )
 
 const (
-	reverseHistoryPageSize  = primitives.GetHistoryMaxPageSize
-	reverseHistoryPageCount = 8
-	reverseHistoryNamespace = "reverse-history-benchmark"
-	reverseHistoryWorkflow  = "reverse-history-workflow"
-	reverseHistoryRun       = "7c177db8-cb3b-4b8d-9385-1f0cfcd6e903"
-	reverseHistoryStream    = "StreamWorkflowExecutionHistoryReverse"
+	reverseHistoryPageSize          = primitives.GetHistoryMaxPageSize
+	reverseHistoryPageCount         = 8
+	reverseHistoryBenchmarkPageSize = 16
+	reverseHistoryNamespace         = "reverse-history-benchmark"
+	reverseHistoryWorkflow          = "reverse-history-workflow"
+	reverseHistoryRun               = "7c177db8-cb3b-4b8d-9385-1f0cfcd6e903"
+	reverseHistoryStream            = "StreamWorkflowExecutionHistoryReverse"
 )
 
 var reverseHistoryNamespaceID = namespace.ID("5b4f313d-7158-4cc2-a60b-1dc0951f8a4d")
@@ -94,19 +95,20 @@ func (s *reverseHistoryStats) waterfall() string {
 // public/frontend-to-History control plane, not persistence latency. It does use
 // the production HistoryContinuation serializer on every unary continuation.
 type pageSource struct {
-	pages   [][]*historypb.HistoryEvent
-	stats   *reverseHistoryStats
-	permits chan struct{}
-	done    chan error
+	pages    [][]*historypb.HistoryEvent
+	pageSize int
+	stats    *reverseHistoryStats
+	permits  chan struct{}
+	done     chan error
 }
 
-func newPageSource(pages int, stats *reverseHistoryStats, gate bool) *pageSource {
-	s := &pageSource{pages: make([][]*historypb.HistoryEvent, pages), stats: stats}
+func newPageSource(pages, pageSize int, stats *reverseHistoryStats, gate bool) *pageSource {
+	s := &pageSource{pages: make([][]*historypb.HistoryEvent, pages), pageSize: pageSize, stats: stats}
 	for page := range s.pages {
-		s.pages[page] = make([]*historypb.HistoryEvent, reverseHistoryPageSize)
+		s.pages[page] = make([]*historypb.HistoryEvent, pageSize)
 		for offset := range s.pages[page] {
 			s.pages[page][offset] = &historypb.HistoryEvent{
-				EventId:   int64(pages*reverseHistoryPageSize - page*reverseHistoryPageSize - offset),
+				EventId:   int64(pages*pageSize - page*pageSize - offset),
 				EventType: enumspb.EVENT_TYPE_ACTIVITY_TASK_COMPLETED,
 			}
 		}
@@ -118,7 +120,7 @@ func newPageSource(pages int, stats *reverseHistoryStats, gate bool) *pageSource
 	return s
 }
 
-func (s *pageSource) total() int { return len(s.pages) * reverseHistoryPageSize }
+func (s *pageSource) total() int { return len(s.pages) * s.pageSize }
 
 func (s *pageSource) validate(request *historyservice.GetWorkflowExecutionHistoryReverseRequest) error {
 	if request.GetNamespaceId() != reverseHistoryNamespaceID.String() || request.GetRequest() == nil {
@@ -141,7 +143,7 @@ func (s *pageSource) index(token []byte) (int, error) {
 	if err != nil || continuation.GetRunId() != reverseHistoryRun || continuation.GetFirstEventId() != 1 {
 		return 0, errors.New("invalid continuation token")
 	}
-	index := int((int64(s.total()) - continuation.GetNextEventId()) / reverseHistoryPageSize)
+	index := int((int64(s.total()) - continuation.GetNextEventId()) / int64(s.pageSize))
 	if index <= 0 || index >= len(s.pages) {
 		return 0, fmt.Errorf("invalid continuation page %d", index)
 	}
@@ -159,7 +161,7 @@ func (s *pageSource) token(next int) ([]byte, error) {
 	token, err := historyapi.SerializeHistoryToken(&tokenspb.HistoryContinuation{
 		RunId:            reverseHistoryRun,
 		FirstEventId:     1,
-		NextEventId:      int64(s.total() - next*reverseHistoryPageSize),
+		NextEventId:      int64(s.total() - next*s.pageSize),
 		BranchToken:      []byte("reverse-history-benchmark-branch"),
 		PersistenceToken: []byte{byte(next), 1, 2, 3, 4, 5, 6, 7},
 	})
@@ -328,12 +330,13 @@ func serverOptions(stats *reverseHistoryStats, kind string) []grpc.ServerOption 
 }
 
 type reverseHistoryFixture struct {
-	pages  int
-	source *pageSource
-	stats  *reverseHistoryStats
-	client workflowservice.WorkflowServiceClient
-	conn   *grpc.ClientConn
-	stream bool
+	pages         int
+	eventsPerPage int
+	source        *pageSource
+	stats         *reverseHistoryStats
+	client        workflowservice.WorkflowServiceClient
+	conn          *grpc.ClientConn
+	stream        bool
 }
 
 func newReverseHistoryFixture(tb testing.TB, pages int, record bool) *reverseHistoryFixture {
@@ -341,16 +344,16 @@ func newReverseHistoryFixture(tb testing.TB, pages int, record bool) *reverseHis
 	if record {
 		stats = &reverseHistoryStats{traceEnabled: true}
 	}
-	return newReverseHistoryFixtureWithStats(tb, pages, stats, record)
+	return newReverseHistoryFixtureWithStats(tb, pages, reverseHistoryPageSize, stats, record)
 }
 
-func newMeasuredReverseHistoryFixture(tb testing.TB, pages int) *reverseHistoryFixture {
-	return newReverseHistoryFixtureWithStats(tb, pages, &reverseHistoryStats{}, false)
+func newMeasuredReverseHistoryFixture(tb testing.TB, pages, eventsPerPage int) *reverseHistoryFixture {
+	return newReverseHistoryFixtureWithStats(tb, pages, eventsPerPage, &reverseHistoryStats{}, false)
 }
 
-func newReverseHistoryFixtureWithStats(tb testing.TB, pages int, stats *reverseHistoryStats, gate bool) *reverseHistoryFixture {
+func newReverseHistoryFixtureWithStats(tb testing.TB, pages, eventsPerPage int, stats *reverseHistoryStats, gate bool) *reverseHistoryFixture {
 	tb.Helper()
-	source := newPageSource(pages, stats, gate)
+	source := newPageSource(pages, eventsPerPage, stats, gate)
 	historyListener := bufconn.Listen(8 * 1024 * 1024)
 	historyServer := grpc.NewServer(serverOptions(stats, "history")...)
 	historyDescriptor := descriptor(historyservice.HistoryService_ServiceDesc, historyStreamHandler)
@@ -373,12 +376,13 @@ func newReverseHistoryFixtureWithStats(tb testing.TB, pages int, stats *reverseH
 	publicConn := dial(tb, publicListener)
 
 	fixture := &reverseHistoryFixture{
-		pages:  pages,
-		source: source,
-		stats:  stats,
-		client: workflowservice.NewWorkflowServiceClient(publicConn),
-		conn:   publicConn,
-		stream: reflect.ValueOf(handler).MethodByName(reverseHistoryStream).IsValid(),
+		pages:         pages,
+		eventsPerPage: eventsPerPage,
+		source:        source,
+		stats:         stats,
+		client:        workflowservice.NewWorkflowServiceClient(publicConn),
+		conn:          publicConn,
+		stream:        reflect.ValueOf(handler).MethodByName(reverseHistoryStream).IsValid(),
 	}
 	tb.Cleanup(func() {
 		_ = publicConn.Close()
@@ -593,12 +597,15 @@ func TestReverseHistoryUnaryCompatibility(t *testing.T) {
 	t.Log("reverse_history_unary_compatibility passed pages=2 public_rpc_count=2 frontend_history_rpc_count=2")
 }
 
-func benchmarkReverseHistoryFullScan(b *testing.B, pages int) {
-	fixture := newMeasuredReverseHistoryFixture(b, pages)
+// benchmarkReverseHistoryScan uses eight partial, bounded frames to isolate the
+// repeated public/frontend-to-History transport cost. The transport contract
+// above separately drains eight production-cap (256-event) frames.
+func benchmarkReverseHistoryScan(b *testing.B, pages int) {
+	fixture := newMeasuredReverseHistoryFixture(b, pages, reverseHistoryBenchmarkPageSize)
 	if events, err := fixture.scan(context.Background(), nil); err != nil {
 		b.Fatal(err)
 	} else {
-		assertPrefix(b, events, pages*reverseHistoryPageSize, int64(pages*reverseHistoryPageSize))
+		assertPrefix(b, events, pages*fixture.eventsPerPage, int64(pages*fixture.eventsPerPage))
 	}
 
 	var publicRPCs, historyRPCs int64
@@ -606,7 +613,7 @@ func benchmarkReverseHistoryFullScan(b *testing.B, pages int) {
 	for b.Loop() {
 		fixture.stats.reset()
 		events, err := fixture.scan(context.Background(), nil)
-		if err != nil || len(events) != pages*reverseHistoryPageSize {
+		if err != nil || len(events) != pages*fixture.eventsPerPage {
 			b.Fatalf("scan events=%d err=%v", len(events), err)
 		}
 		wantRPCs := int64(pages)
@@ -624,10 +631,10 @@ func benchmarkReverseHistoryFullScan(b *testing.B, pages int) {
 	b.ReportMetric(float64(historyRPCs)/float64(b.N), "frontend_history_rpcs/op")
 }
 
-func BenchmarkReverseHistoryFullScanManyPages(b *testing.B) {
-	benchmarkReverseHistoryFullScan(b, reverseHistoryPageCount)
+func BenchmarkReverseHistoryControlPlaneManyPages(b *testing.B) {
+	benchmarkReverseHistoryScan(b, reverseHistoryPageCount)
 }
 
-func BenchmarkReverseHistoryFullScanOnePage(b *testing.B) {
-	benchmarkReverseHistoryFullScan(b, 1)
+func BenchmarkReverseHistoryControlPlaneOnePage(b *testing.B) {
+	benchmarkReverseHistoryScan(b, 1)
 }
