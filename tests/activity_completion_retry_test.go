@@ -32,11 +32,11 @@ import (
 )
 
 const (
-	workflowLeaseAcquisitionsMetric = "workflow_lease_acquisitions_per_fault_injected_completion"
-	historyDeliveriesMetric         = "history_completion_deliveries_per_fault_injected_completion"
-	completionSuccessMetric         = "fault_injected_completion_success"
-	completionRetryBenchmarkBatch   = 128
-	completionRetryBenchmarkRounds  = 16
+	workflowLeaseAcquisitionsMetric         = "workflow_lease_acquisitions_per_duplicate_completion_delivery"
+	historyDeliveriesMetric                 = "history_completion_deliveries_per_duplicate_completion_delivery"
+	completionSuccessMetric                 = "duplicate_completion_success"
+	completionRetryBenchmarkBatch           = 128
+	completionRetryBenchmarkDuplicateRounds = 64
 )
 
 type activityCompletionRequestContextKey struct{}
@@ -153,6 +153,7 @@ type completionRetryResult struct {
 	workflowLeaseAcquisitions int32
 	historyDeliveries         int32
 	completionSuccess         int
+	completionError           error
 }
 
 func (r *completionRetryResult) add(other completionRetryResult) {
@@ -176,41 +177,49 @@ func TestActivityCompletionWithoutLostResponseCompletesNormally(t *testing.T) {
 	scenario.verify(result, 1)
 }
 
-func BenchmarkActivityCompletionLostResponseRetriesWorkflowLease(b *testing.B) {
+func BenchmarkActivityCompletionDuplicateDeliveryWorkflowLease(b *testing.B) {
 	if b.N != 1 {
-		b.Fatal("benchmark requires -benchtime=1x because each sample prepares fixed batches before timing")
+		b.Fatal("benchmark requires -benchtime=1x because each sample prepares duplicate receipts before timing")
 	}
 
 	b.StopTimer()
 	fixture := newCompletionRetryFixture(b)
-	var elapsed time.Duration
-	var totals completionRetryResult
-	// Average independent fault-injected completions in each sample so scheduler
-	// noise is not mistaken for a product latency change. b.N remains one because
-	// setup and invariant checks are intentionally outside every timed batch.
-	for round := 0; round < completionRetryBenchmarkRounds; round++ {
-		scenarios := make([]*completionRetryScenario, 0, completionRetryBenchmarkBatch)
-		for i := 0; i < completionRetryBenchmarkBatch; i++ {
-			scenarios = append(scenarios, fixture.newScenario())
-		}
-
-		results := make([]completionRetryResult, len(scenarios))
-		b.StartTimer()
-		startedAt := time.Now()
-		for i, scenario := range scenarios {
-			results[i] = scenario.complete(true)
-			totals.add(results[i])
-		}
-		elapsed += time.Since(startedAt)
-		b.StopTimer()
-
-		for i, scenario := range scenarios {
-			scenario.verify(results[i], 2)
-		}
+	scenarios := make([]*completionRetryScenario, 0, completionRetryBenchmarkBatch)
+	for i := 0; i < completionRetryBenchmarkBatch; i++ {
+		scenario := fixture.newScenario()
+		result := scenario.complete(true)
+		scenario.verifyAcceptedCompletion(result, 2)
+		scenarios = append(scenarios, scenario)
 	}
 
-	operations := float64(completionRetryBenchmarkBatch * completionRetryBenchmarkRounds)
-	// Override testing's batch-level ns/op with the per-completion average.
+	duplicateResults := make([]completionRetryResult, 0, completionRetryBenchmarkBatch*completionRetryBenchmarkDuplicateRounds)
+	var totals completionRetryResult
+	// Each timed operation is an exact post-commit duplicate of a completion
+	// whose response was fault-injected and replayed during setup. Averaging the
+	// duplicate deliveries avoids mistaking scheduler noise for latency change.
+	b.StartTimer()
+	startedAt := time.Now()
+	for round := 0; round < completionRetryBenchmarkDuplicateRounds; round++ {
+		for _, scenario := range scenarios {
+			result := scenario.completeDuplicate()
+			duplicateResults = append(duplicateResults, result)
+			totals.add(result)
+		}
+	}
+	elapsed := time.Since(startedAt)
+	b.StopTimer()
+
+	for _, result := range duplicateResults {
+		verifyDuplicateCompletionResult(b, result)
+	}
+	for _, scenario := range scenarios {
+		require.False(b, scenario.fault.dropNext.Load(), "the injected response drop was not consumed")
+		scenario.verifyNoDuplicateActivityCompletion()
+		scenario.verifyWorkflowCompletion()
+	}
+
+	operations := float64(len(duplicateResults))
+	// Override testing's batch-level ns/op with the per-duplicate average.
 	b.ReportMetric(float64(elapsed.Nanoseconds())/operations, "ns/op")
 	b.ReportMetric(float64(totals.workflowLeaseAcquisitions)/operations, workflowLeaseAcquisitionsMetric)
 	b.ReportMetric(float64(totals.historyDeliveries)/operations, historyDeliveriesMetric)
@@ -267,38 +276,84 @@ func (s *completionRetryScenario) complete(injectResponseFault bool) completionR
 	s.leaseCounter.reset()
 	if injectResponseFault {
 		s.fault.armResponseDrop()
+	} else {
+		s.fault.deliveries.Store(0)
 	}
+	return s.respondActivityCompletion()
+}
+
+func (s *completionRetryScenario) completeDuplicate() completionRetryResult {
+	s.t.Helper()
+
+	s.leaseCounter.reset()
+	s.fault.deliveries.Store(0)
+	return s.respondActivityCompletion()
+}
+
+func (s *completionRetryScenario) respondActivityCompletion() completionRetryResult {
 	_, err := s.cluster.FrontendClient().RespondActivityTaskCompleted(s.ctx, &workflowservice.RespondActivityTaskCompletedRequest{
 		Namespace: s.namespace,
 		TaskToken: s.activityTask.GetTaskToken(),
 		Identity:  s.identity,
 	})
 	completionSucceeded := err == nil
-	if !completionSucceeded {
-		var notFound *serviceerror.NotFound
-		require.ErrorAs(s.t, err, &notFound)
-	}
-
 	return completionRetryResult{
 		workflowLeaseAcquisitions: s.leaseCounter.acquisitions.Load(),
 		historyDeliveries:         s.fault.deliveries.Load(),
 		completionSuccess:         boolToInt(completionSucceeded),
+		completionError:           err,
 	}
 }
 
 func (s *completionRetryScenario) verify(result completionRetryResult, expectedHistoryDeliveries int32) {
 	s.t.Helper()
 
+	s.verifyAcceptedCompletion(result, expectedHistoryDeliveries)
+	s.verifyWorkflowCompletion()
+}
+
+func (s *completionRetryScenario) verifyAcceptedCompletion(result completionRetryResult, expectedHistoryDeliveries int32) {
+	s.t.Helper()
+
+	verifyCompletionOutcome(s.t, result)
 	require.False(s.t, s.fault.dropNext.Load(), "the injected response drop was not consumed")
 	require.GreaterOrEqual(s.t, result.workflowLeaseAcquisitions, int32(1), "the accepted completion must acquire a workflow lease")
 	require.Equal(s.t, expectedHistoryDeliveries, result.historyDeliveries, "the History client delivery count must match the injected response behavior")
 
-	frontendClient := s.cluster.FrontendClient()
-	events := getCompletionRetryHistory(s.t, s.ctx, frontendClient, s.namespace, s.workflowID, s.started.GetRunId())
-	require.Equal(s.t, 1, countActivityCompletionEvents(events), "the retry must not persist a second ActivityTaskCompleted event")
+	s.verifyNoDuplicateActivityCompletion()
+}
 
+func (s *completionRetryScenario) verifyNoDuplicateActivityCompletion() {
+	s.t.Helper()
+
+	events := getCompletionRetryHistory(s.t, s.ctx, s.cluster.FrontendClient(), s.namespace, s.workflowID, s.started.GetRunId())
+	require.Equal(s.t, 1, countActivityCompletionEvents(events), "the retry must not persist a second ActivityTaskCompleted event")
+}
+
+func verifyDuplicateCompletionResult(t testing.TB, result completionRetryResult) {
+	t.Helper()
+
+	verifyCompletionOutcome(t, result)
+	require.Equal(t, int32(1), result.historyDeliveries, "each duplicate must produce one History delivery")
+}
+
+func verifyCompletionOutcome(t testing.TB, result completionRetryResult) {
+	t.Helper()
+
+	if result.completionSuccess == 1 {
+		require.NoError(t, result.completionError)
+		return
+	}
+	var notFound *serviceerror.NotFound
+	require.ErrorAs(t, result.completionError, &notFound)
+}
+
+func (s *completionRetryScenario) verifyWorkflowCompletion() {
+	s.t.Helper()
+
+	frontendClient := s.cluster.FrontendClient()
 	completeCompletionRetryWorkflow(s.t, s.ctx, frontendClient, s.namespace, s.taskQueueName, s.identity)
-	events = getCompletionRetryHistory(s.t, s.ctx, frontendClient, s.namespace, s.workflowID, s.started.GetRunId())
+	events := getCompletionRetryHistory(s.t, s.ctx, frontendClient, s.namespace, s.workflowID, s.started.GetRunId())
 	require.Equal(s.t, 1, countWorkflowCompletionEvents(events), "the workflow must complete normally after the activity completion")
 }
 
