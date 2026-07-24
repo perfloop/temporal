@@ -367,7 +367,7 @@ func newCompletionRetryTestCluster(
 	cluster, err := testcore.NewTestClusterFactory().NewCluster(t, &testcore.TestClusterConfig{
 		Persistence: testcore.GetPersistenceTestDefaults(),
 		HistoryConfig: testcore.HistoryConfig{
-			NumHistoryShards: 4,
+			NumHistoryShards: 1,
 		},
 		WorkerConfig:             testcore.WorkerConfig{DisableWorker: true},
 		HistoryOuterInterceptors: []grpc.UnaryServerInterceptor{fault.Intercept},
@@ -383,7 +383,7 @@ func newCompletionRetryTestCluster(
 				}),
 			},
 		},
-	}, log.NewTestLogger())
+	}, log.NewNoopLogger())
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		require.NoError(t, cluster.TearDownCluster())
