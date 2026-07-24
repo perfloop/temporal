@@ -37,7 +37,7 @@ const (
 	historyDeliveriesMetric                 = "history_completion_deliveries_per_duplicate_completion_delivery"
 	completionSuccessMetric                 = "duplicate_completion_success"
 	completionRetryBenchmarkBatch           = 128
-	completionRetryBenchmarkDuplicateRounds = 192
+	completionRetryBenchmarkDuplicateRounds = 1024
 	completionRetryBenchmarkWorkers         = 8
 )
 
@@ -467,7 +467,7 @@ func startCompletionRetryWorkflow(
 			Name: "activity-completion-retry-workflow",
 		},
 		TaskQueue:           normalTaskQueue(taskQueueName),
-		WorkflowRunTimeout:  durationpb.New(5 * time.Minute),
+		WorkflowRunTimeout:  durationpb.New(10 * time.Minute),
 		WorkflowTaskTimeout: durationpb.New(time.Second),
 		RequestId:           uuid.NewString(),
 		Identity:            identity,
