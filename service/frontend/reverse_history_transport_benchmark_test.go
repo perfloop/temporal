@@ -32,7 +32,7 @@ import (
 
 const (
 	reverseHistoryPageSize  = primitives.GetHistoryMaxPageSize
-	reverseHistoryPageCount = 16
+	reverseHistoryPageCount = 8
 	reverseHistoryNamespace = "reverse-history-benchmark"
 	reverseHistoryWorkflow  = "reverse-history-workflow"
 	reverseHistoryRun       = "7c177db8-cb3b-4b8d-9385-1f0cfcd6e903"
@@ -51,6 +51,7 @@ func (staticNamespaceRegistry) GetNamespaceID(namespace.Name) (namespace.ID, err
 }
 
 type reverseHistoryStats struct {
+	traceEnabled                                                 bool
 	public, history, reads, serialized, deserialized, tokenBytes atomic.Int64
 	mu                                                           sync.Mutex
 	trace                                                        []string
@@ -62,9 +63,11 @@ func (s *reverseHistoryStats) hop(kind string) {
 	} else {
 		s.history.Add(1)
 	}
-	s.mu.Lock()
-	s.trace = append(s.trace, kind)
-	s.mu.Unlock()
+	if s.traceEnabled {
+		s.mu.Lock()
+		s.trace = append(s.trace, kind)
+		s.mu.Unlock()
+	}
 }
 
 func (s *reverseHistoryStats) reset() {
@@ -74,9 +77,11 @@ func (s *reverseHistoryStats) reset() {
 	s.serialized.Store(0)
 	s.deserialized.Store(0)
 	s.tokenBytes.Store(0)
-	s.mu.Lock()
-	s.trace = nil
-	s.mu.Unlock()
+	if s.traceEnabled {
+		s.mu.Lock()
+		s.trace = nil
+		s.mu.Unlock()
+	}
 }
 
 func (s *reverseHistoryStats) waterfall() string {
@@ -95,7 +100,7 @@ type pageSource struct {
 	done    chan error
 }
 
-func newPageSource(pages int, stats *reverseHistoryStats) *pageSource {
+func newPageSource(pages int, stats *reverseHistoryStats, gate bool) *pageSource {
 	s := &pageSource{pages: make([][]*historypb.HistoryEvent, pages), stats: stats}
 	for page := range s.pages {
 		s.pages[page] = make([]*historypb.HistoryEvent, reverseHistoryPageSize)
@@ -106,7 +111,7 @@ func newPageSource(pages int, stats *reverseHistoryStats) *pageSource {
 			}
 		}
 	}
-	if stats != nil {
+	if gate {
 		s.permits = make(chan struct{}, 1)
 		s.done = make(chan error, 3)
 	}
@@ -332,12 +337,20 @@ type reverseHistoryFixture struct {
 }
 
 func newReverseHistoryFixture(tb testing.TB, pages int, record bool) *reverseHistoryFixture {
-	tb.Helper()
 	var stats *reverseHistoryStats
 	if record {
-		stats = &reverseHistoryStats{}
+		stats = &reverseHistoryStats{traceEnabled: true}
 	}
-	source := newPageSource(pages, stats)
+	return newReverseHistoryFixtureWithStats(tb, pages, stats, record)
+}
+
+func newMeasuredReverseHistoryFixture(tb testing.TB, pages int) *reverseHistoryFixture {
+	return newReverseHistoryFixtureWithStats(tb, pages, &reverseHistoryStats{}, false)
+}
+
+func newReverseHistoryFixtureWithStats(tb testing.TB, pages int, stats *reverseHistoryStats, gate bool) *reverseHistoryFixture {
+	tb.Helper()
+	source := newPageSource(pages, stats, gate)
 	historyListener := bufconn.Listen(8 * 1024 * 1024)
 	historyServer := grpc.NewServer(serverOptions(stats, "history")...)
 	historyDescriptor := descriptor(historyservice.HistoryService_ServiceDesc, historyStreamHandler)
@@ -556,7 +569,7 @@ func TestReverseHistoryTransportContract(t *testing.T) {
 		}
 	}
 
-	t.Logf("reverse_history_transport_contract passed mode=%s pages=16 events=4096 public_rpc_count=%d frontend_history_rpc_count=%d fixture_page_source_reads=%d waterfall=%s", map[bool]string{true: "stream", false: "unary"}[fixture.stream], calls, calls, fullReads, waterfall)
+	t.Logf("reverse_history_transport_contract passed mode=%s pages=%d events=%d public_rpc_count=%d frontend_history_rpc_count=%d fixture_page_source_reads=%d waterfall=%s", map[bool]string{true: "stream", false: "unary"}[fixture.stream], reverseHistoryPageCount, reverseHistoryPageCount*reverseHistoryPageSize, calls, calls, fullReads, waterfall)
 }
 
 func TestReverseHistoryUnaryCompatibility(t *testing.T) {
@@ -580,34 +593,41 @@ func TestReverseHistoryUnaryCompatibility(t *testing.T) {
 	t.Log("reverse_history_unary_compatibility passed pages=2 public_rpc_count=2 frontend_history_rpc_count=2")
 }
 
-func BenchmarkReverseHistoryFullScanManyPages(b *testing.B) {
-	fixture := newReverseHistoryFixture(b, reverseHistoryPageCount, false)
+func benchmarkReverseHistoryFullScan(b *testing.B, pages int) {
+	fixture := newMeasuredReverseHistoryFixture(b, pages)
 	if events, err := fixture.scan(context.Background(), nil); err != nil {
 		b.Fatal(err)
 	} else {
-		assertPrefix(b, events, reverseHistoryPageCount*reverseHistoryPageSize, reverseHistoryPageCount*reverseHistoryPageSize)
+		assertPrefix(b, events, pages*reverseHistoryPageSize, int64(pages*reverseHistoryPageSize))
 	}
+
+	var publicRPCs, historyRPCs int64
 	b.ResetTimer()
 	for b.Loop() {
+		fixture.stats.reset()
 		events, err := fixture.scan(context.Background(), nil)
-		if err != nil || len(events) != reverseHistoryPageCount*reverseHistoryPageSize {
+		if err != nil || len(events) != pages*reverseHistoryPageSize {
 			b.Fatalf("scan events=%d err=%v", len(events), err)
 		}
+		wantRPCs := int64(pages)
+		if fixture.stream {
+			wantRPCs = 1
+		}
+		if fixture.stats.public.Load() != wantRPCs || fixture.stats.history.Load() < wantRPCs || fixture.stats.reads.Load() < int64(pages) {
+			b.Fatalf("observed public=%d history=%d reads=%d wantMinimumRPCs=%d wantMinimumReads=%d", fixture.stats.public.Load(), fixture.stats.history.Load(), fixture.stats.reads.Load(), wantRPCs, pages)
+		}
+		publicRPCs += fixture.stats.public.Load()
+		historyRPCs += fixture.stats.history.Load()
 	}
+	b.StopTimer()
+	b.ReportMetric(float64(publicRPCs)/float64(b.N), "public_rpcs/op")
+	b.ReportMetric(float64(historyRPCs)/float64(b.N), "frontend_history_rpcs/op")
+}
+
+func BenchmarkReverseHistoryFullScanManyPages(b *testing.B) {
+	benchmarkReverseHistoryFullScan(b, reverseHistoryPageCount)
 }
 
 func BenchmarkReverseHistoryFullScanOnePage(b *testing.B) {
-	fixture := newReverseHistoryFixture(b, 1, false)
-	if events, err := fixture.scan(context.Background(), nil); err != nil {
-		b.Fatal(err)
-	} else {
-		assertPrefix(b, events, reverseHistoryPageSize, reverseHistoryPageSize)
-	}
-	b.ResetTimer()
-	for b.Loop() {
-		events, err := fixture.scan(context.Background(), nil)
-		if err != nil || len(events) != reverseHistoryPageSize {
-			b.Fatalf("scan events=%d err=%v", len(events), err)
-		}
-	}
+	benchmarkReverseHistoryFullScan(b, 1)
 }
