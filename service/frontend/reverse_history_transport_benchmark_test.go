@@ -473,10 +473,10 @@ func assertPrefix(t testing.TB, events []*historypb.HistoryEvent, count int, fir
 	}
 }
 
-func assertCalls(t testing.TB, stats *reverseHistoryStats, want int64) {
+func assertCalls(t testing.TB, stats *reverseHistoryStats, wantRPCs, wantReads int64) {
 	t.Helper()
-	if stats.public.Load() != want || stats.history.Load() != want || stats.reads.Load() != want {
-		t.Fatalf("calls public=%d history=%d reads=%d want=%d", stats.public.Load(), stats.history.Load(), stats.reads.Load(), want)
+	if stats.public.Load() != wantRPCs || stats.history.Load() != wantRPCs || stats.reads.Load() != wantReads {
+		t.Fatalf("calls public=%d history=%d reads=%d wantRPCs=%d wantReads=%d", stats.public.Load(), stats.history.Load(), stats.reads.Load(), wantRPCs, wantReads)
 	}
 }
 
@@ -510,7 +510,8 @@ func TestReverseHistoryTransportContract(t *testing.T) {
 	if fixture.stream {
 		calls = 1
 	}
-	assertCalls(t, fixture.stats, calls)
+	assertCalls(t, fixture.stats, calls, reverseHistoryPageCount)
+	fullReads := fixture.stats.reads.Load()
 	if fixture.stream {
 		if err := fixture.source.wait(t); err != nil {
 			t.Fatal(err)
@@ -529,7 +530,7 @@ func TestReverseHistoryTransportContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertPrefix(t, events, reverseHistoryPageSize, reverseHistoryPageCount*reverseHistoryPageSize)
-	assertCalls(t, fixture.stats, 1)
+	assertCalls(t, fixture.stats, 1, 1)
 	if fixture.stream {
 		if err := fixture.source.wait(t); err != nil && !canceled(err) {
 			t.Fatal(err)
@@ -548,14 +549,14 @@ func TestReverseHistoryTransportContract(t *testing.T) {
 		t.Fatalf("cancellation: %v", err)
 	}
 	assertPrefix(t, events, reverseHistoryPageSize, reverseHistoryPageCount*reverseHistoryPageSize)
-	assertCalls(t, fixture.stats, 1)
+	assertCalls(t, fixture.stats, 1, 1)
 	if fixture.stream {
 		if err := fixture.source.wait(t); err != nil && !canceled(err) {
 			t.Fatal(err)
 		}
 	}
 
-	t.Logf("reverse_history_transport_contract passed mode=%s pages=16 events=4096 public_rpc_count=%d frontend_history_rpc_count=%d fixture_page_source_reads=%d waterfall=%s", map[bool]string{true: "stream", false: "unary"}[fixture.stream], calls, calls, calls, waterfall)
+	t.Logf("reverse_history_transport_contract passed mode=%s pages=16 events=4096 public_rpc_count=%d frontend_history_rpc_count=%d fixture_page_source_reads=%d waterfall=%s", map[bool]string{true: "stream", false: "unary"}[fixture.stream], calls, calls, fullReads, waterfall)
 }
 
 func TestReverseHistoryUnaryCompatibility(t *testing.T) {
@@ -565,7 +566,7 @@ func TestReverseHistoryUnaryCompatibility(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertPrefix(t, events, 2*reverseHistoryPageSize, 2*reverseHistoryPageSize)
-	assertCalls(t, fixture.stats, 2)
+	assertCalls(t, fixture.stats, 2, 2)
 	if fixture.stats.serialized.Load() != 1 || fixture.stats.deserialized.Load() != 1 {
 		t.Fatal("unary continuation compatibility failed")
 	}
@@ -575,7 +576,7 @@ func TestReverseHistoryUnaryCompatibility(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertPrefix(t, events, reverseHistoryPageSize, 2*reverseHistoryPageSize)
-	assertCalls(t, fixture.stats, 1)
+	assertCalls(t, fixture.stats, 1, 1)
 	t.Log("reverse_history_unary_compatibility passed pages=2 public_rpc_count=2 frontend_history_rpc_count=2")
 }
 
