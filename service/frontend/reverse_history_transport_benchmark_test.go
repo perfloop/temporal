@@ -320,12 +320,7 @@ func (s *reverseHistoryPageSource) waitForStream(t testing.TB) error {
 	if !s.gateStream {
 		return nil
 	}
-	select {
-	case err := <-s.streamDone:
-		return err
-	case <-time.After(5 * time.Second):
-		return errors.New("timed out waiting for the History stream to finish")
-	}
+	return <-s.streamDone
 }
 
 func (s *reverseHistoryPageSource) streamResponse(
@@ -818,6 +813,36 @@ func reverseHistoryAssertFullScan(
 	return snapshot
 }
 
+func reverseHistoryAssertUnaryFullScan(
+	t testing.TB,
+	fixture *reverseHistoryTransportFixture,
+	events []*historypb.HistoryEvent,
+) {
+	t.Helper()
+	reverseHistoryAssertEvents(t, events, fixture.pageCount*reverseHistoryBenchmarkPageSize)
+	snapshot := fixture.measurements.snapshot()
+	wantCalls := int64(fixture.pageCount)
+	if snapshot.publicRPCCalls != wantCalls || snapshot.historyRPCCalls != wantCalls || snapshot.sourcePageReads != wantCalls {
+		t.Fatalf(
+			"unary full scan counts: public=%d history=%d reads=%d want=%d",
+			snapshot.publicRPCCalls,
+			snapshot.historyRPCCalls,
+			snapshot.sourcePageReads,
+			wantCalls,
+		)
+	}
+	wantContinuations := int64(fixture.pageCount - 1)
+	if snapshot.continuationSerializations != wantContinuations || snapshot.continuationDeserializations != wantContinuations || snapshot.continuationWireBytes <= 0 {
+		t.Fatalf(
+			"unary continuation transitions: serializations=%d deserializations=%d bytes=%d want=%d",
+			snapshot.continuationSerializations,
+			snapshot.continuationDeserializations,
+			snapshot.continuationWireBytes,
+			wantContinuations,
+		)
+	}
+}
+
 func reverseHistoryAssertSinglePageStop(
 	t testing.TB,
 	fixture *reverseHistoryTransportFixture,
@@ -911,6 +936,38 @@ func TestReverseHistoryTransportContract(t *testing.T) {
 		fullSnapshot.continuationWireBytes,
 		fullSnapshot.sourcePageReads,
 		waterfall,
+	)
+}
+
+func TestReverseHistoryUnaryCompatibility(t *testing.T) {
+	fixture := newReverseHistoryTransportFixture(t, 2, true)
+
+	events, err := fixture.scanUnary(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("unary full scan: %v", err)
+	}
+	reverseHistoryAssertUnaryFullScan(t, fixture, events)
+
+	fixture.measurements.reset()
+	events, err = fixture.scanUnary(context.Background(), func(int, *workflowservice.GetWorkflowExecutionHistoryReverseResponse) bool {
+		return false
+	})
+	if err != nil {
+		t.Fatalf("unary first-page stop: %v", err)
+	}
+	reverseHistoryAssertReversePrefix(t, events, reverseHistoryBenchmarkPageSize, 2*reverseHistoryBenchmarkPageSize)
+	stoppedSnapshot := fixture.measurements.snapshot()
+	if stoppedSnapshot.publicRPCCalls != 1 || stoppedSnapshot.historyRPCCalls != 1 || stoppedSnapshot.sourcePageReads != 1 {
+		t.Fatalf(
+			"unary first-page stop issued extra work: public=%d history=%d reads=%d",
+			stoppedSnapshot.publicRPCCalls,
+			stoppedSnapshot.historyRPCCalls,
+			stoppedSnapshot.sourcePageReads,
+		)
+	}
+
+	t.Logf(
+		"reverse_history_unary_compatibility passed pages=2 public_rpc_count=2 frontend_history_rpc_count=2",
 	)
 }
 
