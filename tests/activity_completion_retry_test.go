@@ -2,6 +2,7 @@ package tests
 
 import (
 	"context"
+	"sort"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -35,6 +36,7 @@ const (
 	workflowLeaseAcquisitionsMetric = "workflow_lease_acquisitions_per_duplicate_completion_delivery"
 	historyDeliveriesMetric         = "history_completion_deliveries_per_duplicate_completion_delivery"
 	completionSuccessMetric         = "duplicate_completion_success"
+	duplicateCompletionP95Metric    = "p95_ns"
 	completionRetryBenchmarkBatch   = 128
 )
 
@@ -158,6 +160,7 @@ type completionRetryResult struct {
 type duplicateCompletionResult struct {
 	completionSuccess int
 	completionError   error
+	latency           time.Duration
 }
 
 func TestActivityCompletionLostResponseRetriesWorkflowLease(t *testing.T) {
@@ -192,8 +195,8 @@ func BenchmarkActivityCompletionDuplicateDeliveryWorkflowLease(b *testing.B) {
 	var resultIndex atomic.Int64
 	// Each timed operation is a post-commit duplicate of a completion whose
 	// response was fault-injected and replayed during setup. RunParallel models a
-	// retry burst across independent workflows; Go's native timer reports the
-	// aggregate ns/op for the b.N deliveries.
+	// retry burst across independent workflows. The native benchmark timer drives
+	// b.N, while each Frontend RPC records its own end-to-end latency for p95.
 	b.SetParallelism(1)
 	b.ResetTimer()
 	b.StartTimer()
@@ -208,6 +211,10 @@ func BenchmarkActivityCompletionDuplicateDeliveryWorkflowLease(b *testing.B) {
 	b.StopTimer()
 
 	require.Equal(b, int64(b.N), resultIndex.Load(), "the retry burst must consume every benchmark iteration")
+	sort.Slice(duplicateResults, func(i, j int) bool {
+		return duplicateResults[i].latency < duplicateResults[j].latency
+	})
+	p95Latency := duplicateResults[(95*len(duplicateResults)+99)/100-1].latency
 	totals := completionRetryResult{
 		workflowLeaseAcquisitions: fixture.leaseCounter.acquisitions.Load(),
 		historyDeliveries:         fixture.fault.deliveries.Load(),
@@ -223,6 +230,7 @@ func BenchmarkActivityCompletionDuplicateDeliveryWorkflowLease(b *testing.B) {
 		scenario.verifyWorkflowCompletion()
 	}
 
+	b.ReportMetric(float64(p95Latency.Nanoseconds()), duplicateCompletionP95Metric)
 	b.ReportMetric(float64(totals.workflowLeaseAcquisitions)/float64(b.N), workflowLeaseAcquisitionsMetric)
 	b.ReportMetric(float64(totals.historyDeliveries)/float64(b.N), historyDeliveriesMetric)
 	b.ReportMetric(float64(totals.completionSuccess)/float64(b.N), completionSuccessMetric)
@@ -290,6 +298,7 @@ func (s *completionRetryScenario) complete(injectResponseFault bool) completionR
 }
 
 func (s *completionRetryScenario) completeDuplicate() duplicateCompletionResult {
+	startedAt := time.Now()
 	_, err := s.cluster.FrontendClient().RespondActivityTaskCompleted(s.ctx, &workflowservice.RespondActivityTaskCompletedRequest{
 		Namespace: s.namespace,
 		TaskToken: s.activityTask.GetTaskToken(),
@@ -298,6 +307,7 @@ func (s *completionRetryScenario) completeDuplicate() duplicateCompletionResult 
 	return duplicateCompletionResult{
 		completionSuccess: boolToInt(err == nil),
 		completionError:   err,
+		latency:           time.Since(startedAt),
 	}
 }
 
@@ -460,7 +470,7 @@ func startCompletionRetryWorkflow(
 			Name: "activity-completion-retry-workflow",
 		},
 		TaskQueue:           normalTaskQueue(taskQueueName),
-		WorkflowRunTimeout:  durationpb.New(time.Minute),
+		WorkflowRunTimeout:  durationpb.New(10 * time.Minute),
 		WorkflowTaskTimeout: durationpb.New(time.Second),
 		RequestId:           uuid.NewString(),
 		Identity:            identity,
