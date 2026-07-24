@@ -273,10 +273,9 @@ func registerCompletionRetryTestNamespace(
 	})
 	require.NoError(t, err)
 
-	require.Eventually(t, func() bool {
-		response, err := frontendClient.DescribeNamespace(ctx, &workflowservice.DescribeNamespaceRequest{Namespace: namespace})
-		return err == nil && response.GetNamespaceInfo().GetId() != ""
-	}, 10*time.Second, 50*time.Millisecond)
+	response, err := frontendClient.DescribeNamespace(ctx, &workflowservice.DescribeNamespaceRequest{Namespace: namespace})
+	require.NoError(t, err)
+	require.NotEmpty(t, response.GetNamespaceInfo().GetId())
 
 	return namespace
 }
