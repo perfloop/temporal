@@ -35,7 +35,7 @@ const (
 	workflowLeaseAcquisitionsMetric = "workflow_lease_acquisitions_per_fault_injected_completion"
 	historyDeliveriesMetric         = "history_completion_deliveries_per_fault_injected_completion"
 	completionSuccessMetric         = "fault_injected_completion_success"
-	completionRetryBenchmarkBatch   = 128
+	completionRetryBenchmarkBatch   = 512
 )
 
 type activityCompletionRequestContextKey struct{}
