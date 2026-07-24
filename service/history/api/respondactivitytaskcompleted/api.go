@@ -12,6 +12,7 @@ import (
 	"go.temporal.io/server/common/namespace"
 	"go.temporal.io/server/common/primitives/timestamp"
 	"go.temporal.io/server/common/tasktoken"
+	"go.temporal.io/server/common/testing/testhooks"
 	"go.temporal.io/server/service/history/api"
 	"go.temporal.io/server/service/history/consts"
 	historyi "go.temporal.io/server/service/history/interfaces"
@@ -23,6 +24,7 @@ func Invoke(
 	req *historyservice.RespondActivityTaskCompletedRequest,
 	shard historyi.ShardContext,
 	workflowConsistencyChecker api.WorkflowConsistencyChecker,
+	testHooks testhooks.TestHooks,
 ) (resp *historyservice.RespondActivityTaskCompletedResponse, retError error) {
 	tokenSerializer := tasktoken.NewSerializer()
 	request := req.CompleteRequest
@@ -46,6 +48,7 @@ func Invoke(
 	var workflowTypeName string
 	var fabricateStartedEvent bool
 	var versioningBehavior enumspb.VersioningBehavior
+	testhooks.Call(testHooks, testhooks.HistoryActivityCompletionWorkflowLease, namespace.ID(req.GetNamespaceId()))
 	err = api.GetAndUpdateWorkflowWithNew(
 		ctx,
 		token.Clock,

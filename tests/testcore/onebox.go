@@ -102,6 +102,7 @@ type (
 		onAuthorize               func(context.Context, *authorization.Claims, *authorization.CallTarget) (authorization.Result, error)
 		callbackLock              sync.RWMutex // Must be used for above callbacks
 		serviceFxOptions          map[primitives.ServiceName][]fx.Option
+		historyOuterInterceptors  []grpc.UnaryServerInterceptor
 		taskCategoryRegistry      tasks.TaskCategoryRegistry
 		chasmEngine               chasm.Engine
 		chasmVisibilityMgr        chasm.VisibilityManager
@@ -164,6 +165,7 @@ type (
 		captureMetricsHandler            *metricstest.CaptureHandler
 		// ServiceFxOptions is populated by WithFxOptionsForService.
 		serviceFxOptions          map[primitives.ServiceName][]fx.Option
+		historyOuterInterceptors  []grpc.UnaryServerInterceptor
 		taskCategoryRegistry      tasks.TaskCategoryRegistry
 		hostsByProtocolByService  map[transferProtocol]map[primitives.ServiceName]static.Hosts
 		spanExporters             map[telemetry.SpanExporterType]sdktrace.SpanExporter
@@ -178,7 +180,7 @@ type (
 const NamespaceCacheRefreshInterval = time.Second
 
 // newTemporal returns an instance that hosts full temporal in one process
-func newTemporal(t *testing.T, params *temporalParams) *temporalImpl {
+func newTemporal(t testing.TB, params *temporalParams) *temporalImpl {
 	impl := &temporalImpl{
 		logger:                           params.logger,
 		clusterMetadataConfig:            params.clusterMetadataConfig,
@@ -207,6 +209,7 @@ func newTemporal(t *testing.T, params *temporalParams) *temporalImpl {
 		dcClient:                         dynamicconfig.NewMemoryClient(),
 		testHooks:                        testhooks.NewTestHooks(),
 		serviceFxOptions:                 params.serviceFxOptions,
+		historyOuterInterceptors:         params.historyOuterInterceptors,
 		taskCategoryRegistry:             params.taskCategoryRegistry,
 		hostsByProtocolByService:         params.hostsByProtocolByService,
 		replicationStreamRecorder:        NewReplicationStreamRecorder(),
@@ -458,10 +461,12 @@ func (c *temporalImpl) startHistory() {
 			fx.Provide(func() log.ThrottledLogger { return logger }),
 			fx.Provide(c.newRPCFactory),
 			fx.Decorate(func(base []grpc.UnaryServerInterceptor) []grpc.UnaryServerInterceptor {
+				interceptors := append([]grpc.UnaryServerInterceptor{}, c.historyOuterInterceptors...)
+				interceptors = append(interceptors, base...)
 				if c.replicationStreamRecorder != nil {
-					return append(base, c.replicationStreamRecorder.UnaryServerInterceptor(c.clusterMetadataConfig.CurrentClusterName))
+					interceptors = append(interceptors, c.replicationStreamRecorder.UnaryServerInterceptor(c.clusterMetadataConfig.CurrentClusterName))
 				}
-				return base
+				return interceptors
 			}),
 			fx.Provide(func() []grpc.StreamServerInterceptor {
 				if c.replicationStreamRecorder != nil {
@@ -858,13 +863,13 @@ func (c *temporalImpl) overrideDynamicConfigForClusterLifetime(name dynamicconfi
 }
 
 // overrideDynamicConfigForTest overrides a dynamic config value for the duration of the test.
-func (c *temporalImpl) overrideDynamicConfigForTest(t *testing.T, name dynamicconfig.Key, value any) func() {
+func (c *temporalImpl) overrideDynamicConfigForTest(t testing.TB, name dynamicconfig.Key, value any) func() {
 	cleanup := c.dcClient.PartialOverrideValue(name, value)
 	t.Cleanup(cleanup)
 	return cleanup
 }
 
-func (c *temporalImpl) injectHook(t *testing.T, hook testhooks.Hook, scope any) func() {
+func (c *temporalImpl) injectHook(t testing.TB, hook testhooks.Hook, scope any) func() {
 	cleanup := hook.Apply(c.testHooks, scope)
 	t.Cleanup(cleanup)
 	return cleanup

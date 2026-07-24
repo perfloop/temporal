@@ -51,6 +51,7 @@ import (
 	"go.temporal.io/server/tests/testutils"
 	"go.uber.org/fx"
 	"go.uber.org/multierr"
+	"google.golang.org/grpc"
 )
 
 type (
@@ -87,10 +88,13 @@ type (
 		ServiceFxOptions  map[primitives.ServiceName][]fx.Option
 		TokenProvider     auth.TokenProvider
 		TLSConfigProvider *encryption.FixedTLSConfigProvider
+
+		// HistoryOuterInterceptors run before the History retryable interceptor.
+		HistoryOuterInterceptors []grpc.UnaryServerInterceptor
 	}
 
 	TestClusterFactory interface {
-		NewCluster(t *testing.T, clusterConfig *TestClusterConfig, logger log.Logger) (*TestCluster, error)
+		NewCluster(t testing.TB, clusterConfig *TestClusterConfig, logger log.Logger) (*TestCluster, error)
 	}
 
 	defaultTestClusterFactory struct {
@@ -103,7 +107,7 @@ const (
 	grpcProtocol transferProtocol = "grpc"
 )
 
-func (f *defaultTestClusterFactory) NewCluster(t *testing.T, clusterConfig *TestClusterConfig, logger log.Logger) (*TestCluster, error) {
+func (f *defaultTestClusterFactory) NewCluster(t testing.TB, clusterConfig *TestClusterConfig, logger log.Logger) (*TestCluster, error) {
 	return newClusterWithPersistenceTestBaseFactory(t, clusterConfig, logger, f.tbFactory)
 }
 
@@ -145,7 +149,7 @@ func (f *defaultPersistenceTestBaseFactory) NewTestBase(options *persistencetest
 }
 
 func newClusterWithPersistenceTestBaseFactory(
-	t *testing.T,
+	t testing.TB,
 	clusterConfig *TestClusterConfig,
 	logger log.Logger,
 	tbFactory persistenceTestBaseFactory,
@@ -322,6 +326,7 @@ func newClusterWithPersistenceTestBaseFactory(
 		namespaceReplicationTaskExecutor: nsreplication.NewTaskExecutor(clusterConfig.ClusterMetadata.CurrentClusterName, testBase.MetadataManager, nsreplication.NewNoopDataMerger(), nsreplication.NewDefaultAdmitter(), logger, testhooks.TestHooks{}),
 		dcRedirectionPolicy:              clusterConfig.DCRedirectionPolicy,
 		dynamicConfigOverrides:           clusterConfig.DynamicConfigOverrides,
+		historyOuterInterceptors:         clusterConfig.HistoryOuterInterceptors,
 		tlsConfigProvider:                tlsConfigProvider,
 		serviceFxOptions:                 clusterConfig.ServiceFxOptions,
 		taskCategoryRegistry:             temporal.TaskCategoryRegistryProvider(archiverMetadata),
@@ -557,7 +562,7 @@ func (tc *TestCluster) Host() *temporalImpl {
 	return tc.host
 }
 
-func (tc *TestCluster) InjectHook(t *testing.T, hook testhooks.Hook, scope any) func() {
+func (tc *TestCluster) InjectHook(t testing.TB, hook testhooks.Hook, scope any) func() {
 	return tc.host.injectHook(t, hook, scope)
 }
 
@@ -577,7 +582,7 @@ func (tc *TestCluster) GetHistoryTaskRecorder() *HistoryTaskRecorder {
 	return tc.host.GetHistoryTaskRecorder()
 }
 
-func (tc *TestCluster) OverrideDynamicConfig(t *testing.T, key dynamicconfig.GenericSetting, value any) (cleanup func()) {
+func (tc *TestCluster) OverrideDynamicConfig(t testing.TB, key dynamicconfig.GenericSetting, value any) (cleanup func()) {
 	return tc.host.overrideDynamicConfigForTest(t, key.Key(), value)
 }
 

@@ -29,6 +29,7 @@ var (
 	HistoryChasmRuntimeProvider              = newKey[func(chasm.Engine, chasm.VisibilityManager, *chasm.Registry), global]()
 	HistoryTransferTaskInterceptor           = newKey[func(historytasks.Task, func()), namespace.ID]()
 	HistoryDLQTaskDeleteInterceptor          = newKey[func(context.Context, *historyservice.DeleteDLQTasksRequest, func(context.Context, *historyservice.DeleteDLQTasksRequest) (*historyservice.DeleteDLQTasksResponse, error)) (*historyservice.DeleteDLQTasksResponse, error), global]()
+	HistoryActivityCompletionWorkflowLease   = newKey[func(), namespace.ID]()
 	NamespaceReplicationTaskInterceptor      = newKey[func(context.Context, *replicationspb.NamespaceTaskAttributes, func() error) error, namespace.Name]()
 )
 
