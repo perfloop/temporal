@@ -22,6 +22,7 @@ import (
 	"go.temporal.io/server/common/locks"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/namespace"
+	persistencetests "go.temporal.io/server/common/persistence/persistence-tests"
 	"go.temporal.io/server/common/primitives"
 	"go.temporal.io/server/common/resource"
 	historyi "go.temporal.io/server/service/history/interfaces"
@@ -398,7 +399,10 @@ func newCompletionRetryTestCluster(
 	t.Helper()
 
 	cluster, err := testcore.NewTestClusterFactory().NewCluster(t, &testcore.TestClusterConfig{
-		Persistence: testcore.GetPersistenceTestDefaults(),
+		// The receipt path is persistent state. Keep its SQL transaction and read
+		// in the workload by using the repository's file-backed SQLite fixture
+		// rather than the default private in-memory SQLite test database.
+		Persistence: *persistencetests.GetSQLiteFileTestClusterOption(),
 		HistoryConfig: testcore.HistoryConfig{
 			NumHistoryShards: 1,
 		},
